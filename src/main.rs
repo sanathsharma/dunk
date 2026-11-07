@@ -2,6 +2,7 @@ mod app;
 mod args;
 mod diff;
 mod highlight;
+mod split;
 mod ui;
 mod vcs;
 mod words;
@@ -33,7 +34,7 @@ fn run() -> Result<(), Box<dyn Error>> {
   });
 
   let mut terminal = ratatui::try_init()?;
-  let result = app::run(&mut terminal, Git::new(dir), request, theme);
+  let result = app::run(&mut terminal, Git::new(dir), request, theme, args.layout);
   ratatui::try_restore()?;
   Ok(result?)
 }

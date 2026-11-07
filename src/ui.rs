@@ -1,6 +1,8 @@
 use crate::app::{App, Load};
+use crate::args::Layout as DiffLayout;
 use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind};
 use crate::highlight::Styled;
+use crate::split::pairs;
 use crate::words::changed_words;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -14,8 +16,7 @@ const REMOVED_BG: Color = Color::Rgb(66, 24, 28);
 const ADDED_WORD_BG: Color = Color::Rgb(30, 100, 52);
 const REMOVED_WORD_BG: Color = Color::Rgb(128, 40, 46);
 
-const HELP: &str =
-  " j/k scroll  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  q quit";
+const HELP: &str = " j/k scroll  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  q quit";
 
 enum Row<'a> {
   Header(&'a Hunk),
@@ -122,25 +123,74 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   }
 
   let width = gutter_width(file);
-  let rows = file
-    .hunks
-    .iter()
-    .enumerate()
-    .flat_map(|(hi, h)| {
-      let lines = h.lines.iter().enumerate().map(move |(li, l)| {
-        let styled = colors.and_then(|c| c.hunks.get(hi)?.get(li)?.as_ref());
-        let ranges = words
-          .get(hi)
-          .and_then(|h| h.get(li))
-          .map_or(&[][..], Vec::as_slice);
-        Row::Line(l, styled, ranges)
-      });
-      std::iter::once(Row::Header(h)).chain(lines)
-    })
-    .skip(app.scroll)
-    .take(app.viewport)
-    .map(|row| row_line(row, width, usize::from(inner.width)));
-  frame.render_widget(Paragraph::new(rows.collect::<Vec<_>>()), inner);
+  let hunks = file.hunks.iter().enumerate();
+  let line_of = |hi: usize, li: usize| {
+    let h = &file.hunks[hi];
+    let styled = colors.and_then(|c| c.hunks.get(hi)?.get(li)?.as_ref());
+    let ranges = words
+      .get(hi)
+      .and_then(|h| h.get(li))
+      .map_or(&[][..], Vec::as_slice);
+    (&h.lines[li], styled, ranges)
+  };
+
+  match app.layout {
+    DiffLayout::Unified => {
+      let rows = hunks
+        .flat_map(|(hi, h)| {
+          let lines = (0..h.lines.len()).map(move |li| {
+            let (l, styled, ranges) = line_of(hi, li);
+            Row::Line(l, styled, ranges)
+          });
+          std::iter::once(Row::Header(h)).chain(lines)
+        })
+        .skip(app.scroll)
+        .take(app.viewport)
+        .map(|row| row_line(row, width, usize::from(inner.width)))
+        .collect::<Vec<_>>();
+      frame.render_widget(Paragraph::new(rows), inner);
+    }
+    DiffLayout::Split => {
+      let left_width = inner.width.saturating_sub(1) / 2;
+      let right_width = inner.width.saturating_sub(1 + left_width);
+      let [left_area, _, right_area] = Layout::horizontal([
+        Constraint::Length(left_width),
+        Constraint::Length(1),
+        Constraint::Length(right_width),
+      ])
+      .areas(inner);
+      let side = |index: Option<usize>, hi: usize, new: bool, fill: u16| match index {
+        Some(li) => {
+          let (l, styled, ranges) = line_of(hi, li);
+          let number = if new { l.new_no } else { l.old_no };
+          let gutter = format!(
+            "{:>width$} ",
+            number.map_or(String::new(), |n| n.to_string())
+          );
+          line_spans(l, styled, ranges, gutter, usize::from(fill))
+        }
+        None => Line::raw(""),
+      };
+      let rows: Vec<(Line, Line)> = hunks
+        .flat_map(|(hi, h)| {
+          let header = Row::Header(h);
+          let header = (row_line(header, width, 0), Line::raw(""));
+          let pairs = pairs(h).into_iter().map(move |(l, r)| {
+            (
+              side(l, hi, false, left_width),
+              side(r, hi, true, right_width),
+            )
+          });
+          std::iter::once(header).chain(pairs)
+        })
+        .skip(app.scroll)
+        .take(app.viewport)
+        .collect();
+      let (left, right): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+      frame.render_widget(Paragraph::new(left), left_area);
+      frame.render_widget(Paragraph::new(right), right_area);
+    }
+  }
 }
 
 fn title(file: &FileDiff) -> String {
@@ -187,46 +237,56 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
       Style::new().fg(Color::Cyan),
     ),
     Row::Line(l, styled, changed) => {
-      let (marker, style, word_bg) = match l.kind {
-        LineKind::Context => (' ', Style::new(), None),
-        LineKind::Added => ('+', Style::new().bg(ADDED_BG), Some(ADDED_WORD_BG)),
-        LineKind::Removed => ('-', Style::new().bg(REMOVED_BG), Some(REMOVED_WORD_BG)),
-      };
       let no = |n: Option<u32>| n.map_or(String::new(), |n| n.to_string());
-      let mut spans = vec![
-        Span::styled(
-          format!("{:>width$} {:>width$} ", no(l.old_no), no(l.new_no)),
-          Style::new().fg(Color::DarkGray),
-        ),
-        Span::raw(marker.to_string()),
-      ];
-      let plain;
-      let pieces = match styled {
-        Some(pieces) => pieces,
-        None => {
-          plain = vec![(
-            Style::new(),
-            String::from_utf8_lossy(&l.content).into_owned(),
-          )];
-          &plain
-        }
-      };
-      spans.extend(
-        emphasize(pieces, changed, word_bg)
-          .into_iter()
-          .map(|(style, text)| Span::styled(sanitize(text.as_bytes()), style)),
-      );
-      if l.no_newline {
-        spans.push(Span::styled(
-          " [no newline at end of file]",
-          Style::new().fg(Color::DarkGray),
-        ));
-      }
-      let used: usize = spans.iter().map(Span::width).sum();
-      spans.push(Span::raw(" ".repeat(fill.saturating_sub(used))));
-      Line::from(spans).style(style)
+      let gutter = format!("{:>width$} {:>width$} ", no(l.old_no), no(l.new_no));
+      line_spans(l, styled, changed, gutter, fill)
     }
   }
+}
+
+/// One diff line: gutter, marker, then the code with changed words
+/// emphasized.
+fn line_spans(
+  l: &DiffLine,
+  styled: Option<&Styled>,
+  changed: &[Range<usize>],
+  gutter: String,
+  fill: usize,
+) -> Line<'static> {
+  let (marker, style, word_bg) = match l.kind {
+    LineKind::Context => (' ', Style::new(), None),
+    LineKind::Added => ('+', Style::new().bg(ADDED_BG), Some(ADDED_WORD_BG)),
+    LineKind::Removed => ('-', Style::new().bg(REMOVED_BG), Some(REMOVED_WORD_BG)),
+  };
+  let mut spans = vec![
+    Span::styled(gutter, Style::new().fg(Color::DarkGray)),
+    Span::raw(marker.to_string()),
+  ];
+  let plain;
+  let pieces = match styled {
+    Some(pieces) => pieces,
+    None => {
+      plain = vec![(
+        Style::new(),
+        String::from_utf8_lossy(&l.content).into_owned(),
+      )];
+      &plain
+    }
+  };
+  spans.extend(
+    emphasize(pieces, changed, word_bg)
+      .into_iter()
+      .map(|(style, text)| Span::styled(sanitize(text.as_bytes()), style)),
+  );
+  if l.no_newline {
+    spans.push(Span::styled(
+      " [no newline at end of file]",
+      Style::new().fg(Color::DarkGray),
+    ));
+  }
+  let used: usize = spans.iter().map(Span::width).sum();
+  spans.push(Span::raw(" ".repeat(fill.saturating_sub(used))));
+  Line::from(spans).style(style)
 }
 
 /// Splits `pieces` at the edges of `changed` (byte offsets into the joined
@@ -447,6 +507,84 @@ new file mode 100644
     let (y, row) = row_with(&rows, "+hello");
     let x = row[..row.find("+hello").unwrap()].chars().count() as u16 + 1;
     assert_eq!(terminal.backend().buffer()[(x, y as u16)].bg, ADDED_BG);
+  }
+
+  const SPLIT_DIFF: &str = "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,4 +1,3 @@
+ keep
+-old1
+-old2
++new1
+ tail
+";
+
+  fn split_app() -> App {
+    let mut app = app_with(SPLIT_DIFF);
+    app.layout = DiffLayout::Split;
+    app
+  }
+
+  #[test]
+  fn split_layout_aligns_old_and_new_columns() {
+    let mut app = split_app();
+    let (_, rows) = draw(&mut app, 81, 12);
+    let (_, keep) = row_with(&rows, "keep");
+    assert!(keep.matches("keep").count() == 2);
+    let (_, pair) = row_with(&rows, "-old1");
+    assert!(pair.contains("+new1"));
+    assert!(pair.find("-old1") < pair.find("+new1"));
+    let (_, surplus) = row_with(&rows, "-old2");
+    assert!(!surplus.contains('+'));
+    let (_, tail) = row_with(&rows, "tail");
+    assert_eq!(tail.matches("tail").count(), 2);
+  }
+
+  #[test]
+  fn split_layout_shows_one_line_number_per_column() {
+    let mut app = split_app();
+    let (_, rows) = draw(&mut app, 81, 12);
+    let (_, pair) = row_with(&rows, "-old1");
+    // old line 2 on the left, new line 2 on the right
+    assert_eq!(pair.matches('2').count(), 2, "{pair}");
+    let (_, surplus) = row_with(&rows, "-old2");
+    assert_eq!(surplus.matches('3').count(), 1, "{surplus}");
+  }
+
+  #[test]
+  fn split_layout_keeps_each_column_inside_its_half() {
+    let mut app = app_with(
+      "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n+b\n",
+    );
+    app.layout = DiffLayout::Split;
+    let (_, rows) = draw(&mut app, 81, 8);
+    let (_, row) = row_with(&rows, "+b");
+    assert!(row.contains("+b"));
+  }
+
+  #[test]
+  fn split_layout_colors_each_column_by_kind() {
+    let mut app = split_app();
+    let (terminal, rows) = draw(&mut app, 81, 12);
+    let buffer = terminal.backend().buffer();
+    let (y, row) = row_with(&rows, "-old1");
+    let new_x = row[..row.find("+new1").unwrap()].chars().count() as u16 - 1;
+    let old_x = row[..row.find("-old1").unwrap()].chars().count() as u16 - 1;
+    assert_eq!(buffer[(old_x, y as u16)].bg, REMOVED_BG);
+    assert_eq!(buffer[(new_x, y as u16)].bg, ADDED_BG);
+    let (y, _) = row_with(&rows, "-old2");
+    // The blank right column carries no background.
+    assert_ne!(buffer[(new_x, y as u16)].bg, ADDED_BG);
+  }
+
+  #[test]
+  fn split_layout_survives_tiny_terminals() {
+    let mut app = split_app();
+    for (w, h) in [(1, 1), (10, 2), (30, 3), (5, 40)] {
+      draw(&mut app, w, h);
+    }
   }
 
   #[test]

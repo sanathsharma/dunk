@@ -1,5 +1,7 @@
-use crate::diff::FileDiff;
+use crate::args::Layout;
+use crate::diff::{FileDiff, Hunk};
 use crate::highlight::FileHighlight;
+use crate::split;
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Vcs};
 use crate::worker::Worker;
@@ -34,6 +36,7 @@ pub struct App {
   /// Changed word ranges per file, hunk and line, filled when a file is first
   /// drawn. See `words::changed_words`.
   pub words: Vec<Option<Vec<Vec<Vec<Range<usize>>>>>>,
+  pub layout: Layout,
   pub selected: usize,
   pub list_state: ListState,
   /// Index of the first visible row of the selected file's diff.
@@ -50,6 +53,7 @@ impl Default for App {
       files: Arc::new(Vec::new()),
       highlights: Vec::new(),
       words: Vec::new(),
+      layout: Layout::Unified,
       selected: 0,
       list_state: ListState::default(),
       scroll: 0,
@@ -59,9 +63,58 @@ impl Default for App {
   }
 }
 
-/// Rows a file's diff occupies: one header per hunk plus its lines.
-pub fn row_count(file: &FileDiff) -> usize {
-  file.hunks.iter().map(|h| 1 + h.lines.len()).sum()
+/// Rows a hunk occupies: its header plus one row per line (unified) or per
+/// split pair.
+fn hunk_rows(hunk: &Hunk, layout: Layout) -> usize {
+  1 + match layout {
+    Layout::Unified => hunk.lines.len(),
+    Layout::Split => split::pairs(hunk).len(),
+  }
+}
+
+/// Rows a file's diff occupies in `layout`.
+pub fn row_count(file: &FileDiff, layout: Layout) -> usize {
+  file.hunks.iter().map(|h| hunk_rows(h, layout)).sum()
+}
+
+/// Finds the hunk and line shown at `row`. The line is `None` on a header.
+fn locate(file: &FileDiff, layout: Layout, mut row: usize) -> Option<(usize, Option<usize>)> {
+  for (hi, hunk) in file.hunks.iter().enumerate() {
+    let rows = hunk_rows(hunk, layout);
+    if row >= rows {
+      row -= rows;
+      continue;
+    }
+    let Some(offset) = row.checked_sub(1) else {
+      return Some((hi, None));
+    };
+    let line = match layout {
+      Layout::Unified => offset,
+      Layout::Split => {
+        let (left, right) = split::pairs(hunk)[offset];
+        left.or(right).expect("a pair has at least one side")
+      }
+    };
+    return Some((hi, Some(line)));
+  }
+  None
+}
+
+/// The row where a hunk, or a line within it, is drawn in `layout`.
+fn row_of(file: &FileDiff, layout: Layout, hunk: usize, line: Option<usize>) -> usize {
+  let before: usize = file.hunks[..hunk]
+    .iter()
+    .map(|h| hunk_rows(h, layout))
+    .sum();
+  let Some(line) = line else { return before };
+  let offset = match layout {
+    Layout::Unified => line,
+    Layout::Split => split::pairs(&file.hunks[hunk])
+      .iter()
+      .position(|&(l, r)| l == Some(line) || r == Some(line))
+      .unwrap_or(0),
+  };
+  before + 1 + offset
 }
 
 impl App {
@@ -101,6 +154,7 @@ impl App {
       KeyCode::PageUp => self.scroll_by(-(page as isize)),
       KeyCode::Char('g') | KeyCode::Home => self.scroll = 0,
       KeyCode::Char('G') | KeyCode::End => self.scroll = self.max_scroll(),
+      KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Tab | KeyCode::Char('n') => self.select_by(1),
       KeyCode::BackTab | KeyCode::Char('p') => self.select_by(-1),
       _ => {}
@@ -108,12 +162,32 @@ impl App {
   }
 
   pub fn max_scroll(&self) -> usize {
-    let rows = self.files.get(self.selected).map_or(0, row_count);
+    let rows = self
+      .files
+      .get(self.selected)
+      .map_or(0, |f| row_count(f, self.layout));
     rows.saturating_sub(self.viewport)
   }
 
   pub fn clamp_scroll(&mut self) {
     self.scroll = self.scroll.min(self.max_scroll());
+  }
+
+  /// Switches between unified and split, keeping the hunk and line at the top
+  /// of the pane in view.
+  fn toggle_layout(&mut self) {
+    let from = self.layout;
+    let to = match from {
+      Layout::Unified => Layout::Split,
+      Layout::Split => Layout::Unified,
+    };
+    if let Some(file) = self.files.get(self.selected)
+      && let Some((hunk, line)) = locate(file, from, self.scroll)
+    {
+      self.scroll = row_of(file, to, hunk, line);
+    }
+    self.layout = to;
+    self.clamp_scroll();
   }
 
   fn scroll_by(&mut self, delta: isize) {
@@ -170,13 +244,17 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   vcs: V,
   request: DiffRequest,
   theme: Option<String>,
+  layout: Layout,
 ) -> io::Result<()> {
   let vcs = Arc::new(vcs);
   let (tx, rx) = mpsc::channel();
   spawn_input(tx.clone());
   spawn_load(vcs.clone(), request.clone(), tx.clone());
 
-  let mut app = App::default();
+  let mut app = App {
+    layout,
+    ..App::default()
+  };
   let mut worker: Option<Worker> = None;
   while !app.quit {
     terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -336,6 +414,91 @@ mod tests {
     app.on_highlighted(1, FileHighlight::default());
     assert!(app.highlights[0].is_none() && app.highlights[1].is_some());
     app.on_highlighted(9, FileHighlight::default());
+  }
+
+  /// Two hunks. Split rows: header, 1 context, 1 pair (3 removed vs 1 added) ...
+  fn mixed_file() -> FileDiff {
+    let line = |kind, old_no, new_no, text: &str| Line {
+      kind,
+      old_no,
+      new_no,
+      content: text.as_bytes().to_vec(),
+      no_newline: false,
+    };
+    let hunk = |start: u32, lines: Vec<Line>| Hunk {
+      old_start: start,
+      old_len: 0,
+      new_start: start,
+      new_len: 0,
+      heading: Vec::new(),
+      lines,
+    };
+    let (c, r, a) = (LineKind::Context, LineKind::Removed, LineKind::Added);
+    FileDiff {
+      hunks: vec![
+        hunk(
+          1,
+          vec![
+            line(c, Some(1), Some(1), "keep"),
+            line(r, Some(2), None, "r1"),
+            line(r, Some(3), None, "r2"),
+            line(r, Some(4), None, "r3"),
+            line(a, None, Some(2), "a1"),
+          ],
+        ),
+        hunk(
+          20,
+          vec![
+            line(c, Some(20), Some(18), "x"),
+            line(a, None, Some(19), "y"),
+          ],
+        ),
+      ],
+      ..file("m", 0)
+    }
+  }
+
+  #[test]
+  fn split_layout_row_counts_merge_removed_and_added_lines() {
+    let f = mixed_file();
+    assert_eq!(row_count(&f, Layout::Unified), 2 + 5 + 2);
+    // header + keep + 3 shared rows, header + 2 rows
+    assert_eq!(row_count(&f, Layout::Split), 5 + 3);
+  }
+
+  #[test]
+  fn toggling_layout_keeps_the_hunk_and_line_at_the_top() {
+    let mut app = ready(vec![mixed_file()], 1);
+    // Unified rows: 0 header, 1 keep, 2-4 r1-r3, 5 a1, 6 header, 7 x, 8 y.
+    // Split rows: 0 header, 1 keep, 2 r1|a1, 3 r2, 4 r3, 5 header, 6 x, 7 y.
+    for (unified, split) in [
+      (0, 0),
+      (1, 1),
+      (2, 2),
+      (3, 3),
+      (4, 4),
+      (5, 2),
+      (6, 5),
+      (7, 6),
+    ] {
+      app.layout = Layout::Unified;
+      app.scroll = unified;
+      app.on_key(key(KeyCode::Char('s')));
+      assert_eq!(app.layout, Layout::Split);
+      assert_eq!(app.scroll, split, "unified row {unified}");
+    }
+    app.scroll = 6;
+    app.on_key(key(KeyCode::Char('s')));
+    assert_eq!(app.layout, Layout::Unified);
+    assert_eq!(app.scroll, 7);
+  }
+
+  #[test]
+  fn toggling_without_files_only_flips_the_layout() {
+    let mut app = App::default();
+    app.on_key(key(KeyCode::Char('s')));
+    assert_eq!(app.layout, Layout::Split);
+    assert_eq!(app.scroll, 0);
   }
 
   #[test]
