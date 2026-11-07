@@ -358,10 +358,10 @@ diff --git a/a.rs b/a.rs
   fn expanded_lines_are_colored_from_the_whole_file() {
     let diff =
       "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -4 +4 @@\n-let x = 0;\n+let x = 1;\n";
-    let mut file = parse(diff.as_bytes()).unwrap().remove(0);
+    let file = parse(diff.as_bytes()).unwrap().remove(0);
     let old = b"/* start\nmiddle\nend */\nlet x = 0;\n";
     let new = b"/* start\nmiddle\nend */\nlet x = 1;\n";
-    file.expand(0, new);
+    let (file, _) = file.widened(&[5], new);
     let h = highlighter().diff(&file, &sides(Some(old), Some(new)));
     let lines = &h.hunks[0];
     assert_eq!(lines.len(), 5);

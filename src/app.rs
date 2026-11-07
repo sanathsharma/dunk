@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifi
 use ratatui::widgets::ListState;
 use std::collections::BTreeSet;
 use std::io;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -34,8 +34,8 @@ pub enum Event {
   /// The full contents of a file of the load with this number, read for an
   /// expansion.
   Sides(u64, usize, Arc<Sides>),
-  /// The colors of an expanded file: the load, the file and which of its
-  /// expansions they were made for.
+  /// The colors of a file shown with other context than it was loaded with:
+  /// the load, the file and which of its context changes they were made for.
   Rehighlighted(u64, usize, u32, FileHighlight),
   /// A stage or unstage finished. Carries the entry the selection moves to
   /// once the changeset is read again.
@@ -92,12 +92,24 @@ pub enum Load {
   Failed(String),
 }
 
-/// An expanded file waiting to be colored again.
+/// A file whose context changed, waiting to be colored again.
 pub struct Rehighlight {
   pub index: usize,
   pub generation: u32,
   pub file: FileDiff,
   pub sides: Arc<Sides>,
+}
+
+/// Lines of context a key press adds to or takes from each side of a hunk.
+const CONTEXT_STEP: u32 = 3;
+
+/// What a context key does to the hunk under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+  More,
+  Less,
+  /// Back to the context the changeset was loaded with.
+  Reset,
 }
 
 /// What the keys currently do. The footer names it.
@@ -122,20 +134,26 @@ pub struct App {
   /// Whether the help menu covers the diff. It takes every key until closed.
   pub help: bool,
   pub load: Load,
-  /// The files as shown, with any expanded gaps.
+  /// The files as shown, with any added context.
   pub files: Arc<Vec<FileDiff>>,
-  /// The files as git reported them, without expansion.
+  /// The files as git reported them, with the context it was asked for.
   pub loaded: Arc<Vec<FileDiff>>,
   /// Full file contents per file, parallel to `files`. `None` until the
-  /// first expansion of that file asks for them.
+  /// first widening of that file asks for them.
   sides: Vec<Option<Arc<Sides>>>,
   /// Which files `take_sides_request` already handed out.
   sides_requested: Vec<bool>,
-  /// An expansion waiting for its file contents: the file and the gaps to
-  /// try, best first.
-  pending_expand: Option<(usize, [usize; 2])>,
-  /// How many times each file was expanded. Colors made for an earlier count
-  /// do not fit its lines.
+  /// A widening waiting for its file contents: the file and the hunks of
+  /// `loaded` to widen.
+  pending_widen: Option<(usize, Range<usize>)>,
+  /// Lines of context added on each side of every hunk of `loaded`, per file.
+  /// Always a multiple of `CONTEXT_STEP`.
+  context: Vec<Vec<u32>>,
+  /// For each hunk of `files`, the index of the first hunk of `loaded` it
+  /// holds. The hunks between two entries were merged into one.
+  owners: Vec<Vec<usize>>,
+  /// How many times each file's context changed. Colors made for an earlier
+  /// count do not fit its lines.
   expansions: Vec<u32>,
   rehighlight: Option<Rehighlight>,
   index_request: Option<IndexRequest>,
@@ -175,7 +193,9 @@ impl Default for App {
       loaded: Arc::new(Vec::new()),
       sides: Vec::new(),
       sides_requested: Vec::new(),
-      pending_expand: None,
+      pending_widen: None,
+      context: Vec::new(),
+      owners: Vec::new(),
       expansions: Vec::new(),
       rehighlight: None,
       index_request: None,
@@ -319,8 +339,10 @@ impl App {
     self.sides = files.iter().map(|_| None).collect();
     self.sides_requested = vec![false; files.len()];
     self.expansions = vec![0; files.len()];
+    self.context = files.iter().map(|f| vec![0; f.hunks.len()]).collect();
+    self.owners = files.iter().map(|f| (0..f.hunks.len()).collect()).collect();
     self.rehighlight = None;
-    self.pending_expand = None;
+    self.pending_widen = None;
     let index = followed
       .or(kept)
       .unwrap_or(self.selected.min(files.len().saturating_sub(1)));
@@ -345,7 +367,7 @@ impl App {
   }
 
   /// Takes the colors of file `index` as it was after `generation`
-  /// expansions. Colors for any other count would not fit its lines.
+  /// context changes. Colors for any other count would not fit its lines.
   pub fn on_rehighlighted(&mut self, index: usize, generation: u32, highlight: FileHighlight) {
     if self.expansions.get(index) == Some(&generation)
       && let Some(slot) = self.highlights.get_mut(index)
@@ -354,21 +376,22 @@ impl App {
     }
   }
 
-  /// Takes the expanded file that needs new colors.
+  /// Takes the file whose context changed and that needs new colors.
   pub fn take_rehighlight(&mut self) -> Option<Rehighlight> {
     self.rehighlight.take()
   }
 
-  /// Takes the file whose full contents an expansion is waiting for. Each
+  /// Takes the file whose full contents a widening is waiting for. Each
   /// file is handed out once, until a reload replaces it.
   pub fn take_sides_request(&mut self) -> Option<usize> {
-    let (index, _) = self.pending_expand?;
+    let (index, _) = self.pending_widen.as_ref()?;
+    let index = *index;
     let requested = self.sides_requested.get_mut(index)?;
     (!std::mem::replace(requested, true)).then_some(index)
   }
 
-  /// Takes the full contents of a file and finishes the expansion waiting
-  /// for them.
+  /// Takes the full contents of a file and finishes the widening waiting for
+  /// them.
   pub fn on_sides(&mut self, index: usize, sides: Arc<Sides>) {
     let Some(slot) = self.sides.get_mut(index) else {
       return;
@@ -376,7 +399,7 @@ impl App {
     if sides.new.is_none() {
       // Leave the slot empty so the next key press tries the read again.
       self.sides_requested[index] = false;
-      self.pending_expand = None;
+      self.pending_widen = None;
       self.notice = Some(format!(
         "Cannot read {}",
         self.files[index].path().display()
@@ -384,11 +407,12 @@ impl App {
       return;
     }
     *slot = Some(sides.clone());
-    if let Some((wanted, gaps)) = self.pending_expand
-      && wanted == index
-    {
-      self.pending_expand = None;
-      self.reveal(index, &sides, gaps);
+    if let Some((wanted, hunks)) = self.pending_widen.take() {
+      if wanted == index {
+        self.set_context(index, hunks, Step::More);
+      } else {
+        self.pending_widen = Some((wanted, hunks));
+      }
     }
   }
 
@@ -632,7 +656,9 @@ impl App {
         self.cursor = self.rows().saturating_sub(1);
       }
       KeyCode::Char('s') => self.toggle_layout(),
-      KeyCode::Char('e') => self.expand_at_top(),
+      KeyCode::Char('+') => self.change_context(Step::More),
+      KeyCode::Char('-') => self.change_context(Step::Less),
+      KeyCode::Char('=') => self.change_context(Step::Reset),
       KeyCode::Char('f') => self.toggle_stage(),
       KeyCode::Char('a') => {
         self.toggle_stage_hunk(None);
@@ -745,63 +771,89 @@ impl App {
     self.clamp_scroll();
   }
 
-  /// Reveals the unchanged lines next to the hunk at the top of the pane:
-  /// the gap above it when the top row is in its first half, the gap below
-  /// otherwise. An empty gap falls back to the other one. The scroll index
-  /// stays, so expanding upward puts the revealed lines at the top of the
-  /// pane and expanding downward puts them below the rows already in view.
-  fn expand_at_top(&mut self) {
+  /// Changes the context of the hunk under the cursor, and of the hunks
+  /// merged into it. Adding context needs the file's contents, which are asked
+  /// for first.
+  fn change_context(&mut self, step: Step) {
     let Some(file) = self.files.get(self.selected) else {
       return;
     };
-    let Some((hunk, line)) = locate(file, self.layout, self.scroll) else {
+    let Some((hunk, _)) = locate(file, self.layout, self.cursor) else {
       return;
     };
-    let lower_half = line.is_some_and(|l| l >= file.hunks[hunk].lines.len().div_ceil(2));
-    let gaps = if lower_half {
-      [hunk + 1, hunk]
+    let owners = &self.owners[self.selected];
+    let end = owners
+      .get(hunk + 1)
+      .copied()
+      .unwrap_or(self.loaded[self.selected].hunks.len());
+    let hunks = owners[hunk]..end;
+    if step == Step::More && self.sides[self.selected].is_none() {
+      self.pending_widen = Some((self.selected, hunks));
     } else {
-      [hunk, hunk + 1]
-    };
-    match self.sides.get(self.selected).cloned().flatten() {
-      Some(sides) => self.reveal(self.selected, &sides, gaps),
-      None => self.pending_expand = Some((self.selected, gaps)),
+      self.set_context(self.selected, hunks, step);
     }
   }
 
-  /// Expands the first of `gaps` that has lines to show.
-  fn reveal(&mut self, index: usize, sides: &Arc<Sides>, gaps: [usize; 2]) {
-    let Some(text) = sides.new.as_deref() else {
+  /// Gives hunks `hunks` of file `index` more or less context, or none.
+  /// Says so when that changes nothing.
+  fn set_context(&mut self, index: usize, hunks: Range<usize>, step: Step) {
+    let before = &self.context[index];
+    let mut context = before.clone();
+    for extra in &mut context[hunks.clone()] {
+      *extra = match step {
+        Step::More => *extra + CONTEXT_STEP,
+        Step::Less => extra.saturating_sub(CONTEXT_STEP),
+        Step::Reset => 0,
+      };
+    }
+    if context == *before {
+      self.notice = Some("Already at the default context".into());
       return;
+    }
+    let loaded = &self.loaded[index];
+    let (file, owners) = if context.iter().all(|&extra| extra == 0) {
+      (loaded.clone(), (0..loaded.hunks.len()).collect())
+    } else {
+      let Some(text) = self.sides[index].as_ref().and_then(|s| s.new.as_deref()) else {
+        return;
+      };
+      loaded.widened(&context, text)
     };
-    let anchor = self.cursor_line_numbers();
-    let files = Arc::make_mut(&mut self.files);
     let lines = |f: &FileDiff| f.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
-    let before = lines(&files[index]);
-    for gap in gaps {
-      files[index].expand(gap, text);
-      if lines(&files[index]) != before {
-        break;
-      }
-    }
-    if lines(&files[index]) == before {
-      self.notice = Some("No unchanged lines to show here".into());
+    if step == Step::More && lines(&file) == lines(&self.files[index]) {
+      self.notice = Some("No more unchanged lines to show here".into());
       return;
     }
+    let anchor = self.cursor_line_numbers();
+    let shown = owners
+      .iter()
+      .rposition(|&first| first <= hunks.start)
+      .unwrap_or(0);
+    Arc::make_mut(&mut self.files)[index] = file;
+    self.context[index] = context;
+    self.owners[index] = owners;
     self.expansions[index] += 1;
     self.words[index] = None;
     self.highlights[index] = None;
-    self.rehighlight = Some(Rehighlight {
-      index,
-      generation: self.expansions[index],
-      file: self.files[index].clone(),
-      sides: sides.clone(),
-    });
+    if let Some(sides) = self.sides[index].clone() {
+      self.rehighlight = Some(Rehighlight {
+        index,
+        generation: self.expansions[index],
+        file: self.files[index].clone(),
+        sides,
+      });
+    }
     self.scroll = self.scroll.min(self.max_scroll());
-    self.cursor = anchor
-      .and_then(|numbers| self.row_with_numbers(numbers))
-      .unwrap_or(self.cursor);
-    self.clamp_cursor_to_view();
+    match anchor.and_then(|numbers| self.row_with_numbers(numbers)) {
+      Some(row) => self.cursor = row,
+      None => {
+        // The line under the cursor is hidden now. Go to the hunk that held it.
+        let file = &self.files[index];
+        let first = file.hunks[shown].changed().next();
+        self.cursor = row_of(file, self.layout, shown, first);
+      }
+    }
+    self.clamp_scroll();
   }
 
   /// Old and new line numbers of the line under the cursor, if it is on a
@@ -1575,20 +1627,27 @@ mod tests {
     })
   }
 
+  fn plus(app: &mut App) {
+    app.on_key(key(KeyCode::Char('+')));
+  }
+
   #[test]
-  fn the_expand_key_asks_for_the_file_then_reveals_the_gap_at_the_top() {
+  fn the_plus_key_asks_for_the_file_then_widens_the_hunk_under_the_cursor() {
     let mut app = ready(vec![gapped_file()], 5);
     app.scroll = 2;
     app.cursor = 2;
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     assert_eq!(app.take_sides_request(), Some(0));
     assert_eq!(app.take_sides_request(), None);
     assert_eq!(app.files[0].hunks.len(), 2);
 
     app.on_sides(0, gapped_sides());
+    assert_eq!(app.files[0].hunks.len(), 2);
+    assert_eq!(app.files[0].hunks[0].lines.len(), 4 + 3);
+    plus(&mut app);
     let hunks = &app.files[0].hunks;
     assert_eq!(hunks.len(), 1);
-    assert_eq!(row_count(&app.files[0], Layout::Unified), 1 + 11);
+    assert_eq!(row_count(&app.files[0], Layout::Unified), 1 + 9 + 2);
     let numbers: Vec<_> = hunks[0].lines[4..8]
       .iter()
       .map(|l| (l.old_no, l.new_no))
@@ -1606,49 +1665,101 @@ mod tests {
   }
 
   #[test]
-  fn expanding_keeps_the_viewport_and_the_cursor_inside_it() {
+  fn widening_keeps_the_viewport_and_the_cursor_inside_it() {
     let mut app = ready(vec![gapped_file()], 5);
     app.cursor = 4;
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     app.on_sides(0, gapped_sides());
-    assert_eq!(app.scroll, 0);
     assert!((app.scroll..app.scroll + 5).contains(&app.cursor));
+    let line = app.files[0].hunks[0].lines[app.cursor - app.scroll - 1].clone();
+    assert_eq!(line.new_no, Some(3));
   }
 
   #[test]
-  fn an_identical_reload_keeps_expanded_gaps_and_the_file_contents() {
+  fn the_minus_key_takes_a_step_of_context_back_and_splits_merged_hunks() {
     let mut app = ready(vec![gapped_file()], 20);
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     app.on_sides(0, gapped_sides());
-    assert!(!app.on_loaded(Ok(vec![gapped_file()])));
+    plus(&mut app);
     assert_eq!(app.files[0].hunks.len(), 1);
+    app.cursor = 2;
+    app.on_key(key(KeyCode::Char('-')));
+    assert_eq!(app.files[0].hunks.len(), 2);
+    app.on_key(key(KeyCode::Char('-')));
+    assert_eq!(app.files[0], gapped_file());
+    assert_eq!(app.notice, None);
+    assert_eq!(app.take_sides_request(), None);
+  }
+
+  #[test]
+  fn the_equals_key_returns_to_the_loaded_context() {
+    let mut app = ready(vec![gapped_file()], 20);
+    plus(&mut app);
+    app.on_sides(0, gapped_sides());
+    plus(&mut app);
+    app.cursor = 2;
+    app.on_key(key(KeyCode::Char('=')));
+    assert_eq!(app.files[0], gapped_file());
+  }
+
+  #[test]
+  fn narrowing_at_the_loaded_context_says_so() {
+    let mut app = ready(vec![gapped_file()], 20);
+    app.on_key(key(KeyCode::Char('-')));
+    assert_eq!(
+      app.notice.as_deref(),
+      Some("Already at the default context")
+    );
+    app.on_key(key(KeyCode::Char('=')));
+    assert_eq!(
+      app.notice.as_deref(),
+      Some("Already at the default context")
+    );
+    assert_eq!(app.take_sides_request(), None);
+  }
+
+  #[test]
+  fn the_old_expand_key_does_nothing() {
+    let mut app = ready(vec![gapped_file()], 20);
     app.on_key(key(KeyCode::Char('e')));
     assert_eq!(app.take_sides_request(), None);
   }
 
   #[test]
-  fn a_changed_reload_drops_expansions_and_reads_the_file_again() {
+  fn an_identical_reload_keeps_the_context_and_the_file_contents() {
     let mut app = ready(vec![gapped_file()], 20);
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
+    app.on_sides(0, gapped_sides());
+    plus(&mut app);
+    assert!(!app.on_loaded(Ok(vec![gapped_file()])));
+    assert_eq!(app.files[0].hunks.len(), 1);
+    plus(&mut app);
+    assert_eq!(app.take_sides_request(), None);
+  }
+
+  #[test]
+  fn a_changed_reload_drops_the_context_and_reads_the_file_again() {
+    let mut app = ready(vec![gapped_file()], 20);
+    plus(&mut app);
     app.on_sides(0, gapped_sides());
     let mut other = gapped_file();
     other.hunks.pop();
     assert!(app.on_loaded(Ok(vec![other])));
     assert_eq!(app.files[0].hunks[0].lines.len(), 4);
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     assert_eq!(app.take_sides_request(), Some(0));
   }
 
   #[test]
-  fn an_expanded_file_is_recolored_and_stale_colors_are_dropped() {
+  fn a_file_with_changed_context_is_recolored_and_stale_colors_are_dropped() {
     let mut app = ready(vec![gapped_file()], 20);
     app.on_highlighted(0, FileHighlight::default());
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     assert!(app.take_rehighlight().is_none());
     app.on_sides(0, gapped_sides());
     assert!(app.highlights[0].is_none());
     let job = app.take_rehighlight().unwrap();
-    assert_eq!((job.index, job.generation, job.file.hunks.len()), (0, 1, 1));
+    assert_eq!((job.index, job.generation, job.file.hunks.len()), (0, 1, 2));
 
     app.on_highlighted(0, FileHighlight::default());
     assert!(app.highlights[0].is_none());
@@ -1659,27 +1770,32 @@ mod tests {
   #[test]
   fn an_unreadable_file_leaves_the_diff_as_it_was_says_so_and_can_be_retried() {
     let mut app = ready(vec![gapped_file()], 20);
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     assert_eq!(app.take_sides_request(), Some(0));
     app.on_sides(0, Arc::new(Sides::default()));
     assert_eq!(app.files[0], gapped_file());
     assert_eq!(app.notice.as_deref(), Some("Cannot read f"));
 
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     assert_eq!(app.notice, None);
     assert_eq!(app.take_sides_request(), Some(0));
   }
 
   #[test]
-  fn expanding_with_nothing_left_to_show_says_so() {
+  fn widening_with_nothing_left_to_show_says_so_and_keeps_the_step_count() {
     let mut app = ready(vec![gapped_file()], 20);
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
     app.on_sides(0, gapped_sides());
-    app.on_key(key(KeyCode::Char('e')));
+    plus(&mut app);
+    plus(&mut app);
     assert_eq!(
       app.notice.as_deref(),
-      Some("No unchanged lines to show here")
+      Some("No more unchanged lines to show here")
     );
+    app.cursor = 2;
+    app.on_key(key(KeyCode::Char('-')));
+    app.on_key(key(KeyCode::Char('-')));
+    assert_eq!(app.files[0], gapped_file());
   }
 
   #[test]

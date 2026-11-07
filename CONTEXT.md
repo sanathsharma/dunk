@@ -24,6 +24,10 @@ _Avoid_: approve, mark as reviewed
 **Staged**:
 A change that is already in the index and so would go into the next commit. A change that is not is **unstaged**; an untracked file is unstaged until it is added.
 
+**Context**:
+The unchanged lines shown above and below a change in a hunk. The `context` setting, or git's default of 3 when unset, gives the default amount. `+` adds 3 lines on each side of the hunk under the cursor, `-` takes 3 away and `=` returns to the default. Hunks whose context touches merge into one.
+_Avoid_: expand, collapse (for changing the amount), unchanged lines (as a term)
+
 **Mode**:
 What the keys currently do. In normal mode keys move around and act on a file or hunk. In visual mode keys extend a selection of lines. The footer always names the current mode.
 
