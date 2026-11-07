@@ -2,6 +2,9 @@ use crate::diff::{Hunk, LineKind};
 use similar::{ChangeTag, TextDiff};
 use std::ops::Range;
 
+/// Changed word ranges per hunk, then per line. See `changed_words`.
+pub type FileWords = Vec<Vec<Vec<Range<usize>>>>;
+
 /// Byte ranges of changed words for every line of a hunk, indexed like
 /// `Hunk::lines`. A run of removed lines directly followed by a run of added
 /// lines is paired in order. Lines without a partner get an empty list.

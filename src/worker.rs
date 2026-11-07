@@ -90,16 +90,12 @@ impl Shared {
 mod tests {
   use super::*;
   use crate::diff::parse;
-  use crate::vcs::{Error, Sides, Status, VersionId};
+  use crate::vcs::{Error, Sides, VersionId};
   use std::sync::mpsc;
 
   struct Fake;
 
   impl Vcs for Fake {
-    fn status(&self) -> Result<Status, Error> {
-      unreachable!()
-    }
-
     fn diff(&self, _: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
       unreachable!()
     }

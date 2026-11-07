@@ -1,10 +1,9 @@
 mod git;
 
 use crate::args::Scope;
-use crate::diff::{FileDiff, ParseError};
+use crate::diff::{FileDiff, ParseError, Section};
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
 
 pub use git::Git;
 
@@ -39,60 +38,13 @@ impl From<io::Error> for Error {
   }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChangeKind {
-  Added,
-  Modified,
-  Deleted,
-  Renamed { from: PathBuf },
-  Copied { from: PathBuf },
-  TypeChanged,
-  Unmerged,
-}
-
-impl ChangeKind {
-  pub fn letter(&self) -> char {
+impl Section {
+  /// The scope that selects only this section.
+  pub fn scope(self) -> Scope {
     match self {
-      ChangeKind::Added => 'A',
-      ChangeKind::Modified => 'M',
-      ChangeKind::Deleted => 'D',
-      ChangeKind::Renamed { .. } => 'R',
-      ChangeKind::Copied { .. } => 'C',
-      ChangeKind::TypeChanged => 'T',
-      ChangeKind::Unmerged => 'U',
+      Section::Unstaged => Scope::Unstaged,
+      Section::Staged => Scope::Staged,
     }
-  }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileChange {
-  pub path: PathBuf,
-  pub kind: ChangeKind,
-}
-
-/// The changed files of a repository, grouped by where the change lives.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Status {
-  pub staged: Vec<FileChange>,
-  pub unstaged: Vec<FileChange>,
-  pub untracked: Vec<PathBuf>,
-}
-
-impl Status {
-  /// Drops the groups outside `scope`. Untracked files count as unstaged.
-  pub fn retain_scope(&mut self, scope: Scope) {
-    match scope {
-      Scope::All => {}
-      Scope::Staged => {
-        self.unstaged.clear();
-        self.untracked.clear();
-      }
-      Scope::Unstaged => self.staged.clear(),
-    }
-  }
-
-  pub fn is_empty(&self) -> bool {
-    self.staged.is_empty() && self.unstaged.is_empty() && self.untracked.is_empty()
   }
 }
 
@@ -126,8 +78,32 @@ pub struct Sides {
 }
 
 pub trait Vcs {
-  fn status(&self) -> Result<Status, Error>;
   fn diff(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error>;
+
+  /// The entries to list for `request`. A working tree request gives the
+  /// unstaged entries, then the staged ones, each tagged with its section and
+  /// limited by the scope. Revisions give one untagged list.
+  fn changeset(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
+    if !request.revisions.is_empty() {
+      return self.diff(request);
+    }
+    let mut entries = Vec::new();
+    for section in [Section::Unstaged, Section::Staged] {
+      if request.scope != Scope::All && request.scope != section.scope() {
+        continue;
+      }
+      let part = DiffRequest {
+        scope: section.scope(),
+        ..request.clone()
+      };
+      entries.extend(self.diff(&part)?.into_iter().map(|mut f| {
+        f.section = Some(section);
+        f
+      }));
+    }
+    Ok(entries)
+  }
+
   /// Reads both versions of `file` as `request` compared them.
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;
 }

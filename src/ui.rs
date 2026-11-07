@@ -1,6 +1,6 @@
-use crate::app::{App, Load};
+use crate::app::{App, ListRow, Load};
 use crate::args::Layout as DiffLayout;
-use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind};
+use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind, Section};
 use crate::highlight::Styled;
 use crate::split::pairs;
 use crate::words::changed_words;
@@ -72,16 +72,29 @@ fn status_color(status: FileStatus) -> Color {
 
 fn render_files(frame: &mut Frame, area: Rect, app: &mut App) {
   let items: Vec<ListItem> = app
-    .files
-    .iter()
-    .map(|f| {
-      ListItem::new(Line::from(vec![
-        Span::styled(
-          format!("{} ", f.status.letter()),
-          Style::new().fg(status_color(f.status)),
-        ),
-        Span::raw(f.path().display().to_string()),
-      ]))
+    .list_rows()
+    .into_iter()
+    .map(|row| match row {
+      ListRow::Header(section, count) => {
+        let name = match section {
+          Section::Unstaged => "Unstaged",
+          Section::Staged => "Staged",
+        };
+        ListItem::new(Line::styled(
+          format!("{name} ({count})"),
+          Style::new().add_modifier(Modifier::BOLD),
+        ))
+      }
+      ListRow::Entry(index) => {
+        let f = &app.files[index];
+        ListItem::new(Line::from(vec![
+          Span::styled(
+            format!("{} ", f.status.letter()),
+            Style::new().fg(status_color(f.status)),
+          ),
+          Span::raw(f.path().display().to_string()),
+        ]))
+      }
     })
     .collect();
   let list = List::new(items)
@@ -343,9 +356,10 @@ fn sanitize(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::diff::{FileStatus, parse};
+  use crate::diff::{FileStatus, Section, parse};
   use ratatui::Terminal;
   use ratatui::backend::TestBackend;
+  use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
   const DIFF: &str = "\
 diff --git a/src/a.rs b/src/a.rs
@@ -433,6 +447,71 @@ new file mode 100644
     assert!(rows.iter().any(|r| r.contains("+new")));
   }
 
+  fn sectioned_app(sections: &[Section]) -> App {
+    let mut files = parse(DIFF.as_bytes()).unwrap();
+    files.truncate(1);
+    let entries = sections
+      .iter()
+      .map(|&s| FileDiff {
+        section: Some(s),
+        ..files[0].clone()
+      })
+      .collect();
+    let mut app = App::default();
+    app.on_loaded(Ok(entries));
+    app
+  }
+
+  #[test]
+  fn sections_get_headers_with_counts_and_each_entry_its_own_row() {
+    let mut app = sectioned_app(&[Section::Unstaged, Section::Unstaged, Section::Staged]);
+    let (_, rows) = draw(&mut app, 80, 14);
+    let at = |needle: &str| row_with(&rows, needle).0;
+    assert!(at("Unstaged (2)") < at("Staged (1)"));
+    let entries: Vec<_> = rows
+      .iter()
+      .enumerate()
+      .filter(|(_, r)| r.contains("M src/a.rs"))
+      .map(|(y, _)| y)
+      .collect();
+    assert_eq!(entries.len(), 3);
+    assert!(at("Unstaged (2)") < entries[0] && entries[1] < at("Staged (1)"));
+    assert!(at("Staged (1)") < entries[2]);
+  }
+
+  #[test]
+  fn an_empty_section_has_no_header() {
+    let (_, rows) = draw(&mut sectioned_app(&[Section::Staged]), 80, 14);
+    assert!(rows.iter().any(|r| r.contains("Staged (1)")));
+    assert!(!rows.iter().any(|r| r.contains("Unstaged")));
+    let (_, rows) = draw(&mut sectioned_app(&[Section::Unstaged]), 80, 14);
+    assert!(rows.iter().any(|r| r.contains("Unstaged (1)")));
+    assert!(!rows.iter().any(|r| r.contains(" Staged")));
+  }
+
+  #[test]
+  fn a_revision_lists_files_flat_without_headers() {
+    let (_, rows) = draw(&mut app_with(DIFF), 80, 14);
+    assert!(!rows.iter().any(|r| r.contains("Staged (")));
+  }
+
+  #[test]
+  fn the_highlighted_row_is_the_entry_not_the_header() {
+    let mut app = sectioned_app(&[Section::Unstaged, Section::Staged]);
+    app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let (terminal, rows) = draw(&mut app, 80, 14);
+    let buffer = terminal.backend().buffer();
+    let (y, row) = row_with(&rows, "Staged (1)");
+    let x = row.find("Staged").unwrap() as u16;
+    assert!(!buffer[(x, y as u16)].modifier.contains(Modifier::REVERSED));
+    let x = rows[y + 1].find("src/a.rs").unwrap() as u16;
+    assert!(
+      buffer[(x, y as u16 + 1)]
+        .modifier
+        .contains(Modifier::REVERSED)
+    );
+  }
+
   #[test]
   fn added_and_removed_lines_get_background_colors() {
     let mut app = app_with(DIFF);
@@ -457,8 +536,9 @@ new file mode 100644
     assert_eq!(terminal.backend().buffer()[(x, y as u16)].fg, Color::Reset);
 
     let red = Style::new().fg(Color::Rgb(200, 1, 2));
-    let mut h = FileHighlight::default();
-    h.hunks = vec![vec![None, None, Some(vec![(red, "new".to_string())]), None]];
+    let h = FileHighlight {
+      hunks: vec![vec![None, None, Some(vec![(red, "new".to_string())]), None]],
+    };
     app.on_highlighted(0, h);
     let (terminal, rows) = draw(&mut app, 80, 14);
     let (y, row) = row_with(&rows, "+new");
@@ -486,6 +566,7 @@ new file mode 100644
   }
 
   #[test]
+  #[allow(clippy::single_range_in_vec_init)]
   fn emphasis_keeps_syntax_colors_and_splits_pieces() {
     let red = Style::new().fg(Color::Red);
     let pieces = vec![(red, "ab".to_string()), (Style::new(), "cd".to_string())];

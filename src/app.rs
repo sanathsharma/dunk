@@ -1,17 +1,17 @@
 use crate::args::Layout;
-use crate::diff::{FileDiff, Hunk};
+use crate::diff::{FileDiff, Hunk, Section};
 use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
 use crate::split;
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Sides, Vcs};
 use crate::watch::Watch;
+use crate::words::FileWords;
 use crate::worker::Worker;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::io;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -74,7 +74,7 @@ pub struct App {
   pub highlights: Vec<Option<FileHighlight>>,
   /// Changed word ranges per file, hunk and line, filled when a file is first
   /// drawn. See `words::changed_words`.
-  pub words: Vec<Option<Vec<Vec<Vec<Range<usize>>>>>>,
+  pub words: Vec<Option<FileWords>>,
   pub layout: Layout,
   pub selected: usize,
   pub list_state: ListState,
@@ -107,6 +107,15 @@ impl Default for App {
       quit: false,
     }
   }
+}
+
+/// One row of the file list. Only entries can be selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListRow {
+  /// A section heading with the number of entries under it.
+  Header(Section, usize),
+  /// The file at this index of `App::files`.
+  Entry(usize),
 }
 
 /// Rows a hunk occupies: its header plus one row per line (unified) or per
@@ -181,10 +190,11 @@ impl App {
     if *self.loaded == files {
       return false;
     }
-    let kept = self
-      .files
-      .get(self.selected)
-      .and_then(|old| files.iter().position(|f| f.path() == old.path()));
+    let kept = self.files.get(self.selected).and_then(|old| {
+      files
+        .iter()
+        .position(|f| f.path() == old.path() && f.section == old.section)
+    });
     let scroll = if kept.is_some() { self.scroll } else { 0 };
     self.highlights = files.iter().map(|_| None).collect();
     self.words = files.iter().map(|_| None).collect();
@@ -368,12 +378,36 @@ impl App {
     self.clamp_scroll();
   }
 
+  /// The file list as drawn: a header before each section's entries, none
+  /// when the entries have no section.
+  pub fn list_rows(&self) -> Vec<ListRow> {
+    let mut rows = Vec::new();
+    let mut current = None;
+    for (index, file) in self.files.iter().enumerate() {
+      if let Some(section) = file.section
+        && current != Some(section)
+      {
+        current = Some(section);
+        let count = self
+          .files
+          .iter()
+          .filter(|f| f.section == Some(section))
+          .count();
+        rows.push(ListRow::Header(section, count));
+      }
+      rows.push(ListRow::Entry(index));
+    }
+    rows
+  }
+
   fn select(&mut self, index: usize) {
     self.selected = index;
     self.scroll = 0;
-    self
-      .list_state
-      .select((!self.files.is_empty()).then_some(index));
+    let row = self
+      .list_rows()
+      .iter()
+      .position(|r| *r == ListRow::Entry(index));
+    self.list_state.select(row);
   }
 
   fn select_by(&mut self, delta: isize) {
@@ -393,7 +427,7 @@ fn spawn_load(
   tx: Sender<Event>,
 ) {
   thread::spawn(move || {
-    let _ = tx.send(Event::Loaded(id, vcs.diff(&request)));
+    let _ = tx.send(Event::Loaded(id, vcs.changeset(&request)));
   });
 }
 
@@ -543,6 +577,7 @@ mod tests {
       new_path: Some(PathBuf::from(name)),
       status: FileStatus::Modified,
       binary: false,
+      section: None,
       hunks: vec![Hunk {
         old_start: 1,
         old_len: lines as u32,
@@ -758,6 +793,94 @@ mod tests {
     assert_eq!(app.list_state.selected(), Some(0));
   }
 
+  fn entry(name: &str, section: Section) -> FileDiff {
+    FileDiff {
+      section: Some(section),
+      ..file(name, 3)
+    }
+  }
+
+  fn sectioned() -> Vec<FileDiff> {
+    vec![
+      entry("a", Section::Unstaged),
+      entry("b", Section::Unstaged),
+      entry("a", Section::Staged),
+    ]
+  }
+
+  #[test]
+  fn list_rows_put_a_header_with_its_count_before_each_section() {
+    let app = ready(sectioned(), 5);
+    assert_eq!(
+      app.list_rows(),
+      [
+        ListRow::Header(Section::Unstaged, 2),
+        ListRow::Entry(0),
+        ListRow::Entry(1),
+        ListRow::Header(Section::Staged, 1),
+        ListRow::Entry(2),
+      ]
+    );
+    let staged_only = ready(vec![entry("a", Section::Staged)], 5);
+    assert_eq!(
+      staged_only.list_rows(),
+      [ListRow::Header(Section::Staged, 1), ListRow::Entry(0)]
+    );
+    let flat = ready(vec![file("a", 1), file("b", 1)], 5);
+    assert_eq!(flat.list_rows(), [ListRow::Entry(0), ListRow::Entry(1)]);
+  }
+
+  #[test]
+  fn selection_moves_through_both_sections_and_skips_headers() {
+    let mut app = ready(sectioned(), 5);
+    // Row 0 is the unstaged header, so the first entry sits on row 1.
+    assert_eq!((app.selected, app.list_state.selected()), (0, Some(1)));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!((app.selected, app.list_state.selected()), (1, Some(2)));
+    app.on_key(key(KeyCode::Char('n')));
+    assert_eq!((app.selected, app.list_state.selected()), (2, Some(4)));
+    app.on_key(key(KeyCode::Char('n')));
+    assert_eq!(app.selected, 2);
+    app.on_key(key(KeyCode::Char('p')));
+    assert_eq!((app.selected, app.list_state.selected()), (1, Some(2)));
+    app.on_key(key(KeyCode::BackTab));
+    app.on_key(key(KeyCode::BackTab));
+    assert_eq!((app.selected, app.list_state.selected()), (0, Some(1)));
+  }
+
+  #[test]
+  fn a_reload_keeps_the_same_path_in_the_same_section_selected() {
+    let mut app = ready(sectioned(), 5);
+    app.on_key(key(KeyCode::Char('G')));
+    app.on_key(key(KeyCode::Char('n')));
+    app.on_key(key(KeyCode::Char('n')));
+    assert_eq!(app.selected, 2);
+    // The unstaged "b" disappears; the staged "a" moves up but stays selected.
+    let reloaded = vec![entry("a", Section::Unstaged), entry("a", Section::Staged)];
+    assert!(app.on_loaded(Ok(reloaded)));
+    assert_eq!(app.selected, 1);
+    assert_eq!(app.files[1].section, Some(Section::Staged));
+    assert_eq!(app.list_state.selected(), Some(3));
+  }
+
+  #[test]
+  fn a_file_in_both_sections_is_two_entries_with_their_own_diffs() {
+    let mut staged = entry("a", Section::Staged);
+    staged.hunks.clear();
+    let mut app = ready(vec![entry("a", Section::Unstaged), staged], 5);
+    assert_eq!(row_count(&app.files[0], Layout::Unified), 4);
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.files[app.selected].path(), Path::new("a"));
+    assert_eq!(row_count(&app.files[app.selected], Layout::Unified), 0);
+  }
+
+  #[test]
+  fn a_reload_that_only_moves_a_file_between_sections_counts_as_a_change() {
+    let mut app = ready(vec![entry("a", Section::Unstaged)], 5);
+    assert!(app.on_loaded(Ok(vec![entry("a", Section::Staged)])));
+    assert_eq!(app.files[0].section, Some(Section::Staged));
+  }
+
   #[test]
   fn a_reload_clamps_the_scroll_when_the_file_shrinks() {
     let mut app = ready(vec![file("a", 30)], 5);
@@ -935,10 +1058,6 @@ mod tests {
   struct Slow(std::sync::Mutex<mpsc::Receiver<()>>);
 
   impl Vcs for Slow {
-    fn status(&self) -> Result<vcs::Status, vcs::Error> {
-      unreachable!()
-    }
-
     fn diff(&self, _: &DiffRequest) -> Result<Vec<FileDiff>, vcs::Error> {
       self.0.lock().unwrap().recv().unwrap();
       Ok(vec![file("slow", 1)])
@@ -961,9 +1080,11 @@ mod tests {
       tx,
     );
     assert!(rx.try_recv().is_err());
+    // One release per section of the default working tree request.
+    release.send(()).unwrap();
     release.send(()).unwrap();
     match rx.recv().unwrap() {
-      Event::Loaded(7, Ok(files)) => assert_eq!(files.len(), 1),
+      Event::Loaded(7, Ok(files)) => assert_eq!(files.len(), 2),
       _ => panic!("expected a loaded diff"),
     }
   }

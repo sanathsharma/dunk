@@ -53,12 +53,21 @@ pub struct Hunk {
   pub lines: Vec<Line>,
 }
 
+/// The part of the working tree a file entry belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+  Unstaged,
+  Staged,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
   pub old_path: Option<PathBuf>,
   pub new_path: Option<PathBuf>,
   pub status: FileStatus,
   pub binary: bool,
+  /// Set for entries of a working tree changeset; `None` for a revision.
+  pub section: Option<Section>,
   pub hunks: Vec<Hunk>,
 }
 
@@ -306,7 +315,7 @@ fn hunk_header(line: &[u8]) -> Option<Hunk> {
 
 /// Reads hunk lines by the counts in the header, so a content line that looks
 /// like `diff --git` or `--- ` cannot end the hunk early.
-fn hunk_lines<'a>(hunk: &mut Hunk, lines: &[&'a [u8]], mut i: usize) -> Result<usize, ParseError> {
+fn hunk_lines(hunk: &mut Hunk, lines: &[&[u8]], mut i: usize) -> Result<usize, ParseError> {
   let (mut old_left, mut new_left) = (hunk.old_len, hunk.new_len);
   let (mut old_no, mut new_no) = (hunk.old_start, hunk.new_start);
   while old_left > 0 || new_left > 0 {
@@ -353,11 +362,7 @@ fn hunk_lines<'a>(hunk: &mut Hunk, lines: &[&'a [u8]], mut i: usize) -> Result<u
   Ok(i)
 }
 
-fn file_diff<'a>(
-  rest: &[u8],
-  lines: &[&'a [u8]],
-  mut i: usize,
-) -> Result<(FileDiff, usize), ParseError> {
+fn file_diff(rest: &[u8], lines: &[&[u8]], mut i: usize) -> Result<(FileDiff, usize), ParseError> {
   let (old_path, new_path) = match git_line_paths(rest) {
     Some((o, n)) => (Some(o), Some(n)),
     None => (None, None),
@@ -367,6 +372,7 @@ fn file_diff<'a>(
     new_path,
     status: FileStatus::Modified,
     binary: false,
+    section: None,
     hunks: Vec::new(),
   };
 

@@ -1,6 +1,6 @@
 # Dunk
 
-A terminal viewer for git diffs.
+A terminal tool for reviewing changes before they are committed.
 
 ## Language
 
@@ -16,3 +16,19 @@ A git commit-ish or range the user names to select a changeset, such as `HEAD~3`
 
 **Layout**:
 How a diff is drawn: unified (one column) or split (old and new side by side).
+
+**Review**:
+Going through a changeset to decide what belongs in the next commit. It ends by staging what the reviewer accepts; the index is the only record of that decision.
+_Avoid_: approve, mark as reviewed
+
+**Staged**:
+A change that is already in the index and so would go into the next commit. A change that is not is **unstaged**; an untracked file is unstaged until it is added.
+
+**Mode**:
+What the keys currently do. In normal mode keys move around and act on a file or hunk. In visual mode keys extend a selection of lines. The footer always names the current mode.
+
+**Selection**:
+The run of lines a visual-mode action applies to.
+
+**Section**:
+One of the two groups in the file list: unstaged and staged. A file with both kinds of change appears in both. The diff shown for an entry covers only its own section.
