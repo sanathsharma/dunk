@@ -584,8 +584,8 @@ impl App {
     let Some((hunk, _)) = locate(file, self.layout, self.visual_anchor) else {
       return;
     };
-    let first = row_of(file, self.layout, hunk, None);
-    let last = first + hunk_rows(&file.hunks[hunk], self.layout) - 1;
+    let first = row_of(file, self.layout, hunk, None) + 1;
+    let last = first - 1 + hunk_rows(&file.hunks[hunk], self.layout) - 1;
     self.cursor = self.cursor.saturating_add_signed(delta).clamp(first, last);
     self.clamp_scroll();
   }
@@ -650,6 +650,7 @@ impl App {
       KeyCode::Char('g') | KeyCode::Home => {
         self.scroll = 0;
         self.cursor = 0;
+        self.clamp_scroll();
       }
       KeyCode::Char('G') | KeyCode::End => {
         self.scroll = self.max_scroll();
@@ -690,6 +691,7 @@ impl App {
   pub fn clamp_scroll(&mut self) {
     self.scroll = self.scroll.min(self.max_scroll());
     self.cursor = self.cursor.min(self.rows().saturating_sub(1));
+    self.snap_cursor(false);
     if self.cursor < self.scroll {
       self.scroll = self.cursor;
     } else if self.viewport > 0 && self.cursor >= self.scroll + self.viewport {
@@ -697,25 +699,55 @@ impl App {
     }
   }
 
+  /// Moves the cursor off a hunk header: forward onto the hunk's first line,
+  /// or when `backward` onto the last line of the hunk before it, if any.
+  fn snap_cursor(&mut self, backward: bool) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    let Some((hunk, None)) = locate(file, self.layout, self.cursor) else {
+      return;
+    };
+    self.cursor = if backward && hunk > 0 {
+      self.cursor - 1
+    } else {
+      self.cursor + 1
+    };
+  }
+
   fn move_cursor(&mut self, delta: isize) {
     self.cursor = self.cursor.saturating_add_signed(delta);
+    self.cursor = self.cursor.min(self.rows().saturating_sub(1));
+    self.snap_cursor(delta < 0);
+    // Moving up onto a hunk's first line keeps its header in view.
+    if delta < 0 && self.scroll >= self.cursor {
+      let on_first_line = self.files.get(self.selected).is_some_and(|file| {
+        locate(file, self.layout, self.cursor)
+          .is_some_and(|(hunk, _)| row_of(file, self.layout, hunk, None) + 1 == self.cursor)
+      });
+      if on_first_line {
+        self.scroll = self.cursor - 1;
+      }
+    }
     self.clamp_scroll();
   }
 
-  /// Moves the cursor to the header of the next hunk, or with a negative
-  /// `delta` to the header of the hunk under the cursor, or of the one before
-  /// it when the cursor is already on a header. Stays put past either end. The
-  /// header goes to the top of the pane, or as near as the diff's end allows.
+  /// Moves the cursor to the first line of the next hunk, or with a negative
+  /// `delta` to the first line of the hunk under the cursor, or of the one
+  /// before it when the cursor is already there. Stays put past either end.
+  /// The hunk's header goes to the top of the pane, or as near as the diff's
+  /// end allows.
   fn jump_hunk(&mut self, delta: isize) {
     let Some(file) = self.files.get(self.selected) else {
       return;
     };
-    let Some((hunk, line)) = locate(file, self.layout, self.cursor) else {
+    let Some((hunk, _)) = locate(file, self.layout, self.cursor) else {
       return;
     };
+    let header = row_of(file, self.layout, hunk, None);
     let target = if delta > 0 {
       hunk + 1
-    } else if line.is_some() {
+    } else if self.cursor > header + 1 {
       hunk
     } else if let Some(previous) = hunk.checked_sub(1) {
       previous
@@ -725,8 +757,8 @@ impl App {
     if target >= file.hunks.len() {
       return;
     }
-    self.cursor = row_of(file, self.layout, target, None);
-    self.scroll = self.cursor;
+    self.scroll = row_of(file, self.layout, target, None);
+    self.cursor = self.scroll + 1;
     self.clamp_scroll();
   }
 
@@ -750,12 +782,13 @@ impl App {
       }
       if self.mode == Mode::Visual {
         // The selection spans the rows that show its lines, so it keeps the
-        // lines it had. A selection of the header alone has no lines and
-        // stays on the header.
+        // lines it had.
         if let Some((hunk, lines)) = self.selection_lines() {
-          let rows = |line| row_of(file, to, hunk, line);
-          let mut shown = lines.iter().map(|&line| rows(Some(line)));
-          let first = shown.next().unwrap_or_else(|| rows(None));
+          let rows = |line| row_of(file, to, hunk, Some(line));
+          let mut shown = lines.iter().map(|&line| rows(line));
+          let Some(first) = shown.next() else {
+            return;
+          };
           let (low, high) = shown.fold((first, first), |(lo, hi), row| (lo.min(row), hi.max(row)));
           (self.visual_anchor, self.cursor) = if self.cursor >= self.visual_anchor {
             (low, high)
@@ -1153,21 +1186,21 @@ mod tests {
   }
 
   #[test]
-  fn brackets_jump_between_hunk_headers() {
+  fn brackets_jump_between_hunks_onto_their_first_line() {
     let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n";
     let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
     app.on_key(key(KeyCode::Char(']')));
     assert_eq!(app.cursor_hunk(), Some(1));
-    assert_eq!(app.cursor, 5);
+    assert_eq!(app.cursor, 6);
     app.on_key(key(KeyCode::Char(']')));
-    assert_eq!(app.cursor, 5);
+    assert_eq!(app.cursor, 6);
     app.on_key(key(KeyCode::Char('j')));
     app.on_key(key(KeyCode::Char('[')));
-    assert_eq!(app.cursor, 5);
+    assert_eq!(app.cursor, 6);
     app.on_key(key(KeyCode::Char('[')));
-    assert_eq!(app.cursor, 0);
+    assert_eq!(app.cursor, 1);
     app.on_key(key(KeyCode::Char('[')));
-    assert_eq!(app.cursor, 0);
+    assert_eq!(app.cursor, 1);
   }
 
   #[test]
@@ -1175,12 +1208,12 @@ mod tests {
     let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n@@ -20,2 +20,2 @@\n x\n-y\n+Y\n";
     let mut app = ready(parse(diff.as_bytes()).unwrap(), 4);
     app.on_key(key(KeyCode::Char(']')));
-    assert_eq!((app.cursor, app.scroll), (5, 5));
+    assert_eq!((app.cursor, app.scroll), (6, 5));
     app.on_key(key(KeyCode::Char(']')));
-    assert_eq!(app.cursor, 9);
+    assert_eq!(app.cursor, 10);
     assert_eq!(app.scroll, app.max_scroll());
     app.on_key(key(KeyCode::Char('[')));
-    assert_eq!((app.cursor, app.scroll), (5, 5));
+    assert_eq!((app.cursor, app.scroll), (6, 5));
   }
 
   #[test]
@@ -1190,7 +1223,7 @@ mod tests {
     app.on_key(key(KeyCode::Char('j')));
     app.on_key(key(KeyCode::Char('v')));
     app.on_key(key(KeyCode::Char(']')));
-    assert_eq!(app.cursor, 1);
+    assert_eq!(app.cursor, 2);
     let mut empty = file("e", 1);
     empty.hunks.clear();
     let mut app = ready(vec![empty], 20);
@@ -1214,7 +1247,7 @@ mod tests {
     app.on_key(key(KeyCode::Char('?')));
     assert!(app.help);
     app.on_key(key(KeyCode::Char('j')));
-    assert!(app.help && app.cursor == 0);
+    assert!(app.help && app.cursor == 1);
     app.on_key(key(KeyCode::Char('q')));
     assert!(!app.help && !app.quit);
     app.on_key(key(KeyCode::Char('?')));
@@ -1262,9 +1295,9 @@ mod tests {
 
   #[test]
   fn j_and_k_move_the_cursor_and_the_viewport_follows_it() {
-    // 11 rows, 4 visible.
+    // 11 rows, 4 visible. The cursor starts on row 1, below the header.
     let mut app = ready(vec![file("a", 10)], 4);
-    for _ in 0..3 {
+    for _ in 0..2 {
       app.on_key(key(KeyCode::Char('j')));
     }
     assert_eq!((app.cursor, app.scroll), (3, 0));
@@ -1275,7 +1308,8 @@ mod tests {
     for _ in 0..20 {
       app.on_key(key(KeyCode::Char('k')));
     }
-    assert_eq!((app.cursor, app.scroll), (0, 0));
+    // The hunk header comes back into view with the first line.
+    assert_eq!((app.cursor, app.scroll), (1, 0));
     for _ in 0..20 {
       app.on_key(key(KeyCode::Char('j')));
     }
@@ -1321,6 +1355,60 @@ mod tests {
       assert_eq!(hunks, [Some(0), Some(0), Some(1), Some(1)], "{layout:?}");
     }
     assert_eq!(App::default().cursor_hunk(), None);
+  }
+
+  #[test]
+  fn the_cursor_starts_on_the_first_line_of_the_first_hunk() {
+    let app = ready(vec![file("a", 10)], 4);
+    assert_eq!((app.cursor, app.scroll), (1, 0));
+  }
+
+  #[test]
+  fn j_and_k_skip_the_header_between_hunks() {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
+    for _ in 0..3 {
+      app.on_key(key(KeyCode::Char('j')));
+    }
+    assert_eq!(app.cursor, 4);
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(app.cursor, 6);
+    app.on_key(key(KeyCode::Char('k')));
+    assert_eq!(app.cursor, 4);
+    for _ in 0..10 {
+      app.on_key(key(KeyCode::Char('k')));
+    }
+    assert_eq!(app.cursor, 1);
+  }
+
+  #[test]
+  fn g_and_paging_never_leave_the_cursor_on_a_header() {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
+    app.on_key(key(KeyCode::Char('G')));
+    app.on_key(key(KeyCode::Char('g')));
+    assert_eq!((app.cursor, app.scroll), (1, 0));
+    // Row 5 is the second header. Scrolling its row to the top of the pane
+    // pulls the cursor into view, onto the hunk's first line.
+    app.viewport = 4;
+    app.on_key(key(KeyCode::PageDown));
+    app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!((app.scroll, app.cursor), (5, 6));
+  }
+
+  #[test]
+  fn a_selection_never_takes_in_a_hunk_header() {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
+    app.on_key(key(KeyCode::Char('v')));
+    for _ in 0..10 {
+      app.on_key(key(KeyCode::Char('k')));
+    }
+    assert_eq!(app.selection(), Some(1..=1));
+    for _ in 0..10 {
+      app.on_key(key(KeyCode::Char('j')));
+    }
+    assert_eq!(app.selection(), Some(1..=4));
   }
 
   #[test]
@@ -1433,7 +1521,7 @@ mod tests {
 
   #[test]
   fn toggling_layout_keeps_the_hunk_and_line_at_the_top() {
-    let mut app = ready(vec![mixed_file()], 1);
+    let mut app = ready(vec![mixed_file()], 2);
     // Unified rows: 0 header, 1 keep, 2-4 r1-r3, 5 a1, 6 header, 7 x, 8 y.
     // Split rows: 0 header, 1 keep, 2 r1|a1, 3 r2, 4 r3, 5 header, 6 x, 7 y.
     for (unified, split) in [
@@ -1448,7 +1536,8 @@ mod tests {
     ] {
       app.layout = Layout::Unified;
       app.scroll = unified;
-      app.cursor = unified;
+      // The cursor sits on the line below a header.
+      app.cursor = if unified % 6 == 0 { unified + 1 } else { unified };
       app.on_key(key(KeyCode::Char('s')));
       assert_eq!(app.layout, Layout::Split);
       assert_eq!(app.scroll, split, "unified row {unified}");
@@ -2062,7 +2151,7 @@ mod tests {
     assert_eq!(selected_name(&app), ("one".into(), u));
     assert_eq!(app.files[app.selected].hunks.len(), 1);
     assert_eq!(app.cursor_hunk(), Some(0));
-    assert_eq!(app.cursor, 0);
+    assert_eq!(app.cursor, 1);
     let staged = app
       .files
       .iter()
@@ -2082,7 +2171,7 @@ mod tests {
     // The one hunk left in `one` is its last.
     press_a(&mut app, &git);
     assert_eq!(selected_name(&app), ("two".into(), u));
-    assert_eq!(app.cursor, 0);
+    assert_eq!(app.cursor, 1);
   }
 
   #[test]
@@ -2308,8 +2397,8 @@ mod tests {
     let (_tmp, git) = line_repo();
     let mut app = App::default();
     load(&mut app, &git);
-    // The header and the two context lines above the first change.
-    press(&mut app, "vjj");
+    // The two context lines above the first change.
+    press(&mut app, "vj");
     press(&mut app, "a");
     assert_eq!(app.notice.as_deref(), Some("no changed lines selected"));
     assert!(app.take_index_request().is_none());
@@ -2332,7 +2421,8 @@ mod tests {
     for _ in 0..first + 5 {
       press(&mut app, "k");
     }
-    assert_eq!(app.cursor, 0);
+    // The first line of the hunk, not its header.
+    assert_eq!(app.cursor, 1);
   }
 
   /// One file `f` whose single hunk has unpaired rows. By hunk line: `1` `2`
@@ -2526,7 +2616,7 @@ mod tests {
     // The pair on line 5 is left, in the same entry and hunk.
     assert_eq!(selected_name(&app), ("f".into(), Some(Section::Unstaged)));
     assert_eq!(app.cursor_hunk(), Some(0));
-    assert_eq!(app.cursor, 0);
+    assert_eq!(app.cursor, 1);
     assert_eq!(app.files[app.selected].hunks[0].changed().count(), 2);
   }
 

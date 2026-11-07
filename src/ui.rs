@@ -664,7 +664,7 @@ new file mode 100644
       }
     };
     // The cursor is on `-old`; the selection takes in `+new` too.
-    press(&mut app, "jjvj");
+    press(&mut app, "jvj");
     let (terminal, rows) = draw(&mut app, 100, 8);
     assert!(rows[7].contains(" VISUAL 2 lines "), "{}", rows[7]);
     let buffer = terminal.backend().buffer();
@@ -908,7 +908,7 @@ new file mode 100644
     // The footer mode label.
     assert_eq!(at(1, 13).fg, Color::Rgb(7, 7, 7));
     // The diff cursor.
-    let (y, _) = row_with(&rows, "@@ -1,3");
+    let (y, _) = row_with(&rows, "keep");
     assert_eq!(at(list_width + 2, y).bg, Color::Rgb(6, 6, 6));
 
     app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
@@ -1029,7 +1029,7 @@ diff --git a/a.rs b/a.rs
   fn split_layout_highlights_whole_rows_of_the_selection() {
     let mut app = split_app();
     // The cursor goes to the row of `-old2`, which has no partner on the right.
-    for c in "jjjv".chars() {
+    for c in "jjv".chars() {
       app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
     let (terminal, rows) = draw(&mut app, 81, 12);

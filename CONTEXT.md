@@ -50,3 +50,10 @@ _Avoid_: theme (on its own), colorscheme
 
 **Highlight group**:
 A named style slot for part of the screen, such as `DiffAdd` for added lines or `Border` for pane borders, with an optional foreground, background and text attributes. Names are CamelCase, after Neovim's. A group the user does not set uses its built-in ANSI default.
+
+**Hunk header**:
+The row that opens a hunk. It is drawn but never holds the cursor or a selection.
+
+**Cursor**:
+The row key actions apply to in the diff. It is always on a line, never on a hunk header.
+_Avoid_: selected row (selection and section already use "select")
