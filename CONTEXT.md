@@ -39,3 +39,10 @@ The TOML file holding the user's standing defaults for settings. A flag on the c
 **Setting**:
 An option that can be set in the config file and on the command line. Scope, revisions and paths are not settings, because they define a changeset rather than how it is displayed.
 _Avoid_: preference, option
+
+**Syntax theme**:
+The set of colors used to highlight source code in a diff, chosen with the `theme` setting. It does not color the diff itself (added and removed lines, hunk headers).
+_Avoid_: theme (on its own), colorscheme
+
+**Highlight group**:
+A named style slot for part of the screen, such as `DiffAdd` for added lines or `Border` for pane borders, with an optional foreground, background and text attributes. Names are CamelCase, after Neovim's. A group the user does not set uses its built-in ANSI default.

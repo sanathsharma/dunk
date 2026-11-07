@@ -10,6 +10,15 @@ pub enum Layout {
   Split,
 }
 
+/// The corners of the pane borders.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Border {
+  #[default]
+  Plain,
+  Rounded,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
   /// Staged, unstaged and untracked changes together.
@@ -26,6 +35,7 @@ pub struct Args {
   pub paths: Vec<String>,
   pub scope: Scope,
   pub layout: Option<Layout>,
+  pub border: Option<Border>,
   pub theme: Option<String>,
   pub context: Option<u32>,
   pub watch: Option<bool>,
@@ -77,6 +87,13 @@ fn command() -> Command {
         .help("How to lay out the diff")
         .value_name("LAYOUT")
         .value_parser(["unified", "split"]),
+    )
+    .arg(
+      Arg::new("border")
+        .long("border")
+        .help("Corner style of the pane borders")
+        .value_name("STYLE")
+        .value_parser(["plain", "rounded"]),
     )
     .arg(
       Arg::new("theme")
@@ -145,6 +162,13 @@ fn from_matches(m: &ArgMatches) -> Args {
       Layout::Unified
     }
   });
+  let border = m.get_one::<String>("border").map(|b| {
+    if b == "rounded" {
+      Border::Rounded
+    } else {
+      Border::Plain
+    }
+  });
   // The later of a flag and its opposite wins, and neither means unset.
   let toggle = |on: &str, off: &str| {
     if m.get_flag(off) {
@@ -167,6 +191,7 @@ fn from_matches(m: &ArgMatches) -> Args {
     paths: many("paths"),
     scope,
     layout,
+    border,
     theme: m.get_one::<String>("theme").cloned(),
     context: m.get_one::<u32>("context").copied(),
     watch: toggle("watch", "no-watch"),
@@ -199,6 +224,7 @@ mod tests {
     let a = parse_from(&["dunk"]);
     assert_eq!(a.scope, Scope::All);
     assert_eq!(a.layout, None);
+    assert_eq!(a.border, None);
     assert!(a.watch.is_none() && a.syntax.is_none() && a.config.is_none());
     assert!(a.revisions.is_empty() && a.paths.is_empty());
   }
@@ -239,6 +265,23 @@ mod tests {
     assert_eq!(
       parse_from(&["dunk", "--no-syntax", "--syntax"]).syntax,
       Some(true)
+    );
+  }
+
+  #[test]
+  fn border_takes_plain_or_rounded() {
+    assert_eq!(
+      parse_from(&["dunk", "--border", "rounded"]).border,
+      Some(Border::Rounded)
+    );
+    assert_eq!(
+      parse_from(&["dunk", "--border", "plain"]).border,
+      Some(Border::Plain)
+    );
+    assert!(
+      command()
+        .try_get_matches_from(["dunk", "--border", "double"])
+        .is_err()
     );
   }
 

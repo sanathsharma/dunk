@@ -1,7 +1,9 @@
-use crate::args::Layout;
+use crate::args::{Border, Layout};
+use crate::config::Settings;
 use crate::diff::{FileDiff, FileStatus, Hunk, Section};
 use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
+use crate::palette::Palette;
 use crate::split;
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Sides, Vcs};
@@ -145,6 +147,8 @@ pub struct App {
   /// drawn. See `words::changed_words`.
   pub words: Vec<Option<FileWords>>,
   pub layout: Layout,
+  pub palette: Palette,
+  pub border: Border,
   pub selected: usize,
   pub list_state: ListState,
   /// Index of the first visible row of the selected file's diff.
@@ -177,6 +181,8 @@ impl Default for App {
       highlights: Vec::new(),
       words: Vec::new(),
       layout: Layout::Unified,
+      palette: Palette::default(),
+      border: Border::default(),
       selected: 0,
       list_state: ListState::default(),
       scroll: 0,
@@ -896,13 +902,13 @@ fn spawn_input(tx: Sender<Event>) {
   });
 }
 
-/// `theme` turns syntax highlighting on; `None` leaves diffs uncolored.
+/// A `theme` in `settings` turns syntax highlighting on; `None` leaves diffs
+/// uncolored.
 pub fn run<V: Vcs + Send + Sync + 'static>(
   terminal: &mut DefaultTerminal,
   vcs: V,
   request: DiffRequest,
-  theme: Option<String>,
-  layout: Layout,
+  settings: Settings,
   watch: Option<&Path>,
 ) -> io::Result<()> {
   let vcs = Arc::new(vcs);
@@ -920,10 +926,13 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   let (mut latest, mut applied) = (0, 0);
 
   let mut app = App {
-    layout,
+    layout: settings.layout,
+    palette: settings.palette,
+    border: settings.border,
     ..App::default()
   };
-  let highlighter = theme
+  let highlighter = settings
+    .theme
     .and_then(|theme| Highlighter::new(&theme).ok())
     .map(Arc::new);
   let mut worker: Option<Worker> = None;

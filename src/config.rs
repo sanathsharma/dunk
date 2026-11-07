@@ -1,5 +1,6 @@
-use crate::args::{Args, Layout};
+use crate::args::{Args, Border, Layout};
 use crate::highlight;
+use crate::palette::{Highlights, Palette};
 use serde::Deserialize;
 use std::fs;
 use std::io;
@@ -10,9 +11,17 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+  ui: Ui,
   diff: Diff,
   syntax: Syntax,
   watch: Watch,
+  highlights: Highlights,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+struct Ui {
+  border: Option<Border>,
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -50,6 +59,7 @@ impl Config {
     if let Some(theme) = &config.syntax.theme {
       highlight::resolve_theme(theme).map_err(|e| format!("syntax.theme: {e}"))?;
     }
+    config.highlights.palette()?;
     Ok(config)
   }
 
@@ -80,10 +90,12 @@ impl Config {
 #[derive(Debug, PartialEq)]
 pub struct Settings {
   pub layout: Layout,
+  pub border: Border,
   pub context: Option<u32>,
   /// `None` when syntax highlighting is off.
   pub theme: Option<String>,
   pub watch: bool,
+  pub palette: Palette,
 }
 
 impl Settings {
@@ -95,6 +107,7 @@ impl Settings {
         .layout
         .or(config.diff.layout)
         .unwrap_or(Layout::Unified),
+      border: args.border.or(config.ui.border).unwrap_or_default(),
       context: args.context.or(config.diff.context),
       theme: syntax.then(|| {
         theme
@@ -102,6 +115,7 @@ impl Settings {
           .unwrap_or_else(|| highlight::DEFAULT_THEME.to_string())
       }),
       watch: args.watch.or(config.watch.enabled).unwrap_or(false),
+      palette: config.highlights.palette().unwrap_or_default(),
     }
   }
 }
@@ -111,6 +125,9 @@ mod tests {
   use super::*;
 
   const FULL: &str = r#"
+[ui]
+border = "rounded"
+
 [diff]
 layout = "split"
 context = 5
@@ -146,6 +163,7 @@ enabled = true
   fn a_full_file_sets_every_setting() {
     let s = Settings::resolve(&args(&[]), Config::parse(FULL).unwrap());
     assert_eq!(s.layout, Layout::Split);
+    assert_eq!(s.border, Border::Rounded);
     assert_eq!(s.context, Some(5));
     assert_eq!(s.theme, None);
     assert!(s.watch);
@@ -185,9 +203,11 @@ enabled = true
       s,
       Settings {
         layout: Layout::Unified,
+        border: Border::Plain,
         context: None,
         theme: Some(highlight::DEFAULT_THEME.to_string()),
         watch: false,
+        palette: Palette::default(),
       }
     );
   }
@@ -195,6 +215,8 @@ enabled = true
   #[test]
   fn flags_beat_the_config_file() {
     let flags = args(&[
+      "--border",
+      "plain",
       "--layout",
       "unified",
       "-U",
@@ -206,9 +228,30 @@ enabled = true
     ]);
     let s = Settings::resolve(&flags, Config::parse(FULL).unwrap());
     assert_eq!(s.layout, Layout::Unified);
+    assert_eq!(s.border, Border::Plain);
     assert_eq!(s.context, Some(1));
     assert_eq!(s.theme.as_deref(), Some("Dracula"));
     assert!(!s.watch);
+  }
+
+  #[test]
+  fn highlights_are_validated_and_reach_the_settings() {
+    let text = "[highlights]\nDiffAdd = { bg = \"#102030\" }\n";
+    let s = Settings::resolve(&args(&[]), Config::parse(text).unwrap());
+    assert_eq!(
+      s.palette.diff_add,
+      ratatui::style::Style::new().bg(ratatui::style::Color::Rgb(16, 32, 48))
+    );
+    let err = Config::parse("[highlights]\nDiffAdd = { bg = \"grn\" }\n").unwrap_err();
+    assert!(
+      err.contains("highlights.DiffAdd.bg: unknown color 'grn'"),
+      "{err}"
+    );
+    let err = Config::parse("[highlights]\nDiffAdds = { bg = \"red\" }\n").unwrap_err();
+    assert!(
+      err.contains("DiffAdds") && err.contains("DiffDeleteText"),
+      "{err}"
+    );
   }
 
   #[test]

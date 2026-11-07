@@ -1,25 +1,27 @@
-use crate::app::{App, ListRow, Load};
-use crate::args::Layout as DiffLayout;
+use crate::app::{App, ListRow, Load, Mode};
+use crate::args::{Border, Layout as DiffLayout};
 use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind, Section};
 use crate::highlight::Styled;
+use crate::palette::Palette;
 use crate::split::pairs;
 use crate::words::changed_words;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph};
 use std::ops::Range;
-
-const ADDED_BG: Color = Color::Rgb(18, 52, 28);
-const REMOVED_BG: Color = Color::Rgb(66, 24, 28);
-const ADDED_WORD_BG: Color = Color::Rgb(30, 100, 52);
-const REMOVED_WORD_BG: Color = Color::Rgb(128, 40, 46);
 
 const HELP: &str = " j/k move · space/PgDn page · ctrl-d/u half page · g/G top/bottom · n/p file · s split/unified · e expand · v select lines · a stage hunk or selection · - stage file · q quit";
 
-const CURRENT_HUNK_BG: Color = Color::Rgb(48, 54, 80);
-const SELECTED_BG: Color = Color::Rgb(70, 70, 110);
+impl Row<'_> {
+  /// Whether the row is in the hunk under the cursor.
+  fn active(&self) -> bool {
+    match self {
+      Row::Header(_, active) | Row::Line(_, _, _, active) => *active,
+    }
+  }
+}
 
 enum Row<'a> {
   /// A hunk header, and whether the cursor is in that hunk.
@@ -28,6 +30,8 @@ enum Row<'a> {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+  let area = frame.area();
+  frame.buffer_mut().set_style(area, app.palette.normal);
   let [main, footer] =
     Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
   frame.render_widget(Paragraph::new(footer_line(app)), footer);
@@ -53,10 +57,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 /// The mode at the left, then the notice or the key help.
 fn footer_line(app: &App) -> Line<'static> {
-  let mode = Span::styled(
-    format!(" {} ", app.mode_label()),
-    Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
-  );
+  let style = match app.mode {
+    Mode::Normal => app.palette.mode_normal,
+    Mode::Visual => app.palette.mode_visual,
+  };
+  let mode = Span::styled(format!(" {} ", app.mode_label()), style);
   let rest = match &app.notice {
     Some(notice) => Span::styled(format!(" {notice}"), Style::new().fg(Color::Yellow)),
     None => Span::styled(HELP, Style::new().fg(Color::DarkGray)),
@@ -84,7 +89,16 @@ fn status_color(status: FileStatus) -> Color {
   }
 }
 
+fn border_type(border: Border) -> BorderType {
+  match border {
+    Border::Plain => BorderType::Plain,
+    Border::Rounded => BorderType::Rounded,
+  }
+}
+
 fn render_files(frame: &mut Frame, area: Rect, app: &mut App) {
+  let palette = app.palette;
+  let border_type = border_type(app.border);
   let items: Vec<ListItem> = app
     .list_rows()
     .into_iter()
@@ -96,7 +110,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App) {
         };
         ListItem::new(Line::styled(
           format!("{name} ({count})"),
-          Style::new().add_modifier(Modifier::BOLD),
+          palette.section_label,
         ))
       }
       ListRow::Entry(index) => {
@@ -112,14 +126,25 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App) {
     })
     .collect();
   let list = List::new(items)
-    .block(Block::bordered().title(format!(" Files ({}) ", app.files.len())))
-    .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    .block(
+      Block::bordered()
+        .border_type(border_type)
+        .border_style(palette.border)
+        .title_style(palette.border)
+        .title(format!(" Files ({}) ", app.files.len())),
+    )
+    .highlight_style(palette.cursor_line);
   frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
 fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   let file = &app.files[app.selected];
-  let block = Block::bordered().title(title(file));
+  let border = app.palette.border.patch(app.palette.diff_border);
+  let block = Block::bordered()
+    .border_type(border_type(app.border))
+    .border_style(border)
+    .title_style(border)
+    .title(title(file));
   let inner = block.inner(area);
   frame.render_widget(block, area);
 
@@ -154,13 +179,18 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   let current = app.cursor_hunk();
   let cursor = app.cursor.saturating_sub(app.scroll);
   let selection = app.selection();
+  let palette = app.palette;
   let mark = |i: usize, line: Line<'static>| {
     let selected = selection
       .as_ref()
       .is_some_and(|rows| rows.contains(&(app.scroll + i)));
-    let line = if selected { select(line) } else { line };
+    let line = if selected {
+      overlay(line, palette.visual)
+    } else {
+      line
+    };
     if i == cursor {
-      line.patch_style(Modifier::REVERSED)
+      overlay(line, palette.cursor_line)
     } else {
       line
     }
@@ -178,6 +208,8 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
 
   match app.layout {
     DiffLayout::Unified => {
+      let [bar_area, text] =
+        Layout::horizontal([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
       let rows = hunks
         .flat_map(|(hi, h)| {
           let lines = (0..h.lines.len()).map(move |li| {
@@ -188,16 +220,22 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .skip(app.scroll)
         .take(app.viewport)
-        .map(|row| row_line(row, width, usize::from(inner.width)))
+        .map(|row| {
+          let active = row.active();
+          (active, row_line(row, &palette, width, text.width.into()))
+        })
         .enumerate()
-        .map(|(i, line)| mark(i, line))
+        .map(|(i, (active, line))| (active, mark(i, line)))
         .collect::<Vec<_>>();
-      frame.render_widget(Paragraph::new(rows), inner);
+      let (active, rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+      frame.render_widget(Paragraph::new(bar(&active, &palette)), bar_area);
+      frame.render_widget(Paragraph::new(rows), text);
     }
     DiffLayout::Split => {
-      let left_width = inner.width.saturating_sub(1) / 2;
-      let right_width = inner.width.saturating_sub(1 + left_width);
-      let [left_area, _, right_area] = Layout::horizontal([
+      let left_width = inner.width.saturating_sub(2) / 2;
+      let right_width = inner.width.saturating_sub(2 + left_width);
+      let [edge_area, left_area, gap_area, right_area] = Layout::horizontal([
+        Constraint::Length(1),
         Constraint::Length(left_width),
         Constraint::Length(1),
         Constraint::Length(right_width),
@@ -213,6 +251,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
           );
           line_spans(
             l,
+            &palette,
             styled,
             ranges,
             gutter,
@@ -222,15 +261,18 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         None => blank(fill),
       };
-      let rows: Vec<(Line, Line)> = hunks
+      let rows: Vec<(bool, Line, Line)> = hunks
         .flat_map(|(hi, h)| {
-          let header = Row::Header(h, current == Some(hi));
+          let active = current == Some(hi);
+          let header = Row::Header(h, active);
           let header = (
-            row_line(header, width, left_width.into()),
+            active,
+            row_line(header, &palette, width, left_width.into()),
             blank(right_width),
           );
           let pairs = pairs(h).into_iter().map(move |(l, r)| {
             (
+              active,
               side(l, hi, false, left_width),
               side(r, hi, true, right_width),
             )
@@ -240,13 +282,36 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         .skip(app.scroll)
         .take(app.viewport)
         .enumerate()
-        .map(|(i, (l, r))| (mark(i, l), mark(i, r)))
+        .map(|(i, (active, l, r))| (active, mark(i, l), mark(i, r)))
         .collect();
-      let (left, right): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+      let active: Vec<bool> = rows.iter().map(|(a, _, _)| *a).collect();
+      let left: Vec<Line> = rows.iter().map(|(_, l, _)| l.clone()).collect();
+      let right: Vec<Line> = rows.into_iter().map(|(_, _, r)| r).collect();
+      frame.render_widget(Paragraph::new(bar(&active, &palette)), edge_area);
+      frame.render_widget(Paragraph::new(bar(&active, &palette)), gap_area);
       frame.render_widget(Paragraph::new(left), left_area);
       frame.render_widget(Paragraph::new(right), right_area);
     }
   }
+}
+
+/// The left half of a cell, which `DiffHunkBar` colors with its foreground.
+const BAR: &str = "\u{258C}";
+
+/// A one cell wide column beside the diff. It holds the `DiffHunkBar` half
+/// block on the rows of the hunk under the cursor and is transparent on the
+/// others.
+fn bar(active: &[bool], palette: &Palette) -> Vec<Line<'static>> {
+  active
+    .iter()
+    .map(|&on| {
+      if on {
+        Line::styled(BAR, palette.diff_hunk_bar)
+      } else {
+        Line::raw(" ")
+      }
+    })
+    .collect()
 }
 
 /// An empty column of a split row. It holds spaces so that a selection
@@ -255,12 +320,12 @@ fn blank(width: u16) -> Line<'static> {
   Line::raw(" ".repeat(width.into()))
 }
 
-/// Paints the selection background over a line, replacing the colors of its
-/// added or removed background.
-fn select(mut line: Line<'static>) -> Line<'static> {
-  line.style = line.style.bg(SELECTED_BG);
+/// Lays a group such as `Visual` over a line and its spans. It overrides only
+/// what it sets, so the line keeps its other colors.
+fn overlay(mut line: Line<'static>, group: Style) -> Line<'static> {
+  line.style = line.style.patch(group);
   for span in &mut line.spans {
-    span.style = span.style.bg(SELECTED_BG);
+    span.style = span.style.patch(group);
   }
   line
 }
@@ -295,7 +360,7 @@ fn gutter_width(file: &FileDiff) -> usize {
 }
 
 /// `fill` pads changed lines to the pane width so their background spans it.
-fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
+fn row_line(row: Row, palette: &Palette, width: usize, fill: usize) -> Line<'static> {
   match row {
     Row::Header(h, current) => Line::styled(
       format!(
@@ -310,18 +375,15 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
         )
       ),
       if current {
-        Style::new()
-          .fg(Color::Cyan)
-          .bg(CURRENT_HUNK_BG)
-          .add_modifier(Modifier::BOLD)
+        palette.diff_hunk_header.patch(palette.diff_current_hunk)
       } else {
-        Style::new().fg(Color::Cyan)
+        palette.diff_hunk_header
       },
     ),
     Row::Line(l, styled, changed, current) => {
       let no = |n: Option<u32>| n.map_or(String::new(), |n| n.to_string());
       let gutter = format!("{:>width$} {:>width$} ", no(l.old_no), no(l.new_no));
-      line_spans(l, styled, changed, gutter, fill, current)
+      line_spans(l, palette, styled, changed, gutter, fill, current)
     }
   }
 }
@@ -330,6 +392,7 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
 /// emphasized.
 fn line_spans(
   l: &DiffLine,
+  palette: &Palette,
   styled: Option<&Styled>,
   changed: &[Range<usize>],
   gutter: String,
@@ -338,8 +401,8 @@ fn line_spans(
 ) -> Line<'static> {
   let (marker, style, word_bg) = match l.kind {
     LineKind::Context => (' ', Style::new(), None),
-    LineKind::Added => ('+', Style::new().bg(ADDED_BG), Some(ADDED_WORD_BG)),
-    LineKind::Removed => ('-', Style::new().bg(REMOVED_BG), Some(REMOVED_WORD_BG)),
+    LineKind::Added => ('+', palette.diff_add, Some(palette.diff_add_text)),
+    LineKind::Removed => ('-', palette.diff_delete, Some(palette.diff_delete_text)),
   };
   let gutter_color = if current {
     Color::Gray
@@ -378,13 +441,13 @@ fn line_spans(
 }
 
 /// Splits `pieces` at the edges of `changed` (byte offsets into the joined
-/// text) and gives the changed parts the `bg` background.
+/// text) and lays the `emphasis` style over the changed parts.
 fn emphasize(
   pieces: &[(Style, String)],
   changed: &[Range<usize>],
-  bg: Option<Color>,
+  emphasis: Option<Style>,
 ) -> Vec<(Style, String)> {
-  let Some(bg) = bg.filter(|_| !changed.is_empty()) else {
+  let Some(emphasis) = emphasis.filter(|_| !changed.is_empty()) else {
     return pieces.to_vec();
   };
   let mut out = Vec::new();
@@ -404,7 +467,7 @@ fn emphasize(
     for w in cut.windows(2) {
       let (from, to) = (at + w[0], at + w[1]);
       let hit = changed.iter().any(|r| r.start <= from && to <= r.end);
-      let style = if hit { style.bg(bg) } else { *style };
+      let style = if hit { style.patch(emphasis) } else { *style };
       out.push((style, text[w[0]..w[1]].to_string()));
     }
     at = end;
@@ -429,6 +492,10 @@ fn sanitize(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+  use ratatui::style::Modifier;
+  const ADDED_BG: Color = Color::Green;
+  const REMOVED_BG: Color = Color::Red;
+  const SELECTED_BG: Color = Color::Blue;
   use super::*;
   use crate::diff::{FileStatus, Section, parse};
   use ratatui::Terminal;
@@ -503,8 +570,9 @@ new file mode 100644
       let x = row.find(needle).unwrap() as u16;
       buffer[(x, y as u16)].bg
     };
-    assert_eq!(bg(&rows, "@@ -1,1"), CURRENT_HUNK_BG);
-    assert_ne!(bg(&rows, "@@ -9,1"), CURRENT_HUNK_BG);
+    let current_bg = Palette::default().diff_current_hunk.bg.unwrap();
+    assert_eq!(bg(&rows, "@@ -1,1"), current_bg);
+    assert_ne!(bg(&rows, "@@ -9,1"), current_bg);
     let (y, _) = row_with(&rows, "@@ -1,1");
     assert!(buffer[(5, y as u16)].modifier.contains(Modifier::REVERSED));
 
@@ -516,10 +584,10 @@ new file mode 100644
     let (y, row) = row_with(&rows, "@@ -9,1");
     assert_eq!(
       buffer[(row.find("@@").unwrap() as u16, y as u16)].bg,
-      CURRENT_HUNK_BG
+      current_bg
     );
     let (y, _) = row_with(&rows, "@@ -1,1");
-    assert_ne!(buffer[(5, y as u16)].bg, CURRENT_HUNK_BG);
+    assert_ne!(buffer[(5, y as u16)].bg, current_bg);
   }
 
   #[test]
@@ -691,7 +759,7 @@ new file mode 100644
     let x = row[..row.find("+new").unwrap()].chars().count() as u16 + 1;
     let cell = &terminal.backend().buffer()[(x, y as u16)];
     assert_eq!(cell.fg, Color::Rgb(200, 1, 2));
-    assert_eq!(cell.bg, ADDED_WORD_BG);
+    assert_eq!(cell.bg, Palette::default().diff_add_text.bg.unwrap());
     assert!(rows.iter().any(|r| r.contains("-old")));
   }
 
@@ -700,10 +768,12 @@ new file mode 100644
     let mut app = app_with(DIFF);
     let (terminal, rows) = draw(&mut app, 80, 14);
     let buffer = terminal.backend().buffer();
-    for (needle, line_bg, word_bg) in [
-      ("+new", ADDED_BG, ADDED_WORD_BG),
-      ("-old", REMOVED_BG, REMOVED_WORD_BG),
+    let p = Palette::default();
+    for (needle, line, word) in [
+      ("+new", p.diff_add, p.diff_add_text),
+      ("-old", p.diff_delete, p.diff_delete_text),
     ] {
+      let (line_bg, word_bg) = (line.bg.unwrap(), word.bg.unwrap());
       let (y, row) = row_with(&rows, needle);
       let x = row[..row.find(needle).unwrap()].chars().count() as u16 + 1;
       assert_eq!(buffer[(x, y as u16)].bg, word_bg);
@@ -716,13 +786,133 @@ new file mode 100644
   fn emphasis_keeps_syntax_colors_and_splits_pieces() {
     let red = Style::new().fg(Color::Red);
     let pieces = vec![(red, "ab".to_string()), (Style::new(), "cd".to_string())];
-    let out = emphasize(&pieces, &[1..3], Some(Color::Blue));
+    let out = emphasize(&pieces, &[1..3], Some(Style::new().bg(Color::Blue)));
     let texts: Vec<_> = out.iter().map(|(_, t)| t.as_str()).collect();
     assert_eq!(texts, ["a", "b", "c", "d"]);
     assert_eq!(out[0].0, red);
     assert_eq!(out[1].0, red.bg(Color::Blue));
     assert_eq!(out[2].0, Style::new().bg(Color::Blue));
     assert_eq!(out[3].0, Style::new());
+  }
+
+  #[test]
+  fn a_custom_palette_colors_the_diff_and_visual_keeps_the_line_foreground() {
+    let mut app = app_with(DIFF);
+    app.palette.diff_add = Style::new().fg(Color::Magenta).bg(Color::Rgb(1, 2, 3));
+    app.palette.diff_add_text = Style::new().bg(Color::Rgb(4, 5, 6));
+    app.palette.visual = Style::new().bg(Color::Rgb(7, 8, 9));
+    let cell = |app: &mut App, needle: &str, dx: isize| {
+      let (terminal, rows) = draw(app, 80, 14);
+      let (y, row) = row_with(&rows, needle);
+      // The first row character is a quote, so the cell is one to the left.
+      let x = row[..row.find(needle).unwrap()].chars().count() as isize - 1 + dx;
+      terminal.backend().buffer()[(x as u16, y as u16)].clone()
+    };
+    // The marker takes the line style, the changed word the emphasis on top.
+    assert_eq!(cell(&mut app, "+new", 0).bg, Color::Rgb(1, 2, 3));
+    assert_eq!(cell(&mut app, "+new", 1).bg, Color::Rgb(4, 5, 6));
+    assert_eq!(cell(&mut app, "+new", 1).fg, Color::Magenta);
+    for c in "jjvj".chars() {
+      app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let selected = cell(&mut app, "+new", 1);
+    assert_eq!(selected.bg, Color::Rgb(7, 8, 9));
+    assert_eq!(selected.fg, Color::Magenta);
+  }
+
+  #[test]
+  fn chrome_groups_color_the_background_borders_labels_cursor_and_mode() {
+    let mut app = app_with(DIFF);
+    app.palette.normal = Style::new().fg(Color::Rgb(1, 1, 1)).bg(Color::Rgb(2, 2, 2));
+    app.palette.border = Style::new().fg(Color::Rgb(3, 3, 3));
+    app.palette.diff_border = Style::new().fg(Color::Rgb(4, 4, 4));
+    app.palette.section_label = Style::new().fg(Color::Rgb(5, 5, 5));
+    app.palette.cursor_line = Style::new().bg(Color::Rgb(6, 6, 6));
+    app.palette.mode_normal = Style::new().fg(Color::Rgb(7, 7, 7));
+    app.palette.mode_visual = Style::new().fg(Color::Rgb(8, 8, 8));
+    let (terminal, rows) = draw(&mut app, 100, 14);
+    let at = |x: u16, y: usize| terminal.backend().buffer()[(x, y as u16)].clone();
+
+    // The list border is `Border`, the diff border is `Border` under `DiffBorder`.
+    assert_eq!(at(0, 0).fg, Color::Rgb(3, 3, 3));
+    let list_width = (100u16 / 3).clamp(20, 40);
+    assert_eq!(at(list_width, 0).fg, Color::Rgb(4, 4, 4));
+    // Cells nothing else drew take `Normal`.
+    assert_eq!(at(99, 12).bg, Color::Rgb(2, 2, 2));
+    assert_eq!(at(5, 10).fg, Color::Rgb(1, 1, 1));
+    // The footer mode label.
+    assert_eq!(at(1, 13).fg, Color::Rgb(7, 7, 7));
+    // The diff cursor.
+    let (y, _) = row_with(&rows, "@@ -1,3");
+    assert_eq!(at(list_width + 2, y).bg, Color::Rgb(6, 6, 6));
+
+    app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+    let (terminal, _) = draw(&mut app, 100, 14);
+    assert_eq!(terminal.backend().buffer()[(1, 13)].fg, Color::Rgb(8, 8, 8));
+  }
+
+  #[test]
+  fn rounded_borders_use_rounded_corners_and_plain_is_the_default() {
+    let mut app = app_with(DIFF);
+    let (_, rows) = draw(&mut app, 100, 14);
+    assert!(rows[0].starts_with("\"┌"), "{}", rows[0]);
+    app.border = Border::Rounded;
+    let (_, rows) = draw(&mut app, 100, 14);
+    assert!(rows[0].starts_with("\"╭"), "{}", rows[0]);
+    assert!(rows[0].contains("╮╭"), "{}", rows[0]);
+    assert!(rows[12].contains("╯╰"), "{}", rows[12]);
+  }
+
+  #[test]
+  fn the_current_hunk_fills_a_bar_beside_the_diff_and_between_split_columns() {
+    let mut app =
+      app_with("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d\n");
+    let bar = Palette::default().diff_hunk_bar.fg.unwrap();
+    // The list is 20 wide at this size, so the diff text starts at column 21.
+    let (edge, gap) = (21, 21 + 1 + (38 - 2) / 2);
+    // The bar is a half block, so its color is the foreground of the cell,
+    // and a row without the bar is a blank cell.
+    let bg_at = |app: &mut App, needle: &str, x: u16| {
+      let (terminal, rows) = draw(app, 60, 12);
+      let (y, _) = row_with(&rows, needle);
+      let cell = &terminal.backend().buffer()[(x, y as u16)];
+      if cell.symbol() == BAR {
+        cell.fg
+      } else {
+        assert_eq!(cell.symbol(), " ");
+        Color::Reset
+      }
+    };
+
+    assert_eq!(bg_at(&mut app, "@@ -1,1", edge), bar);
+    assert_eq!(bg_at(&mut app, "-a", edge), bar);
+    assert_ne!(bg_at(&mut app, "@@ -9,1", edge), bar);
+    assert_ne!(bg_at(&mut app, "-c", edge), bar);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    for x in [edge, gap] {
+      assert_eq!(bg_at(&mut app, "@@ -1,1", x), bar, "column {x}");
+      assert_eq!(bg_at(&mut app, "-a", x), bar, "column {x}");
+      assert_ne!(bg_at(&mut app, "@@ -9,1", x), bar, "column {x}");
+    }
+    for c in "jjj".chars() {
+      app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert_eq!(bg_at(&mut app, "@@ -9,1", gap), bar);
+    assert_ne!(bg_at(&mut app, "@@ -1,1", gap), bar);
+  }
+
+  #[test]
+  fn section_labels_take_the_section_label_group() {
+    let mut app = sectioned_app(&[Section::Unstaged, Section::Staged]);
+    app.palette.section_label = Style::new().fg(Color::Rgb(5, 5, 5));
+    let (terminal, rows) = draw(&mut app, 80, 14);
+    let (y, row) = row_with(&rows, "Unstaged");
+    let x = row[..row.find("Unstaged").unwrap()].chars().count() - 1;
+    assert_eq!(
+      terminal.backend().buffer()[(x as u16, y as u16)].fg,
+      Color::Rgb(5, 5, 5)
+    );
   }
 
   #[test]
