@@ -16,7 +16,7 @@ const REMOVED_BG: Color = Color::Rgb(66, 24, 28);
 const ADDED_WORD_BG: Color = Color::Rgb(30, 100, 52);
 const REMOVED_WORD_BG: Color = Color::Rgb(128, 40, 46);
 
-const HELP: &str = " j/k scroll  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  q quit";
+const HELP: &str = " j/k scroll  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  e expand  q quit";
 
 enum Row<'a> {
   Header(&'a Hunk),
@@ -26,10 +26,11 @@ enum Row<'a> {
 pub fn render(frame: &mut Frame, app: &mut App) {
   let [main, footer] =
     Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-  frame.render_widget(
-    Paragraph::new(HELP).style(Style::new().fg(Color::DarkGray)),
-    footer,
-  );
+  let footer_text = match &app.notice {
+    Some(notice) => Paragraph::new(format!(" {notice}")).style(Style::new().fg(Color::Yellow)),
+    None => Paragraph::new(HELP).style(Style::new().fg(Color::DarkGray)),
+  };
+  frame.render_widget(footer_text, footer);
 
   if let Load::Failed(message) = &app.load {
     let text = Paragraph::new(format!("Error: {message}")).style(Style::new().fg(Color::Red));

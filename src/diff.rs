@@ -576,6 +576,88 @@ index 111..222 100644
     assert_eq!(f, before);
   }
 
+  fn numbers(f: &FileDiff) -> Vec<(Option<u32>, Option<u32>)> {
+    f.hunks[0]
+      .lines
+      .iter()
+      .map(|l| (l.old_no, l.new_no))
+      .collect()
+  }
+
+  #[test]
+  fn expanding_around_a_pure_addition_numbers_both_sides() {
+    let mut f = one("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -2,0 +3,2 @@\n+x\n+y\n");
+    f.expand(0, b"l1\nl2\nx\ny\nl5\nl6\n");
+    f.expand(1, b"l1\nl2\nx\ny\nl5\nl6\n");
+    let h = &f.hunks[0];
+    assert_eq!(
+      (h.old_start, h.old_len, h.new_start, h.new_len),
+      (1, 4, 1, 6)
+    );
+    assert_eq!(
+      numbers(&f),
+      [
+        (Some(1), Some(1)),
+        (Some(2), Some(2)),
+        (None, Some(3)),
+        (None, Some(4)),
+        (Some(3), Some(5)),
+        (Some(4), Some(6)),
+      ]
+    );
+  }
+
+  #[test]
+  fn expanding_around_a_pure_deletion_numbers_both_sides() {
+    let mut f = one("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3,2 +2,0 @@\n-c\n-d\n");
+    f.expand(0, b"a\nb\ne\nf\n");
+    f.expand(1, b"a\nb\ne\nf\n");
+    let h = &f.hunks[0];
+    assert_eq!(
+      (h.old_start, h.old_len, h.new_start, h.new_len),
+      (1, 6, 1, 4)
+    );
+    assert_eq!(
+      numbers(&f),
+      [
+        (Some(1), Some(1)),
+        (Some(2), Some(2)),
+        (Some(3), None),
+        (Some(4), None),
+        (Some(5), Some(3)),
+        (Some(6), Some(4)),
+      ]
+    );
+  }
+
+  #[test]
+  fn expanding_a_whole_file_change_or_a_missing_file_reveals_nothing() {
+    let mut added = one(
+      "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1,2 @@\n+a\n+b\n",
+    );
+    let before = added.clone();
+    added.expand(0, b"a\nb\n");
+    added.expand(1, b"a\nb\n");
+    assert_eq!(added, before);
+
+    let mut deleted = one(
+      "diff --git a/f b/f\ndeleted file mode 100644\n--- a/f\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n",
+    );
+    let before = deleted.clone();
+    deleted.expand(0, b"");
+    deleted.expand(1, b"");
+    assert_eq!(deleted, before);
+  }
+
+  #[test]
+  fn revealed_lines_keep_carriage_returns_like_diff_lines_do() {
+    let mut f = one("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -2 +2 @@\n-x\r\n+y\r\n");
+    f.expand(0, b"l1\r\ny\r\n");
+    let lines = &f.hunks[0].lines;
+    assert_eq!(lines[0].content, b"l1\r");
+    assert_eq!(lines[2].content, b"y\r");
+  }
+
   #[test]
   fn parses_several_files() {
     let two = format!(

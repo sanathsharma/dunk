@@ -30,6 +30,9 @@ pub enum Event {
   /// The full contents of a file of the load with this number, read for an
   /// expansion.
   Sides(u64, usize, Arc<Sides>),
+  /// The colors of an expanded file: the load, the file and which of its
+  /// expansions they were made for.
+  Rehighlighted(u64, usize, u32, FileHighlight),
   InputFailed(io::Error),
 }
 
@@ -37,6 +40,14 @@ pub enum Load {
   Loading,
   Ready,
   Failed(String),
+}
+
+/// An expanded file waiting to be colored again.
+pub struct Rehighlight {
+  pub index: usize,
+  pub generation: u32,
+  pub file: FileDiff,
+  pub sides: Arc<Sides>,
 }
 
 pub struct App {
@@ -53,10 +64,12 @@ pub struct App {
   /// An expansion waiting for its file contents: the file and the gaps to
   /// try, best first.
   pending_expand: Option<(usize, [usize; 2])>,
-  /// Which files have expanded gaps, so their original highlights are stale.
-  expanded: Vec<bool>,
-  /// Recolors a file after an expansion. `None` leaves diffs uncolored.
-  pub highlighter: Option<Arc<Highlighter>>,
+  /// How many times each file was expanded. Colors made for an earlier count
+  /// do not fit its lines.
+  expansions: Vec<u32>,
+  rehighlight: Option<Rehighlight>,
+  /// A short message for the footer, cleared by the next key press.
+  pub notice: Option<String>,
   /// Colors per file, parallel to `files`. `None` until the worker delivers.
   pub highlights: Vec<Option<FileHighlight>>,
   /// Changed word ranges per file, hunk and line, filled when a file is first
@@ -81,8 +94,9 @@ impl Default for App {
       sides: Vec::new(),
       sides_requested: Vec::new(),
       pending_expand: None,
-      expanded: Vec::new(),
-      highlighter: None,
+      expansions: Vec::new(),
+      rehighlight: None,
+      notice: None,
       highlights: Vec::new(),
       words: Vec::new(),
       layout: Layout::Unified,
@@ -176,7 +190,8 @@ impl App {
     self.words = files.iter().map(|_| None).collect();
     self.sides = files.iter().map(|_| None).collect();
     self.sides_requested = vec![false; files.len()];
-    self.expanded = vec![false; files.len()];
+    self.expansions = vec![0; files.len()];
+    self.rehighlight = None;
     self.pending_expand = None;
     let index = kept.unwrap_or(self.selected.min(files.len().saturating_sub(1)));
     self.loaded = Arc::new(files);
@@ -188,12 +203,22 @@ impl App {
   }
 
   pub fn on_highlighted(&mut self, index: usize, highlight: FileHighlight) {
-    // A highlight made for the unexpanded file would not fit its lines.
-    if self.expanded.get(index) == Some(&false)
+    self.on_rehighlighted(index, 0, highlight);
+  }
+
+  /// Takes the colors of file `index` as it was after `generation`
+  /// expansions. Colors for any other count would not fit its lines.
+  pub fn on_rehighlighted(&mut self, index: usize, generation: u32, highlight: FileHighlight) {
+    if self.expansions.get(index) == Some(&generation)
       && let Some(slot) = self.highlights.get_mut(index)
     {
       *slot = Some(highlight);
     }
+  }
+
+  /// Takes the expanded file that needs new colors.
+  pub fn take_rehighlight(&mut self) -> Option<Rehighlight> {
+    self.rehighlight.take()
   }
 
   /// Takes the file whose full contents an expansion is waiting for. Each
@@ -210,6 +235,16 @@ impl App {
     let Some(slot) = self.sides.get_mut(index) else {
       return;
     };
+    if sides.new.is_none() {
+      // Leave the slot empty so the next key press tries the read again.
+      self.sides_requested[index] = false;
+      self.pending_expand = None;
+      self.notice = Some(format!(
+        "Cannot read {}",
+        self.files[index].path().display()
+      ));
+      return;
+    }
     *slot = Some(sides.clone());
     if let Some((wanted, gaps)) = self.pending_expand
       && wanted == index
@@ -223,6 +258,7 @@ impl App {
     if key.kind != KeyEventKind::Press {
       return;
     }
+    self.notice = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let page = self.viewport.max(1);
     match key.code {
@@ -275,8 +311,9 @@ impl App {
 
   /// Reveals the unchanged lines next to the hunk at the top of the pane:
   /// the gap above it when the top row is in its first half, the gap below
-  /// otherwise. An empty gap falls back to the other one. The scroll position
-  /// stays, so the revealed lines appear where the hunk edge was.
+  /// otherwise. An empty gap falls back to the other one. The scroll index
+  /// stays, so expanding upward puts the revealed lines at the top of the
+  /// pane and expanding downward puts them below the rows already in view.
   fn expand_at_top(&mut self) {
     let Some(file) = self.files.get(self.selected) else {
       return;
@@ -297,7 +334,7 @@ impl App {
   }
 
   /// Expands the first of `gaps` that has lines to show.
-  fn reveal(&mut self, index: usize, sides: &Sides, gaps: [usize; 2]) {
+  fn reveal(&mut self, index: usize, sides: &Arc<Sides>, gaps: [usize; 2]) {
     let Some(text) = sides.new.as_deref() else {
       return;
     };
@@ -311,14 +348,18 @@ impl App {
       }
     }
     if lines(&files[index]) == before {
+      self.notice = Some("No unchanged lines to show here".into());
       return;
     }
-    self.expanded[index] = true;
+    self.expansions[index] += 1;
     self.words[index] = None;
-    self.highlights[index] = self
-      .highlighter
-      .as_ref()
-      .map(|h| h.diff(&self.files[index], sides));
+    self.highlights[index] = None;
+    self.rehighlight = Some(Rehighlight {
+      index,
+      generation: self.expansions[index],
+      file: self.files[index].clone(),
+      sides: sides.clone(),
+    });
     self.clamp_scroll();
   }
 
@@ -420,7 +461,6 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   let highlighter = theme
     .and_then(|theme| Highlighter::new(&theme).ok())
     .map(Arc::new);
-  app.highlighter = highlighter.clone();
   let mut worker: Option<Worker> = None;
   while !app.quit {
     terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -457,8 +497,21 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
       Ok(Event::Highlighted(..)) => {}
       Ok(Event::Sides(id, index, sides)) if id == applied => app.on_sides(index, sides),
       Ok(Event::Sides(..)) => {}
+      Ok(Event::Rehighlighted(id, index, generation, highlight)) if id == applied => {
+        app.on_rehighlighted(index, generation, highlight)
+      }
+      Ok(Event::Rehighlighted(..)) => {}
       Ok(Event::InputFailed(e)) => return Err(e),
       Err(_) => break,
+    }
+    if let Some(r) = app.take_rehighlight()
+      && let Some(highlighter) = highlighter.clone()
+    {
+      let (tx, id) = (tx.clone(), applied);
+      thread::spawn(move || {
+        let highlight = highlighter.diff(&r.file, &r.sides);
+        let _ = tx.send(Event::Rehighlighted(id, r.index, r.generation, highlight));
+      });
     }
     if let Some(index) = app.take_sides_request() {
       spawn_sides(
@@ -791,28 +844,70 @@ mod tests {
   }
 
   #[test]
-  fn expanding_again_uses_the_file_already_read_and_a_reload_keeps_it() {
+  fn an_identical_reload_keeps_expanded_gaps_and_the_file_contents() {
+    let mut app = ready(vec![gapped_file()], 20);
+    app.on_key(key(KeyCode::Char('e')));
+    app.on_sides(0, gapped_sides());
+    assert!(!app.on_loaded(Ok(vec![gapped_file()])));
+    assert_eq!(app.files[0].hunks.len(), 1);
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.take_sides_request(), None);
+  }
+
+  #[test]
+  fn a_changed_reload_drops_expansions_and_reads_the_file_again() {
+    let mut app = ready(vec![gapped_file()], 20);
+    app.on_key(key(KeyCode::Char('e')));
+    app.on_sides(0, gapped_sides());
+    let mut other = gapped_file();
+    other.hunks.pop();
+    assert!(app.on_loaded(Ok(vec![other])));
+    assert_eq!(app.files[0].hunks[0].lines.len(), 4);
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.take_sides_request(), Some(0));
+  }
+
+  #[test]
+  fn an_expanded_file_is_recolored_and_stale_colors_are_dropped() {
+    let mut app = ready(vec![gapped_file()], 20);
+    app.on_highlighted(0, FileHighlight::default());
+    app.on_key(key(KeyCode::Char('e')));
+    assert!(app.take_rehighlight().is_none());
+    app.on_sides(0, gapped_sides());
+    assert!(app.highlights[0].is_none());
+    let job = app.take_rehighlight().unwrap();
+    assert_eq!((job.index, job.generation, job.file.hunks.len()), (0, 1, 1));
+
+    app.on_highlighted(0, FileHighlight::default());
+    assert!(app.highlights[0].is_none());
+    app.on_rehighlighted(0, 1, FileHighlight::default());
+    assert!(app.highlights[0].is_some());
+  }
+
+  #[test]
+  fn an_unreadable_file_leaves_the_diff_as_it_was_says_so_and_can_be_retried() {
+    let mut app = ready(vec![gapped_file()], 20);
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.take_sides_request(), Some(0));
+    app.on_sides(0, Arc::new(Sides::default()));
+    assert_eq!(app.files[0], gapped_file());
+    assert_eq!(app.notice.as_deref(), Some("Cannot read f"));
+
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.notice, None);
+    assert_eq!(app.take_sides_request(), Some(0));
+  }
+
+  #[test]
+  fn expanding_with_nothing_left_to_show_says_so() {
     let mut app = ready(vec![gapped_file()], 20);
     app.on_key(key(KeyCode::Char('e')));
     app.on_sides(0, gapped_sides());
     app.on_key(key(KeyCode::Char('e')));
-    assert_eq!(app.take_sides_request(), None);
-    assert!(!app.on_loaded(Ok(vec![gapped_file()])));
-    assert_eq!(app.files[0].hunks.len(), 1);
-
-    let mut other = gapped_file();
-    other.hunks.pop();
-    assert!(app.on_loaded(Ok(vec![other])));
-    assert_eq!(app.files[0].hunks.len(), 1);
-    assert_eq!(app.files[0].hunks[0].lines.len(), 4);
-  }
-
-  #[test]
-  fn an_unreadable_file_leaves_the_diff_as_it_was() {
-    let mut app = ready(vec![gapped_file()], 20);
-    app.on_key(key(KeyCode::Char('e')));
-    app.on_sides(0, Arc::new(Sides::default()));
-    assert_eq!(app.files[0], gapped_file());
+    assert_eq!(
+      app.notice.as_deref(),
+      Some("No unchanged lines to show here")
+    );
   }
 
   #[test]
