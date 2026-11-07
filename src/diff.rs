@@ -1,6 +1,6 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
-use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -169,10 +169,10 @@ impl FileDiff {
   }
 
   /// A patch that holds only the changed lines of hunk `hunk` that fall in
-  /// `lines`, an index range into the hunk's lines. A removed line outside the
+  /// `lines`, a set of indexes into the hunk's lines. A removed line outside the
   /// range becomes context and an added one outside it is left out, so the
   /// patch changes nothing but the selection.
-  pub fn line_patch(&self, hunk: usize, lines: Range<usize>) -> Vec<u8> {
+  pub fn line_patch(&self, hunk: usize, lines: &BTreeSet<usize>) -> Vec<u8> {
     let h = &self.hunks[hunk];
     let mut kept: Vec<Line> = Vec::new();
     for (i, line) in h.lines.iter().enumerate() {
@@ -233,7 +233,7 @@ impl FileDiff {
 
   /// A patch that undoes only the changed lines of hunk `hunk` that fall in
   /// `lines`, as `line_patch` selects them.
-  pub fn reverse_line_patch(&self, hunk: usize, lines: Range<usize>) -> Vec<u8> {
+  pub fn reverse_line_patch(&self, hunk: usize, lines: &BTreeSet<usize>) -> Vec<u8> {
     self.reversed_hunk(hunk).line_patch(0, lines)
   }
 

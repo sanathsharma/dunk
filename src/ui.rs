@@ -220,12 +220,15 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
             current == Some(hi),
           )
         }
-        None => Line::raw(""),
+        None => blank(fill),
       };
       let rows: Vec<(Line, Line)> = hunks
         .flat_map(|(hi, h)| {
           let header = Row::Header(h, current == Some(hi));
-          let header = (row_line(header, width, left_width.into()), Line::raw(""));
+          let header = (
+            row_line(header, width, left_width.into()),
+            blank(right_width),
+          );
           let pairs = pairs(h).into_iter().map(move |(l, r)| {
             (
               side(l, hi, false, left_width),
@@ -244,6 +247,12 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
       frame.render_widget(Paragraph::new(right), right_area);
     }
   }
+}
+
+/// An empty column of a split row. It holds spaces so that a selection
+/// highlight spans it.
+fn blank(width: u16) -> Line<'static> {
+  Line::raw(" ".repeat(width.into()))
 }
 
 /// Paints the selection background over a line, replacing the colors of its
@@ -759,6 +768,28 @@ diff --git a/a.rs b/a.rs
     assert!(!surplus.contains('+'));
     let (_, tail) = row_with(&rows, "tail");
     assert_eq!(tail.matches("tail").count(), 2);
+  }
+
+  #[test]
+  fn split_layout_highlights_whole_rows_of_the_selection() {
+    let mut app = split_app();
+    // The cursor goes to the row of `-old2`, which has no partner on the right.
+    for c in "jjjv".chars() {
+      app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    let (terminal, rows) = draw(&mut app, 81, 12);
+    assert!(rows[11].contains(" VISUAL 1 line "), "{}", rows[11]);
+    let buffer = terminal.backend().buffer();
+    let (y, row) = row_with(&rows, "-old2");
+    let left = row[..row.find("-old2").unwrap()].chars().count() as u16;
+    // The left line and the blank right column are both highlighted.
+    for x in [left, 79] {
+      assert_eq!(buffer[(x, y as u16)].bg, SELECTED_BG, "column {x}");
+    }
+    let (y, _) = row_with(&rows, "-old1");
+    for x in [left, 79] {
+      assert_ne!(buffer[(x, y as u16)].bg, SELECTED_BG, "column {x}");
+    }
   }
 
   #[test]

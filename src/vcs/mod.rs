@@ -2,9 +2,9 @@ mod git;
 
 use crate::args::Scope;
 use crate::diff::{FileDiff, ParseError, Section};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
-use std::ops::Range;
 
 pub use git::Git;
 
@@ -120,12 +120,18 @@ pub trait Vcs {
   fn unstage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error>;
 
   /// Adds only the changed lines of hunk `hunk` of `file` that fall in
-  /// `lines`, an index range into the hunk's lines.
-  fn stage_lines(&self, file: &FileDiff, hunk: usize, lines: Range<usize>) -> Result<(), Error>;
+  /// `lines`, a set of indexes into the hunk's lines.
+  fn stage_lines(&self, file: &FileDiff, hunk: usize, lines: &BTreeSet<usize>)
+  -> Result<(), Error>;
 
   /// Takes only the changed lines of hunk `hunk` of a staged `file` that fall
   /// in `lines` out of the index, keeping the working tree.
-  fn unstage_lines(&self, file: &FileDiff, hunk: usize, lines: Range<usize>) -> Result<(), Error>;
+  fn unstage_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: &BTreeSet<usize>,
+  ) -> Result<(), Error>;
 
   /// Reads both versions of `file` as `request` compared them.
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;

@@ -11,8 +11,9 @@ use crate::worker::Worker;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
+use std::collections::BTreeSet;
 use std::io;
-use std::ops::{Range, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -55,8 +56,8 @@ pub struct Follow {
 pub enum Target {
   File,
   Hunk(usize),
-  /// The lines of a hunk in this range of the hunk's lines.
-  Lines(usize, Range<usize>),
+  /// The lines of a hunk at these indexes into the hunk's lines.
+  Lines(usize, BTreeSet<usize>),
 }
 
 /// A stage or unstage of a file, a hunk or some of its lines waiting to run.
@@ -77,8 +78,8 @@ impl IndexRequest {
       (Target::File, false) => vcs.unstage(file),
       (Target::Hunk(hunk), true) => vcs.stage_hunk(file, *hunk),
       (Target::Hunk(hunk), false) => vcs.unstage_hunk(file, *hunk),
-      (Target::Lines(hunk, lines), true) => vcs.stage_lines(file, *hunk, lines.clone()),
-      (Target::Lines(hunk, lines), false) => vcs.unstage_lines(file, *hunk, lines.clone()),
+      (Target::Lines(hunk, lines), true) => vcs.stage_lines(file, *hunk, lines),
+      (Target::Lines(hunk, lines), false) => vcs.unstage_lines(file, *hunk, lines),
     }
   }
 }
@@ -231,6 +232,24 @@ fn locate(file: &FileDiff, layout: Layout, mut row: usize) -> Option<(usize, Opt
     return Some((hi, Some(line)));
   }
   None
+}
+
+/// Indexes of the lines drawn at `row`: both sides of a split row, the one
+/// line of a unified row, none on a header. Ascending.
+fn row_lines(file: &FileDiff, layout: Layout, row: usize) -> Vec<usize> {
+  let Some((hunk, Some(line))) = locate(file, layout, row) else {
+    return Vec::new();
+  };
+  match layout {
+    Layout::Unified => vec![line],
+    Layout::Split => {
+      let (left, right) =
+        split::pairs(&file.hunks[hunk])[row - row_of(file, layout, hunk, None) - 1];
+      let mut lines: Vec<usize> = left.into_iter().chain(right).collect();
+      lines.dedup();
+      lines
+    }
+  }
 }
 
 /// The row where a hunk, or a line within it, is drawn in `layout`.
@@ -408,7 +427,7 @@ impl App {
   /// the entry, or to the next file in the section after the last hunk. When
   /// part of the hunk is left, the cursor stays on it. Returns whether a
   /// request was made.
-  fn toggle_stage_hunk(&mut self, lines: Option<Range<usize>>) -> bool {
+  fn toggle_stage_hunk(&mut self, lines: Option<BTreeSet<usize>>) -> bool {
     let Some(file) = self.files.get(self.selected) else {
       return false;
     };
@@ -470,9 +489,7 @@ impl App {
 
   /// Starts a selection at the cursor.
   fn enter_visual(&mut self) {
-    if self.layout != Layout::Unified {
-      self.notice = Some("Visual mode needs the unified layout, press s".into());
-    } else if self.cursor_hunk().is_some() {
+    if self.cursor_hunk().is_some() {
       self.mode = Mode::Visual;
       self.visual_anchor = self.cursor;
     }
@@ -484,17 +501,17 @@ impl App {
       .then(|| self.visual_anchor.min(self.cursor)..=self.visual_anchor.max(self.cursor))
   }
 
-  /// The hunk the selection is in and the range of that hunk's lines it
-  /// covers. The header row holds no line. The selection never leaves the
-  /// hunk it started in.
-  pub fn selection_lines(&self) -> Option<(usize, Range<usize>)> {
+  /// The hunk the selection is in and the indexes of the lines it covers.
+  /// The header row holds no line. In the split layout a row covers the lines
+  /// on both of its sides. The selection never leaves the hunk it started in.
+  pub fn selection_lines(&self) -> Option<(usize, BTreeSet<usize>)> {
     let rows = self.selection()?;
     let file = self.files.get(self.selected)?;
     let (hunk, _) = locate(file, self.layout, *rows.start())?;
-    let first_line_row = row_of(file, self.layout, hunk, None) + 1;
-    let start = rows.start().saturating_sub(first_line_row);
-    let end = (rows.end() + 1).saturating_sub(first_line_row);
-    Some((hunk, start..end))
+    let lines = rows
+      .flat_map(|row| row_lines(file, self.layout, row))
+      .collect();
+    Some((hunk, lines))
   }
 
   /// The mode for the footer, with the size of the selection in visual mode.
@@ -548,6 +565,7 @@ impl App {
       KeyCode::Esc | KeyCode::Char('v') => self.mode = Mode::Normal,
       KeyCode::Char('j') | KeyCode::Down => self.extend_selection(1),
       KeyCode::Char('k') | KeyCode::Up => self.extend_selection(-1),
+      KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('a') => self.stage_selection(),
       _ => {}
     }
@@ -655,7 +673,22 @@ impl App {
       if let Some((hunk, line)) = locate(file, from, self.scroll) {
         self.scroll = row_of(file, to, hunk, line);
       }
-      if let Some((hunk, line)) = locate(file, from, self.cursor) {
+      if self.mode == Mode::Visual {
+        // The selection spans the rows that show its lines, so it keeps the
+        // lines it had. A selection of the header alone has no lines and
+        // stays on the header.
+        if let Some((hunk, lines)) = self.selection_lines() {
+          let rows = |line| row_of(file, to, hunk, line);
+          let mut shown = lines.iter().map(|&line| rows(Some(line)));
+          let first = shown.next().unwrap_or_else(|| rows(None));
+          let (low, high) = shown.fold((first, first), |(lo, hi), row| (lo.min(row), hi.max(row)));
+          (self.visual_anchor, self.cursor) = if self.cursor >= self.visual_anchor {
+            (low, high)
+          } else {
+            (high, low)
+          };
+        }
+      } else if let Some((hunk, line)) = locate(file, from, self.cursor) {
         self.cursor = row_of(file, to, hunk, line);
       }
     }
@@ -1574,11 +1607,11 @@ mod tests {
       unreachable!()
     }
 
-    fn stage_lines(&self, _: &FileDiff, _: usize, _: Range<usize>) -> Result<(), vcs::Error> {
+    fn stage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), vcs::Error> {
       unreachable!()
     }
 
-    fn unstage_lines(&self, _: &FileDiff, _: usize, _: Range<usize>) -> Result<(), vcs::Error> {
+    fn unstage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), vcs::Error> {
       unreachable!()
     }
   }
@@ -2054,21 +2087,180 @@ mod tests {
     }
     // The last row of the first hunk, not the header of the second.
     assert_eq!(app.cursor, first);
-    assert_eq!(app.selection_lines(), Some((0, 0..first)));
+    assert_eq!(app.selection_lines(), Some((0, (0..first).collect())));
     for _ in 0..first + 5 {
       press(&mut app, "k");
     }
     assert_eq!(app.cursor, 0);
   }
 
+  /// One file `f` whose single hunk has unpaired rows. By hunk line: `1` `2`
+  /// `-3` `-4` `+x3` ` 5` `+new` ` 6` and context. By split row (the header
+  /// is row 0): 3 is `-3|+x3`, 4 is `-4|` and 6 is `|+new`.
+  fn uneven_repo() -> (tempfile::TempDir, crate::vcs::Git) {
+    use std::process::Command;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let d = tmp.path().to_path_buf();
+    let git = |args: &[&str]| {
+      let status = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(&d)
+        .status()
+        .unwrap();
+      assert!(status.success());
+    };
+    let body = |lines: &[&str]| lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+    let numbers: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+    let old: Vec<&str> = numbers.iter().map(String::as_str).collect();
+    let mut new = old.clone();
+    new.insert(5, "new");
+    new.splice(2..4, ["x3"]);
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(d.join("f"), body(&old)).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(d.join("f"), body(&new)).unwrap();
+    let repo = crate::vcs::Git::new(&d);
+    (tmp, repo)
+  }
+
+  /// The index of `uneven_repo` with `edits` applied to its numbered lines.
+  fn uneven_index(skip: &[&str], x3_before: bool, new_after_5: bool) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for n in 1..=20 {
+      let n = n.to_string();
+      if n == "3" && x3_before {
+        out.push("x3".into());
+      }
+      if !skip.contains(&n.as_str()) {
+        out.push(n.clone());
+      }
+      if n == "5" && new_after_5 {
+        out.push("new".into());
+      }
+    }
+    out.iter().map(|l| format!("{l}\n")).collect()
+  }
+
+  fn split_cursor_to(app: &mut App, row: usize) {
+    app.layout = Layout::Split;
+    cursor_to(app, row);
+  }
+
   #[test]
-  fn visual_mode_needs_the_unified_layout() {
-    let (_tmp, git) = line_repo();
+  fn a_split_row_selects_the_lines_on_both_sides() {
+    let (_tmp, git) = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
-    press(&mut app, "sv");
-    assert_eq!(app.mode, Mode::Normal);
-    assert!(app.notice.is_some());
+    split_cursor_to(&mut app, 3);
+    press(&mut app, "v");
+    assert_eq!(app.selection_lines(), Some((0, [2, 4].into())));
+    assert_eq!(app.mode_label(), "VISUAL 2 lines");
+    press(&mut app, "j");
+    assert_eq!(app.selection_lines(), Some((0, [2, 3, 4].into())));
+  }
+
+  #[test]
+  fn selected_split_rows_stage_both_sides_of_a_pair() {
+    let (tmp, git) = uneven_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    split_cursor_to(&mut app, 3);
+    press(&mut app, "va");
+    run_request(&mut app, &git);
+    // `-3` and `+x3` are staged, `-4` is not, so `x3` lands after the old 4.
+    let expected = uneven_index(&["3"], false, false).replacen("4\n", "4\nx3\n", 1);
+    assert_eq!(index_of(tmp.path(), "f"), expected);
+  }
+
+  #[test]
+  fn a_split_row_with_only_a_removed_line_stages_the_removal() {
+    let (tmp, git) = uneven_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    split_cursor_to(&mut app, 4);
+    press(&mut app, "va");
+    run_request(&mut app, &git);
+    assert_eq!(
+      index_of(tmp.path(), "f"),
+      uneven_index(&["4"], false, false)
+    );
+  }
+
+  #[test]
+  fn a_split_row_with_only_an_added_line_stages_the_addition() {
+    let (tmp, git) = uneven_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    split_cursor_to(&mut app, 6);
+    press(&mut app, "va");
+    run_request(&mut app, &git);
+    assert_eq!(index_of(tmp.path(), "f"), uneven_index(&[], false, true));
+  }
+
+  #[test]
+  fn split_rows_across_a_pair_and_an_unpaired_row_stage_all_their_lines() {
+    let (tmp, git) = uneven_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    split_cursor_to(&mut app, 3);
+    press(&mut app, "vja");
+    run_request(&mut app, &git);
+    assert_eq!(
+      index_of(tmp.path(), "f"),
+      uneven_index(&["3", "4"], true, false)
+    );
+  }
+
+  #[test]
+  fn unstaging_split_rows_takes_back_both_sides() {
+    let (tmp, git) = uneven_repo();
+    let d = tmp.path();
+    std::process::Command::new("git")
+      .args(["add", "f"])
+      .current_dir(d)
+      .status()
+      .unwrap();
+    let mut app = App::default();
+    load(&mut app, &git);
+    assert_eq!(selected_name(&app).1, Some(Section::Staged));
+    split_cursor_to(&mut app, 3);
+    press(&mut app, "va");
+    run_request(&mut app, &git);
+    // `-3` and `+x3` leave the index, the rest of the change stays.
+    assert_eq!(index_of(d, "f"), uneven_index(&["4"], false, true));
+  }
+
+  #[test]
+  fn toggling_the_layout_keeps_the_selected_lines() {
+    let (_tmp, git) = uneven_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    cursor_to(&mut app, 3); // unified `-3`
+    press(&mut app, "vjj"); // `-3` `-4` `+x3`
+    assert_eq!(app.selection_lines(), Some((0, [2, 3, 4].into())));
+    press(&mut app, "s");
+    assert_eq!(app.layout, Layout::Split);
+    assert_eq!((app.mode, app.selection()), (Mode::Visual, Some(3..=4)));
+    assert_eq!(app.selection_lines(), Some((0, [2, 3, 4].into())));
+    press(&mut app, "s");
+    assert_eq!(app.layout, Layout::Unified);
+    assert_eq!(app.selection(), Some(3..=5));
+    assert_eq!(app.selection_lines(), Some((0, [2, 3, 4].into())));
+  }
+
+  #[test]
+  fn toggling_the_layout_keeps_the_direction_of_the_selection() {
+    let (_tmp, git) = uneven_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    split_cursor_to(&mut app, 4);
+    press(&mut app, "vk");
+    assert_eq!(app.selection(), Some(3..=4));
+    press(&mut app, "s");
+    // Cursor above the anchor stays above it: `+x3` down to `-4`.
+    assert_eq!((app.cursor, app.visual_anchor), (3, 5));
   }
 
   #[test]

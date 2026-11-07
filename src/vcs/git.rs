@@ -1,11 +1,11 @@
 use super::{DiffRequest, Error, Sides, Vcs, VersionId};
 use crate::args::Scope;
 use crate::diff::{FileDiff, FileStatus, Section, parse};
+use std::collections::BTreeSet;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -349,12 +349,22 @@ impl Vcs for Git {
     self.apply_to_index(&file.hunk_patch(hunk))
   }
 
-  fn stage_lines(&self, file: &FileDiff, hunk: usize, lines: Range<usize>) -> Result<(), Error> {
+  fn stage_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: &BTreeSet<usize>,
+  ) -> Result<(), Error> {
     self.mark_intent_to_add(file)?;
     self.apply_to_index(&file.line_patch(hunk, lines))
   }
 
-  fn unstage_lines(&self, file: &FileDiff, hunk: usize, lines: Range<usize>) -> Result<(), Error> {
+  fn unstage_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: &BTreeSet<usize>,
+  ) -> Result<(), Error> {
     self.apply_to_index(&file.reverse_line_patch(hunk, lines))
   }
 
@@ -1080,7 +1090,7 @@ mod tests {
       let git = Git::new(d);
       let file = entry(&git, "f.txt", Section::Unstaged);
       assert_eq!(file.hunks.len(), 1);
-      git.stage_lines(&file, 0, lines.clone()).unwrap();
+      git.stage_lines(&file, 0, &lines.clone().collect()).unwrap();
       assert_eq!(index_of(d, "f.txt"), expected, "{lines:?}");
     }
   }
@@ -1101,7 +1111,9 @@ mod tests {
       git(d, &["add", "f.txt"]);
       let git = Git::new(d);
       let file = entry(&git, "f.txt", Section::Staged);
-      git.unstage_lines(&file, 0, lines.clone()).unwrap();
+      git
+        .unstage_lines(&file, 0, &lines.clone().collect())
+        .unwrap();
       assert_eq!(index_of(d, "f.txt"), expected, "{lines:?}");
     }
   }
@@ -1115,7 +1127,7 @@ mod tests {
     write(d, "new.txt", "a\nb\nc\nd\n");
     let git = Git::new(d);
     let file = entry(&git, "new.txt", Section::Unstaged);
-    git.stage_lines(&file, 0, 1..3).unwrap();
+    git.stage_lines(&file, 0, &(1..3).collect()).unwrap();
     assert_eq!(index_of(d, "new.txt"), "b\nc\n");
     let rest = entry(&git, "new.txt", Section::Unstaged);
     let added: Vec<&[u8]> = rest.hunks[0]
@@ -1138,13 +1150,21 @@ mod tests {
     git(d, &["add", "new.txt"]);
     let git = Git::new(d);
     git
-      .stage_lines(&entry(&git, "gone.txt", Section::Unstaged), 0, 0..1)
+      .stage_lines(
+        &entry(&git, "gone.txt", Section::Unstaged),
+        0,
+        &(0..1).collect(),
+      )
       .unwrap();
     // Only the first line is gone from the index.
     assert_eq!(index_of(d, "gone.txt"), "2\n3\n");
 
     git
-      .unstage_lines(&entry(&git, "new.txt", Section::Staged), 0, 1..2)
+      .unstage_lines(
+        &entry(&git, "new.txt", Section::Staged),
+        0,
+        &(1..2).collect(),
+      )
       .unwrap();
     assert_eq!(index_of(d, "new.txt"), "a\nc\n");
   }
@@ -1160,7 +1180,7 @@ mod tests {
     let file = entry(&git, "f.txt", Section::Unstaged);
     // Lines: ` a`, `-b` without a newline, `+c`. Only the addition is picked,
     // so `b` stays but now ends its line.
-    git.stage_lines(&file, 0, 2..3).unwrap();
+    git.stage_lines(&file, 0, &(2..3).collect()).unwrap();
     assert_eq!(index_of(d, "f.txt"), "a\nb\nc\n");
   }
 
