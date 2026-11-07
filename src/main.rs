@@ -5,6 +5,7 @@ mod highlight;
 mod split;
 mod ui;
 mod vcs;
+mod watch;
 mod words;
 mod worker;
 
@@ -33,8 +34,18 @@ fn run() -> Result<(), Box<dyn Error>> {
       .unwrap_or_else(|| highlight::DEFAULT_THEME.to_string())
   });
 
+  let git = Git::new(dir);
+  let root = if args.watch { Some(git.root()?) } else { None };
+
   let mut terminal = ratatui::try_init()?;
-  let result = app::run(&mut terminal, Git::new(dir), request, theme, args.layout);
+  let result = app::run(
+    &mut terminal,
+    git,
+    request,
+    theme,
+    args.layout,
+    root.as_deref(),
+  );
   ratatui::try_restore()?;
   Ok(result?)
 }

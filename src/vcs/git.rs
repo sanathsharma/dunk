@@ -46,7 +46,8 @@ impl Git {
     Ok(out.stdout)
   }
 
-  fn root(&self) -> Result<PathBuf, Error> {
+  /// The top level directory of the work tree containing the start directory.
+  pub fn root(&self) -> Result<PathBuf, Error> {
     let out = self.run(["rev-parse", "--show-toplevel"])?;
     Ok(path(out.strip_suffix(b"\n").unwrap_or(&out)))
   }

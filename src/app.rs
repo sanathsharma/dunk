@@ -4,12 +4,14 @@ use crate::highlight::FileHighlight;
 use crate::split;
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Vcs};
+use crate::watch::Watch;
 use crate::worker::Worker;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::io;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -17,8 +19,13 @@ use std::thread;
 pub enum Event {
   Key(KeyEvent),
   Resize,
-  Loaded(Result<Vec<FileDiff>, vcs::Error>),
-  Highlighted(usize, FileHighlight),
+  /// A load finished. The number says which load, so a slow older one cannot
+  /// overwrite a newer result.
+  Loaded(u64, Result<Vec<FileDiff>, vcs::Error>),
+  /// The watcher saw the repository change.
+  Changed,
+  /// A highlight for a file of the load with this number.
+  Highlighted(u64, usize, FileHighlight),
   InputFailed(io::Error),
 }
 
@@ -118,17 +125,36 @@ fn row_of(file: &FileDiff, layout: Layout, hunk: usize, line: Option<usize>) -> 
 }
 
 impl App {
-  pub fn on_loaded(&mut self, result: Result<Vec<FileDiff>, vcs::Error>) {
-    match result {
-      Ok(files) => {
-        self.highlights = files.iter().map(|_| None).collect();
-        self.words = files.iter().map(|_| None).collect();
-        self.files = Arc::new(files);
-        self.load = Load::Ready;
-        self.select(0);
+  /// Takes a freshly loaded changeset. Returns false when nothing changed,
+  /// so callers can keep the highlights they already have. After a reload
+  /// the same file stays selected, at the same scroll position, when it is
+  /// still in the changeset; otherwise the selection moves to the nearest
+  /// index.
+  pub fn on_loaded(&mut self, result: Result<Vec<FileDiff>, vcs::Error>) -> bool {
+    let files = match result {
+      Ok(files) => files,
+      Err(e) => {
+        self.load = Load::Failed(e.to_string());
+        return false;
       }
-      Err(e) => self.load = Load::Failed(e.to_string()),
+    };
+    self.load = Load::Ready;
+    if *self.files == files {
+      return false;
     }
+    let kept = self
+      .files
+      .get(self.selected)
+      .and_then(|old| files.iter().position(|f| f.path() == old.path()));
+    let scroll = if kept.is_some() { self.scroll } else { 0 };
+    self.highlights = files.iter().map(|_| None).collect();
+    self.words = files.iter().map(|_| None).collect();
+    let index = kept.unwrap_or(self.selected.min(files.len().saturating_sub(1)));
+    self.files = Arc::new(files);
+    self.select(index);
+    self.scroll = scroll;
+    self.clamp_scroll();
+    true
   }
 
   pub fn on_highlighted(&mut self, index: usize, highlight: FileHighlight) {
@@ -213,9 +239,14 @@ impl App {
 }
 
 /// Runs git off the UI thread and reports the result over the channel.
-fn spawn_load(vcs: Arc<impl Vcs + Send + Sync + 'static>, request: DiffRequest, tx: Sender<Event>) {
+fn spawn_load(
+  vcs: Arc<impl Vcs + Send + Sync + 'static>,
+  request: DiffRequest,
+  id: u64,
+  tx: Sender<Event>,
+) {
   thread::spawn(move || {
-    let _ = tx.send(Event::Loaded(vcs.diff(&request)));
+    let _ = tx.send(Event::Loaded(id, vcs.diff(&request)));
   });
 }
 
@@ -245,11 +276,21 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   request: DiffRequest,
   theme: Option<String>,
   layout: Layout,
+  watch: Option<&Path>,
 ) -> io::Result<()> {
   let vcs = Arc::new(vcs);
   let (tx, rx) = mpsc::channel();
   spawn_input(tx.clone());
-  spawn_load(vcs.clone(), request.clone(), tx.clone());
+  spawn_load(vcs.clone(), request.clone(), 0, tx.clone());
+  let _watch = match watch {
+    Some(root) => {
+      let tx = tx.clone();
+      Some(Watch::start(root, move || tx.send(Event::Changed).is_ok()).map_err(io::Error::other)?)
+    }
+    None => None,
+  };
+  // `latest` numbers the newest load asked for, `applied` the one on screen.
+  let (mut latest, mut applied) = (0, 0);
 
   let mut app = App {
     layout,
@@ -261,24 +302,34 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
     match rx.recv() {
       Ok(Event::Key(key)) => app.on_key(key),
       Ok(Event::Resize) => {}
-      Ok(Event::Loaded(result)) => {
-        app.on_loaded(result);
-        worker = theme
-          .clone()
-          .filter(|_| !app.files.is_empty())
-          .map(|theme| {
-            let tx = tx.clone();
-            Worker::spawn(
-              vcs.clone(),
-              request.clone(),
-              app.files.clone(),
-              theme,
-              app.selected,
-              move |i, h| tx.send(Event::Highlighted(i, h)).is_ok(),
-            )
-          });
+      Ok(Event::Changed) => {
+        latest += 1;
+        spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
       }
-      Ok(Event::Highlighted(index, highlight)) => app.on_highlighted(index, highlight),
+      Ok(Event::Loaded(id, result)) if id == latest => {
+        if app.on_loaded(result) {
+          applied = id;
+          worker = theme
+            .clone()
+            .filter(|_| !app.files.is_empty())
+            .map(|theme| {
+              let tx = tx.clone();
+              Worker::spawn(
+                vcs.clone(),
+                request.clone(),
+                app.files.clone(),
+                theme,
+                app.selected,
+                move |i, h| tx.send(Event::Highlighted(id, i, h)).is_ok(),
+              )
+            });
+        }
+      }
+      Ok(Event::Loaded(..)) => {}
+      Ok(Event::Highlighted(id, index, highlight)) if id == applied => {
+        app.on_highlighted(index, highlight)
+      }
+      Ok(Event::Highlighted(..)) => {}
       Ok(Event::InputFailed(e)) => return Err(e),
       Err(_) => break,
     }
@@ -293,7 +344,7 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
 mod tests {
   use super::*;
   use crate::diff::{FileStatus, Hunk, Line, LineKind};
-  use std::path::PathBuf;
+  use std::path::{Path, PathBuf};
 
   fn file(name: &str, lines: usize) -> FileDiff {
     FileDiff {
@@ -502,6 +553,64 @@ mod tests {
   }
 
   #[test]
+  fn a_reload_keeps_the_selected_file_and_scroll() {
+    let mut app = ready(vec![file("a", 30), file("b", 30), file("c", 30)], 5);
+    app.on_key(key(KeyCode::Char('n')));
+    app.on_key(key(KeyCode::PageDown));
+    let scroll = app.scroll;
+    assert!(scroll > 0);
+    // "a" disappears and "b" grows; "b" moves to index 0 but stays selected.
+    assert!(app.on_loaded(Ok(vec![file("b", 40), file("c", 30)])));
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.files[app.selected].path(), Path::new("b"));
+    assert_eq!(app.scroll, scroll);
+    assert_eq!(app.list_state.selected(), Some(0));
+  }
+
+  #[test]
+  fn a_reload_clamps_the_scroll_when_the_file_shrinks() {
+    let mut app = ready(vec![file("a", 30)], 5);
+    app.on_key(key(KeyCode::Char('G')));
+    assert!(app.on_loaded(Ok(vec![file("a", 10)])));
+    assert_eq!(app.scroll, app.max_scroll());
+    assert_eq!(app.scroll, 11 - 5);
+  }
+
+  #[test]
+  fn a_reload_moves_to_the_nearest_file_when_the_selected_one_is_gone() {
+    let mut app = ready(vec![file("a", 5), file("b", 5), file("c", 5)], 5);
+    app.on_key(key(KeyCode::Char('G')));
+    app.on_key(key(KeyCode::Char('n')));
+    app.on_key(key(KeyCode::Char('n')));
+    assert_eq!(app.selected, 2);
+    assert!(app.on_loaded(Ok(vec![file("a", 5), file("b", 5)])));
+    assert_eq!(app.selected, 1);
+    assert_eq!(app.scroll, 0);
+    assert!(app.on_loaded(Ok(Vec::new())));
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.list_state.selected(), None);
+  }
+
+  #[test]
+  fn an_identical_reload_changes_nothing() {
+    let mut app = ready(vec![file("a", 5)], 5);
+    app.on_highlighted(0, FileHighlight::default());
+    assert!(!app.on_loaded(Ok(vec![file("a", 5)])));
+    assert!(app.highlights[0].is_some());
+  }
+
+  #[test]
+  fn a_failed_reload_shows_the_error_and_the_next_one_recovers() {
+    let mut app = ready(vec![file("a", 5), file("b", 5)], 5);
+    app.on_key(key(KeyCode::Char('n')));
+    assert!(!app.on_loaded(Err(vcs::Error::Git("boom".into()))));
+    assert!(matches!(app.load, Load::Failed(_)));
+    assert!(!app.on_loaded(Ok(vec![file("a", 5), file("b", 5)])));
+    assert!(matches!(app.load, Load::Ready));
+    assert_eq!(app.selected, 1);
+  }
+
+  #[test]
   fn quit_keys_stop_the_app() {
     for k in [
       key(KeyCode::Char('q')),
@@ -548,12 +657,13 @@ mod tests {
     spawn_load(
       Arc::new(Slow(std::sync::Mutex::new(gate))),
       DiffRequest::default(),
+      7,
       tx,
     );
     assert!(rx.try_recv().is_err());
     release.send(()).unwrap();
     match rx.recv().unwrap() {
-      Event::Loaded(Ok(files)) => assert_eq!(files.len(), 1),
+      Event::Loaded(7, Ok(files)) => assert_eq!(files.len(), 1),
       _ => panic!("expected a loaded diff"),
     }
   }
