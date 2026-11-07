@@ -10,6 +10,8 @@ pub enum FileStatus {
   Modified,
   Renamed,
   Copied,
+  /// Has unresolved merge conflicts. Such an entry has no hunks.
+  Conflicted,
 }
 
 impl FileStatus {
@@ -20,6 +22,7 @@ impl FileStatus {
       FileStatus::Modified => 'M',
       FileStatus::Renamed => 'R',
       FileStatus::Copied => 'C',
+      FileStatus::Conflicted => 'U',
     }
   }
 }
@@ -60,6 +63,28 @@ pub enum Section {
   Staged,
 }
 
+/// A path with its `a/` or `b/` prefix, quoted the way git does when it holds
+/// control characters, quotes or backslashes.
+fn prefixed(prefix: &[u8], path: &Path) -> Vec<u8> {
+  let mut name = prefix.to_vec();
+  name.extend(path.as_os_str().as_bytes());
+  if !name.iter().any(|&b| b < 0x20 || b == b'"' || b == b'\\') {
+    return name;
+  }
+  let mut quoted = vec![b'"'];
+  for b in name {
+    match b {
+      b'"' | b'\\' => quoted.extend([b'\\', b]),
+      b'\t' => quoted.extend(b"\\t"),
+      b'\n' => quoted.extend(b"\\n"),
+      b if b < 0x20 => quoted.extend(format!("\\{b:03o}").bytes()),
+      b => quoted.push(b),
+    }
+  }
+  quoted.push(b'"');
+  quoted
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
   pub old_path: Option<PathBuf>,
@@ -88,6 +113,68 @@ impl FileDiff {
       .flat_map(|h| &h.lines)
       .filter(|l| l.kind == kind)
       .count()
+  }
+
+  /// A patch that holds only hunk `hunk`, for `git apply`. It has no `diff --git`
+  /// line, which would need mode lines for a new or deleted file. A new file is
+  /// written as `--- /dev/null` and a deleted one as `+++ /dev/null`.
+  pub fn hunk_patch(&self, hunk: usize) -> Vec<u8> {
+    let h = &self.hunks[hunk];
+    let old = self.old_path.as_deref().map(|p| prefixed(b"a/", p));
+    let new = self.new_path.as_deref().map(|p| prefixed(b"b/", p));
+    let name = |side: &Option<Vec<u8>>| side.clone().unwrap_or_else(|| b"/dev/null".to_vec());
+    let mut out = Vec::new();
+    out.extend(b"--- ");
+    out.extend(name(&old));
+    out.extend(b"\n+++ ");
+    out.extend(name(&new));
+    out.extend(
+      format!(
+        "\n@@ -{},{} +{},{} @@",
+        h.old_start, h.old_len, h.new_start, h.new_len
+      )
+      .bytes(),
+    );
+    if !h.heading.is_empty() {
+      out.push(b' ');
+      out.extend(&h.heading);
+    }
+    out.push(b'\n');
+    for line in &h.lines {
+      out.push(match line.kind {
+        LineKind::Context => b' ',
+        LineKind::Added => b'+',
+        LineKind::Removed => b'-',
+      });
+      out.extend(&line.content);
+      out.push(b'\n');
+      if line.no_newline {
+        out.extend(b"\\ No newline at end of file\n");
+      }
+    }
+    out
+  }
+
+  /// A patch that undoes hunk `hunk`. It is written out rather than left to
+  /// `git apply --reverse`, which cannot read a `/dev/null` header backwards.
+  pub fn reverse_hunk_patch(&self, hunk: usize) -> Vec<u8> {
+    let mut h = self.hunks[hunk].clone();
+    (h.old_start, h.new_start) = (h.new_start, h.old_start);
+    (h.old_len, h.new_len) = (h.new_len, h.old_len);
+    for line in &mut h.lines {
+      line.kind = match line.kind {
+        LineKind::Added => LineKind::Removed,
+        LineKind::Removed => LineKind::Added,
+        LineKind::Context => LineKind::Context,
+      };
+    }
+    FileDiff {
+      old_path: self.new_path.clone(),
+      new_path: self.old_path.clone(),
+      hunks: vec![h],
+      ..self.clone()
+    }
+    .hunk_patch(0)
   }
 
   /// Reveals the unchanged lines of gap `gap` as context. Gap `i` lies above
@@ -780,5 +867,48 @@ index 111..222 100644
     assert!(parse(b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ nonsense @@\n").is_err());
     assert!(parse(b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n").is_err());
     assert!(parse(b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n?bad\n").is_err());
+  }
+
+  #[test]
+  fn a_hunk_patch_parses_back_to_that_hunk() {
+    let f = one(MODIFIED);
+    // The parser wants the header line that `git apply` can do without.
+    let patch = String::from_utf8(f.hunk_patch(1)).unwrap();
+    let again = one(&format!("diff --git a/src/a.rs b/src/a.rs\n{patch}"));
+    assert_eq!(again.hunks, [f.hunks[1].clone()]);
+    assert_eq!(again.path(), f.path());
+  }
+
+  #[test]
+  fn a_hunk_patch_marks_new_and_deleted_files_and_missing_newlines() {
+    let added = one(
+      "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+a\n\\ No newline at end of file\n",
+    );
+    let patch = String::from_utf8(added.hunk_patch(0)).unwrap();
+    assert!(patch.contains("--- /dev/null\n+++ b/f\n"));
+    assert!(patch.ends_with("+a\n\\ No newline at end of file\n"));
+    let deleted = one(
+      "diff --git a/f b/f\ndeleted file mode 100644\n--- a/f\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
+    );
+    let patch = String::from_utf8(deleted.hunk_patch(0)).unwrap();
+    assert!(patch.contains("--- a/f\n+++ /dev/null\n"));
+  }
+
+  #[test]
+  fn a_hunk_patch_quotes_unusual_paths() {
+    let mut f = one(MODIFIED);
+    f.old_path = Some(PathBuf::from("a\tb\"c.txt"));
+    f.new_path = f.old_path.clone();
+    let patch = String::from_utf8(f.hunk_patch(0)).unwrap();
+    assert!(patch.contains("--- \"a/a\\tb\\\"c.txt\"\n"));
+  }
+
+  #[test]
+  fn a_reverse_patch_swaps_the_sides() {
+    let f = one(
+      "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1,2 @@\n+a\n+b\n",
+    );
+    let patch = String::from_utf8(f.reverse_hunk_patch(0)).unwrap();
+    assert!(patch.contains("--- a/f\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n"));
   }
 }

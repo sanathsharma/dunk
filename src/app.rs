@@ -1,5 +1,5 @@
 use crate::args::Layout;
-use crate::diff::{FileDiff, Hunk, Section};
+use crate::diff::{FileDiff, FileStatus, Hunk, Section};
 use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
 use crate::split;
@@ -39,14 +39,22 @@ pub enum Event {
   InputFailed(io::Error),
 }
 
-/// An entry of the file list, named by path and section so it can be found
-/// again after a reload.
-pub type Follow = (PathBuf, Section);
+/// Where the selection goes after a reload: an entry of the file list, named
+/// by path and section so it can be found again, and optionally one of its
+/// hunks for the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Follow {
+  pub path: PathBuf,
+  pub section: Section,
+  pub hunk: Option<usize>,
+}
 
-/// A stage or unstage of a whole file waiting to run.
+/// A stage or unstage of a file or one of its hunks waiting to run.
 pub struct IndexRequest {
   pub file: FileDiff,
-  /// True to stage the file, false to unstage it.
+  /// The hunk to move, or `None` for the whole file.
+  pub hunk: Option<usize>,
+  /// True to stage, false to unstage.
   pub stage: bool,
   pub follow: Option<Follow>,
 }
@@ -236,13 +244,12 @@ impl App {
         .iter()
         .position(|f| f.path() == old.path() && f.section == old.section)
     });
-    let followed = || {
-      let (path, section) = follow.as_ref()?;
+    let followed = follow.as_ref().and_then(|target| {
       files
         .iter()
-        .position(|f| f.path() == path && f.section == Some(*section))
-    };
-    let (scroll, cursor) = if kept.is_some() {
+        .position(|f| f.path() == target.path && f.section == Some(target.section))
+    });
+    let (scroll, cursor) = if followed.is_none() && kept.is_some() {
       (self.scroll, self.cursor)
     } else {
       (0, 0)
@@ -254,14 +261,21 @@ impl App {
     self.expansions = vec![0; files.len()];
     self.rehighlight = None;
     self.pending_expand = None;
-    let index = kept
-      .or_else(followed)
+    let index = followed
+      .or(kept)
       .unwrap_or(self.selected.min(files.len().saturating_sub(1)));
+    let hunk = followed.and(follow.and_then(|target| target.hunk));
     self.loaded = Arc::new(files);
     self.files = self.loaded.clone();
     self.select(index);
     self.scroll = scroll;
     self.cursor = cursor;
+    if let Some(hunk) = hunk {
+      let file = &self.files[index];
+      if let Some(last) = file.hunks.len().checked_sub(1) {
+        self.cursor = row_of(file, self.layout, hunk.min(last), None);
+      }
+    }
     self.clamp_scroll();
     true
   }
@@ -350,8 +364,57 @@ impl App {
     };
     self.index_request = Some(IndexRequest {
       file: file.clone(),
+      hunk: None,
       stage: section == Section::Unstaged,
       follow: self.neighbour(),
+    });
+  }
+
+  /// Asks to stage the hunk under the cursor, or to unstage it when the
+  /// selected entry is in the staged section. The cursor then goes to the
+  /// next hunk of the entry, or to the next file in the section after the
+  /// last hunk.
+  fn toggle_stage_hunk(&mut self) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    let Some(section) = file.section else {
+      self.notice = Some("read-only: revision".into());
+      return;
+    };
+    if matches!(
+      file.status,
+      FileStatus::Conflicted | FileStatus::Renamed | FileStatus::Copied
+    ) {
+      let what = match file.status {
+        FileStatus::Conflicted => "a conflicted",
+        _ => "a renamed or copied",
+      };
+      self.notice = Some(format!("Cannot stage hunks of {what} file, use - instead"));
+      return;
+    }
+    let Some(hunk) = self.cursor_hunk() else {
+      self.notice = Some("No hunk under the cursor".into());
+      return;
+    };
+    let in_entry = |hunk| Follow {
+      path: file.path().to_path_buf(),
+      section,
+      hunk: Some(hunk),
+    };
+    // The staged hunk leaves the entry, so the next one takes its index.
+    let follow = if hunk + 1 < file.hunks.len() {
+      Some(in_entry(hunk))
+    } else {
+      self
+        .neighbour()
+        .or_else(|| hunk.checked_sub(1).map(in_entry))
+    };
+    self.index_request = Some(IndexRequest {
+      file: file.clone(),
+      hunk: Some(hunk),
+      stage: section == Section::Unstaged,
+      follow,
     });
   }
 
@@ -363,7 +426,11 @@ impl App {
     let next = (self.selected + 1..self.files.len()).find(in_section);
     let previous = (0..self.selected).rev().find(in_section);
     let at = next.or(previous)?;
-    Some((self.files[at].path().to_path_buf(), section))
+    Some(Follow {
+      path: self.files[at].path().to_path_buf(),
+      section,
+      hunk: None,
+    })
   }
 
   pub fn on_key(&mut self, key: KeyEvent) {
@@ -393,6 +460,7 @@ impl App {
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('e') => self.expand_at_top(),
       KeyCode::Char('-') => self.toggle_stage(),
+      KeyCode::Char('a') => self.toggle_stage_hunk(),
       KeyCode::Tab | KeyCode::Char('n') => self.select_by(1),
       KeyCode::BackTab | KeyCode::Char('p') => self.select_by(-1),
       _ => {}
@@ -615,10 +683,11 @@ fn spawn_index(
   tx: Sender<Event>,
 ) {
   thread::spawn(move || {
-    let result = if request.stage {
-      vcs.stage(&request.file)
-    } else {
-      vcs.unstage(&request.file)
+    let result = match (request.hunk, request.stage) {
+      (None, true) => vcs.stage(&request.file),
+      (None, false) => vcs.unstage(&request.file),
+      (Some(hunk), true) => vcs.stage_hunk(&request.file, hunk),
+      (Some(hunk), false) => vcs.unstage_hunk(&request.file, hunk),
     };
     let _ = tx.send(Event::Indexed(request.follow, result));
   });
@@ -1360,6 +1429,14 @@ mod tests {
     fn unstage(&self, _: &FileDiff) -> Result<(), vcs::Error> {
       unreachable!()
     }
+
+    fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
+
+    fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
   }
 
   #[test]
@@ -1427,10 +1504,11 @@ mod tests {
   fn press_minus(app: &mut App, git: &crate::vcs::Git) {
     app.on_key(key(KeyCode::Char('-')));
     let request = app.take_index_request().expect("a stage request");
-    let result = if request.stage {
-      git.stage(&request.file)
-    } else {
-      git.unstage(&request.file)
+    let result = match (request.hunk, request.stage) {
+      (None, true) => git.stage(&request.file),
+      (None, false) => git.unstage(&request.file),
+      (Some(h), true) => git.stage_hunk(&request.file, h),
+      (Some(h), false) => git.unstage_hunk(&request.file, h),
     };
     assert!(app.on_indexed(request.follow, result));
     load(app, git);
@@ -1511,5 +1589,140 @@ mod tests {
       rx.recv().unwrap(),
       Event::Indexed(Some(_), Ok(()))
     ));
+  }
+
+  /// `one` and `two` each have two unstaged hunks.
+  fn hunk_repo() -> (tempfile::TempDir, crate::vcs::Git) {
+    use std::process::Command;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let d = tmp.path().to_path_buf();
+    let git = |args: &[&str]| {
+      let status = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(&d)
+        .status()
+        .unwrap();
+      assert!(status.success());
+    };
+    let body = |top: &str, bottom: &str| {
+      (1..=20)
+        .map(|n| match n {
+          2 => format!("{top}\n"),
+          19 => format!("{bottom}\n"),
+          n => format!("{n}\n"),
+        })
+        .collect::<String>()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    for f in ["one", "two"] {
+      std::fs::write(d.join(f), body("2", "19")).unwrap();
+    }
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    for f in ["one", "two"] {
+      std::fs::write(d.join(f), body("TOP", "BOTTOM")).unwrap();
+    }
+    let repo = crate::vcs::Git::new(&d);
+    (tmp, repo)
+  }
+
+  /// Presses `a` and runs what it asked for, as the event loop does.
+  fn press_a(app: &mut App, git: &crate::vcs::Git) {
+    app.on_key(key(KeyCode::Char('a')));
+    let request = app.take_index_request().expect("a hunk request");
+    assert!(request.hunk.is_some());
+    let result = match request.stage {
+      true => git.stage_hunk(&request.file, request.hunk.unwrap()),
+      false => git.unstage_hunk(&request.file, request.hunk.unwrap()),
+    };
+    assert!(app.on_indexed(request.follow, result));
+    load(app, git);
+  }
+
+  #[test]
+  fn a_stages_the_hunk_under_the_cursor_and_the_cursor_moves_to_the_next_hunk() {
+    let (_tmp, git) = hunk_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    let u = Some(Section::Unstaged);
+    assert_eq!(app.files[0].hunks.len(), 2);
+
+    press_a(&mut app, &git);
+    assert_eq!(selected_name(&app), ("one".into(), u));
+    assert_eq!(app.files[app.selected].hunks.len(), 1);
+    assert_eq!(app.cursor_hunk(), Some(0));
+    assert_eq!(app.cursor, 0);
+    let staged = app
+      .files
+      .iter()
+      .find(|f| f.section == Some(Section::Staged))
+      .unwrap();
+    assert_eq!(staged.hunks.len(), 1);
+    assert_eq!(staged.hunks[0].lines[2].content, b"TOP");
+  }
+
+  #[test]
+  fn a_on_the_last_hunk_moves_to_the_next_file_in_the_section() {
+    let (_tmp, git) = hunk_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    let u = Some(Section::Unstaged);
+    press_a(&mut app, &git);
+    // The one hunk left in `one` is its last.
+    press_a(&mut app, &git);
+    assert_eq!(selected_name(&app), ("two".into(), u));
+    assert_eq!(app.cursor, 0);
+  }
+
+  #[test]
+  fn a_in_the_staged_section_unstages_that_hunk_only() {
+    let (_tmp, git) = hunk_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    press_a(&mut app, &git);
+    let staged = app
+      .files
+      .iter()
+      .position(|f| f.section == Some(Section::Staged) && f.path() == Path::new("one"))
+      .unwrap();
+    app.select(staged);
+    press_a(&mut app, &git);
+    assert!(app.files.iter().all(|f| f.section != Some(Section::Staged)));
+    let one = app
+      .files
+      .iter()
+      .find(|f| f.path() == Path::new("one"))
+      .unwrap();
+    assert_eq!(one.hunks.len(), 2);
+  }
+
+  #[test]
+  fn a_refuses_on_a_revision_a_conflict_and_a_file_without_hunks() {
+    let mut app = ready(vec![file_in("a", None)], 5);
+    app.on_key(key(KeyCode::Char('a')));
+    assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
+
+    let conflicted = FileDiff {
+      status: FileStatus::Conflicted,
+      hunks: Vec::new(),
+      ..file_in("c", Some(Section::Unstaged))
+    };
+    let mut app = ready(vec![conflicted], 5);
+    app.on_key(key(KeyCode::Char('a')));
+    assert_eq!(
+      app.notice.as_deref(),
+      Some("Cannot stage hunks of a conflicted file, use - instead")
+    );
+
+    let binary = FileDiff {
+      binary: true,
+      hunks: Vec::new(),
+      ..file_in("b", Some(Section::Unstaged))
+    };
+    let mut app = ready(vec![binary], 5);
+    app.on_key(key(KeyCode::Char('a')));
+    assert_eq!(app.notice.as_deref(), Some("No hunk under the cursor"));
+    assert!(app.take_index_request().is_none());
   }
 }

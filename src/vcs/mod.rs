@@ -110,6 +110,14 @@ pub trait Vcs {
   /// Resets `file` in the index to the commit, keeping the working tree.
   fn unstage(&self, file: &FileDiff) -> Result<(), Error>;
 
+  /// Adds only hunk `hunk` of `file` to the index. An untracked file is first
+  /// marked intent-to-add so the hunk applies like a tracked change.
+  fn stage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error>;
+
+  /// Takes hunk `hunk` of a staged `file` out of the index, keeping the
+  /// working tree.
+  fn unstage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error>;
+
   /// Reads both versions of `file` as `request` compared them.
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;
 }

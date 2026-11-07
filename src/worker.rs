@@ -116,6 +116,14 @@ mod tests {
     fn unstage(&self, _: &FileDiff) -> Result<(), Error> {
       unreachable!()
     }
+
+    fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
+      unreachable!()
+    }
+
+    fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
+      unreachable!()
+    }
   }
 
   fn files(n: usize) -> Arc<Vec<FileDiff>> {

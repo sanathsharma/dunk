@@ -4,9 +4,10 @@ use crate::diff::{FileDiff, FileStatus, Section, parse};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 pub struct Git {
   dir: PathBuf,
@@ -24,16 +25,32 @@ impl Git {
     S: AsRef<OsStr>,
   {
     let out = Command::new("git")
-      .args([
-        "--no-pager",
-        "--no-optional-locks",
-        "-c",
-        "core.quotepath=off",
-      ])
+      .args(GIT_FLAGS)
       .args(args)
       .current_dir(dir)
       .output()?;
     Ok(out)
+  }
+
+  /// Like `command`, with `input` on the standard input.
+  fn command_with_input<I, S>(&self, dir: &Path, args: I, input: &[u8]) -> Result<Output, Error>
+  where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+  {
+    let mut child = Command::new("git")
+      .args(GIT_FLAGS)
+      .args(args)
+      .current_dir(dir)
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()?;
+    // Dropping the handle closes the pipe so git sees the end of the input.
+    // Git can exit before it reads everything, and its stderr then says why,
+    // so a failed write is not an error here.
+    let _ = child.stdin.take().expect("stdin is piped").write_all(input);
+    Ok(child.wait_with_output()?)
   }
 
   fn run<I, S>(&self, args: I) -> Result<Vec<u8>, Error>
@@ -111,6 +128,19 @@ impl Git {
     Ok(())
   }
 
+  /// Applies `patch` to the index only. It runs at the repository root because patch paths are relative to it.
+  /// `--recount` trusts the lines over the header counts, and `--unidiff-zero`
+  /// lets a patch without context apply.
+  fn apply_to_index(&self, patch: &[u8]) -> Result<(), Error> {
+    let root = self.root()?;
+    let args = ["apply", "--cached", "--recount", "--unidiff-zero", "-"];
+    let out = self.command_with_input(&root, args, patch)?;
+    if !out.status.success() {
+      return Err(git_error(&out));
+    }
+    Ok(())
+  }
+
   /// Files with unresolved merge conflicts. `git diff` prints these as a
   /// combined diff the parser skips, so they are listed without hunks.
   fn unmerged(&self, req: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
@@ -134,7 +164,7 @@ impl Git {
       files.push(FileDiff {
         old_path: Some(name.clone()),
         new_path: Some(name),
-        status: FileStatus::Modified,
+        status: FileStatus::Conflicted,
         binary: false,
         section: None,
         hunks: Vec::new(),
@@ -253,6 +283,15 @@ fn git_error(out: &Output) -> Error {
   Error::Git(String::from_utf8_lossy(&out.stderr).trim().to_string())
 }
 
+/// Options for every git call, so user config cannot add a pager or change
+/// how paths print.
+const GIT_FLAGS: [&str; 4] = [
+  "--no-pager",
+  "--no-optional-locks",
+  "-c",
+  "core.quotepath=off",
+];
+
 /// Pins the diff output so user config cannot change what the parser sees.
 const DIFF_FLAGS: [&str; 7] = [
   "--no-color",
@@ -292,6 +331,19 @@ impl Vcs for Git {
 
   fn unstage(&self, file: &FileDiff) -> Result<(), Error> {
     self.write_index(&["reset", "-q"], file)
+  }
+
+  fn stage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {
+    // An unstaged added file is untracked or already intent-to-add, and
+    // `add -N` is harmless for the second.
+    if file.status == FileStatus::Added {
+      self.write_index(&["add", "-N"], file)?;
+    }
+    self.apply_to_index(&file.hunk_patch(hunk))
+  }
+
+  fn unstage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {
+    self.apply_to_index(&file.reverse_hunk_patch(hunk))
   }
 
   fn sides(&self, req: &DiffRequest, file: &FileDiff) -> Sides {
@@ -919,5 +971,149 @@ mod tests {
     );
     git.stage(&entry(&git, "c.txt", Section::Unstaged)).unwrap();
     assert!(status(d).contains("M  c.txt"));
+  }
+
+  /// Twenty lines with edits at the top and the bottom, so the diff has two
+  /// hunks.
+  fn two_hunk_repo() -> TempDir {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "f.txt", &numbered(&[]));
+    commit_all(d, "init");
+    write(d, "f.txt", &numbered(&[(2, "TWO"), (19, "NINETEEN")]));
+    tmp
+  }
+
+  fn numbered(edits: &[(usize, &str)]) -> String {
+    (1..=20)
+      .map(|n| {
+        let line = edits
+          .iter()
+          .find(|(at, _)| *at == n)
+          .map_or(n.to_string(), |(_, text)| text.to_string());
+        format!("{line}\n")
+      })
+      .collect()
+  }
+
+  fn index_of(d: &Path, name: &str) -> String {
+    let out = Command::new("git")
+      .args(["show", &format!(":{name}")])
+      .current_dir(d)
+      .output()
+      .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+  }
+
+  #[test]
+  fn stages_one_hunk_and_leaves_the_other_unstaged() {
+    let tmp = two_hunk_repo();
+    let d = tmp.path();
+    let git = Git::new(d);
+    let file = entry(&git, "f.txt", Section::Unstaged);
+    assert_eq!(file.hunks.len(), 2);
+    git.stage_hunk(&file, 1).unwrap();
+    assert_eq!(index_of(d, "f.txt"), numbered(&[(19, "NINETEEN")]));
+    let rest = entry(&git, "f.txt", Section::Unstaged);
+    assert_eq!(rest.hunks.len(), 1);
+    assert_eq!(rest.hunks[0].lines[1].content, b"2");
+    assert_eq!(
+      fs::read_to_string(d.join("f.txt")).unwrap().lines().nth(1),
+      Some("TWO")
+    );
+  }
+
+  #[test]
+  fn unstages_one_hunk_of_a_staged_file() {
+    let tmp = two_hunk_repo();
+    let d = tmp.path();
+    git(d, &["add", "f.txt"]);
+    let git = Git::new(d);
+    let file = entry(&git, "f.txt", Section::Staged);
+    git.unstage_hunk(&file, 0).unwrap();
+    assert_eq!(index_of(d, "f.txt"), numbered(&[(19, "NINETEEN")]));
+    assert_eq!(entry(&git, "f.txt", Section::Staged).hunks.len(), 1);
+    assert_eq!(entry(&git, "f.txt", Section::Unstaged).hunks.len(), 1);
+  }
+
+  #[test]
+  fn stages_a_hunk_of_an_untracked_file() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "keep.txt", "k\n");
+    commit_all(d, "init");
+    write(d, "new.txt", "a\nb\nc\n");
+    let git = Git::new(d);
+    git
+      .stage_hunk(&entry(&git, "new.txt", Section::Unstaged), 0)
+      .unwrap();
+    assert_eq!(index_of(d, "new.txt"), "a\nb\nc\n");
+    assert!(status(d).contains("A  new.txt"));
+    // Unstaging the hunk takes the file out of the index again.
+    git
+      .unstage_hunk(&entry(&git, "new.txt", Section::Staged), 0)
+      .unwrap();
+    assert!(status(d).contains("?? new.txt") || status(d).contains(" A new.txt"));
+  }
+
+  #[test]
+  fn stages_a_hunk_of_a_deleted_file_and_one_without_a_trailing_newline() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "gone.txt", "1\n2\n");
+    fs::write(d.join("tail.txt"), "x\ny").unwrap();
+    commit_all(d, "init");
+    fs::remove_file(d.join("gone.txt")).unwrap();
+    fs::write(d.join("tail.txt"), "x\nz").unwrap();
+    let git = Git::new(d);
+    git
+      .stage_hunk(&entry(&git, "gone.txt", Section::Unstaged), 0)
+      .unwrap();
+    git
+      .stage_hunk(&entry(&git, "tail.txt", Section::Unstaged), 0)
+      .unwrap();
+    let status = status(d);
+    assert!(status.contains("D  gone.txt"));
+    assert!(status.contains("M  tail.txt"));
+    assert_eq!(index_of(d, "tail.txt"), "x\nz");
+  }
+
+  #[test]
+  fn stages_a_hunk_of_a_file_with_an_unusual_name() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "my file.txt", "1\n");
+    write(d, "tab\tname.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "my file.txt", "2\n");
+    write(d, "tab\tname.txt", "2\n");
+    let git = Git::new(d);
+    for name in ["my file.txt", "tab\tname.txt"] {
+      git
+        .stage_hunk(&entry(&git, name, Section::Unstaged), 0)
+        .unwrap();
+      assert_eq!(index_of(d, name), "2\n");
+    }
+  }
+
+  #[test]
+  fn a_conflicted_file_has_its_own_status() {
+    let tmp = conflicted_repo();
+    let git = Git::new(tmp.path());
+    let file = entry(&git, "c.txt", Section::Unstaged);
+    assert_eq!(file.status, FileStatus::Conflicted);
+    assert!(file.hunks.is_empty());
+  }
+
+  #[test]
+  fn a_patch_that_does_not_apply_reports_gits_message() {
+    let tmp = two_hunk_repo();
+    let d = tmp.path();
+    let git = Git::new(d);
+    let file = entry(&git, "f.txt", Section::Unstaged);
+    // The file changes on disk after the diff was read.
+    git.stage(&file).unwrap();
+    let err = git.stage_hunk(&file, 0).unwrap_err();
+    assert!(matches!(err, Error::Git(ref m) if m.contains("patch")));
   }
 }
