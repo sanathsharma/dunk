@@ -16,7 +16,7 @@ const REMOVED_BG: Color = Color::Rgb(66, 24, 28);
 const ADDED_WORD_BG: Color = Color::Rgb(30, 100, 52);
 const REMOVED_WORD_BG: Color = Color::Rgb(128, 40, 46);
 
-const HELP: &str = " j/k move  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  e expand  v select lines  a stage hunk or selection  - stage file  q quit";
+const HELP: &str = " j/k move · space/PgDn page · ctrl-d/u half page · g/G top/bottom · n/p file · s split/unified · e expand · v select lines · a stage hunk or selection · - stage file · q quit";
 
 const CURRENT_HUNK_BG: Color = Color::Rgb(48, 54, 80);
 const SELECTED_BG: Color = Color::Rgb(70, 70, 110);
