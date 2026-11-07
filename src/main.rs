@@ -4,6 +4,7 @@ mod diff;
 mod highlight;
 mod ui;
 mod vcs;
+mod words;
 mod worker;
 
 use std::error::Error;

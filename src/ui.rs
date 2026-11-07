@@ -1,21 +1,25 @@
 use crate::app::{App, Load};
 use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind};
 use crate::highlight::Styled;
+use crate::words::changed_words;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use std::ops::Range;
 
 const ADDED_BG: Color = Color::Rgb(18, 52, 28);
 const REMOVED_BG: Color = Color::Rgb(66, 24, 28);
+const ADDED_WORD_BG: Color = Color::Rgb(30, 100, 52);
+const REMOVED_WORD_BG: Color = Color::Rgb(128, 40, 46);
 
 const HELP: &str =
   " j/k scroll  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  q quit";
 
 enum Row<'a> {
   Header(&'a Hunk),
-  Line(&'a DiffLine, Option<&'a Styled>),
+  Line(&'a DiffLine, Option<&'a Styled>, &'a [Range<usize>]),
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -92,7 +96,16 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
 
   app.viewport = usize::from(inner.height);
   app.clamp_scroll();
+  if app.words[app.selected].is_none() {
+    let words = app.files[app.selected]
+      .hunks
+      .iter()
+      .map(changed_words)
+      .collect();
+    app.words[app.selected] = Some(words);
+  }
   let file = &app.files[app.selected];
+  let words = app.words[app.selected].as_deref().unwrap_or_default();
   let colors = app.highlights.get(app.selected).and_then(Option::as_ref);
 
   if file.hunks.is_empty() {
@@ -116,7 +129,11 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     .flat_map(|(hi, h)| {
       let lines = h.lines.iter().enumerate().map(move |(li, l)| {
         let styled = colors.and_then(|c| c.hunks.get(hi)?.get(li)?.as_ref());
-        Row::Line(l, styled)
+        let ranges = words
+          .get(hi)
+          .and_then(|h| h.get(li))
+          .map_or(&[][..], Vec::as_slice);
+        Row::Line(l, styled, ranges)
       });
       std::iter::once(Row::Header(h)).chain(lines)
     })
@@ -169,11 +186,11 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
       ),
       Style::new().fg(Color::Cyan),
     ),
-    Row::Line(l, styled) => {
-      let (marker, style) = match l.kind {
-        LineKind::Context => (' ', Style::new()),
-        LineKind::Added => ('+', Style::new().bg(ADDED_BG)),
-        LineKind::Removed => ('-', Style::new().bg(REMOVED_BG)),
+    Row::Line(l, styled, changed) => {
+      let (marker, style, word_bg) = match l.kind {
+        LineKind::Context => (' ', Style::new(), None),
+        LineKind::Added => ('+', Style::new().bg(ADDED_BG), Some(ADDED_WORD_BG)),
+        LineKind::Removed => ('-', Style::new().bg(REMOVED_BG), Some(REMOVED_WORD_BG)),
       };
       let no = |n: Option<u32>| n.map_or(String::new(), |n| n.to_string());
       let mut spans = vec![
@@ -183,14 +200,22 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
         ),
         Span::raw(marker.to_string()),
       ];
-      match styled {
-        Some(pieces) => spans.extend(
-          pieces
-            .iter()
-            .map(|(style, text)| Span::styled(sanitize(text.as_bytes()), *style)),
-        ),
-        None => spans.push(Span::raw(sanitize(&l.content))),
-      }
+      let plain;
+      let pieces = match styled {
+        Some(pieces) => pieces,
+        None => {
+          plain = vec![(
+            Style::new(),
+            String::from_utf8_lossy(&l.content).into_owned(),
+          )];
+          &plain
+        }
+      };
+      spans.extend(
+        emphasize(pieces, changed, word_bg)
+          .into_iter()
+          .map(|(style, text)| Span::styled(sanitize(text.as_bytes()), style)),
+      );
       if l.no_newline {
         spans.push(Span::styled(
           " [no newline at end of file]",
@@ -202,6 +227,41 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
       Line::from(spans).style(style)
     }
   }
+}
+
+/// Splits `pieces` at the edges of `changed` (byte offsets into the joined
+/// text) and gives the changed parts the `bg` background.
+fn emphasize(
+  pieces: &[(Style, String)],
+  changed: &[Range<usize>],
+  bg: Option<Color>,
+) -> Vec<(Style, String)> {
+  let Some(bg) = bg.filter(|_| !changed.is_empty()) else {
+    return pieces.to_vec();
+  };
+  let mut out = Vec::new();
+  let mut at = 0;
+  for (style, text) in pieces {
+    let end = at + text.len();
+    let mut cut = vec![0, text.len()];
+    for r in changed {
+      for edge in [r.start, r.end] {
+        if edge > at && edge < end {
+          cut.push(edge - at);
+        }
+      }
+    }
+    cut.sort_unstable();
+    cut.dedup();
+    for w in cut.windows(2) {
+      let (from, to) = (at + w[0], at + w[1]);
+      let hit = changed.iter().any(|r| r.start <= from && to <= r.end);
+      let style = if hit { style.bg(bg) } else { *style };
+      out.push((style, text[w[0]..w[1]].to_string()));
+    }
+    at = end;
+  }
+  out
 }
 
 /// Makes raw file bytes safe to draw: invalid UTF-8 and control characters
@@ -344,8 +404,49 @@ new file mode 100644
     let x = row[..row.find("+new").unwrap()].chars().count() as u16 + 1;
     let cell = &terminal.backend().buffer()[(x, y as u16)];
     assert_eq!(cell.fg, Color::Rgb(200, 1, 2));
-    assert_eq!(cell.bg, ADDED_BG);
+    assert_eq!(cell.bg, ADDED_WORD_BG);
     assert!(rows.iter().any(|r| r.contains("-old")));
+  }
+
+  #[test]
+  fn changed_words_get_a_stronger_background_than_the_line() {
+    let mut app = app_with(DIFF);
+    let (terminal, rows) = draw(&mut app, 80, 14);
+    let buffer = terminal.backend().buffer();
+    for (needle, line_bg, word_bg) in [
+      ("+new", ADDED_BG, ADDED_WORD_BG),
+      ("-old", REMOVED_BG, REMOVED_WORD_BG),
+    ] {
+      let (y, row) = row_with(&rows, needle);
+      let x = row[..row.find(needle).unwrap()].chars().count() as u16 + 1;
+      assert_eq!(buffer[(x, y as u16)].bg, word_bg);
+      assert_eq!(buffer[(79 - 1, y as u16)].bg, line_bg);
+    }
+  }
+
+  #[test]
+  fn emphasis_keeps_syntax_colors_and_splits_pieces() {
+    let red = Style::new().fg(Color::Red);
+    let pieces = vec![(red, "ab".to_string()), (Style::new(), "cd".to_string())];
+    let out = emphasize(&pieces, &[1..3], Some(Color::Blue));
+    let texts: Vec<_> = out.iter().map(|(_, t)| t.as_str()).collect();
+    assert_eq!(texts, ["a", "b", "c", "d"]);
+    assert_eq!(out[0].0, red);
+    assert_eq!(out[1].0, red.bg(Color::Blue));
+    assert_eq!(out[2].0, Style::new().bg(Color::Blue));
+    assert_eq!(out[3].0, Style::new());
+  }
+
+  #[test]
+  fn unpaired_lines_get_no_word_emphasis() {
+    let mut app = app_with(DIFF);
+    app.on_key(ratatui::crossterm::event::KeyEvent::from(
+      ratatui::crossterm::event::KeyCode::Tab,
+    ));
+    let (terminal, rows) = draw(&mut app, 80, 14);
+    let (y, row) = row_with(&rows, "+hello");
+    let x = row[..row.find("+hello").unwrap()].chars().count() as u16 + 1;
+    assert_eq!(terminal.backend().buffer()[(x, y as u16)].bg, ADDED_BG);
   }
 
   #[test]

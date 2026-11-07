@@ -7,6 +7,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::io;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -30,6 +31,9 @@ pub struct App {
   pub files: Arc<Vec<FileDiff>>,
   /// Colors per file, parallel to `files`. `None` until the worker delivers.
   pub highlights: Vec<Option<FileHighlight>>,
+  /// Changed word ranges per file, hunk and line, filled when a file is first
+  /// drawn. See `words::changed_words`.
+  pub words: Vec<Option<Vec<Vec<Vec<Range<usize>>>>>>,
   pub selected: usize,
   pub list_state: ListState,
   /// Index of the first visible row of the selected file's diff.
@@ -45,6 +49,7 @@ impl Default for App {
       load: Load::Loading,
       files: Arc::new(Vec::new()),
       highlights: Vec::new(),
+      words: Vec::new(),
       selected: 0,
       list_state: ListState::default(),
       scroll: 0,
@@ -64,6 +69,7 @@ impl App {
     match result {
       Ok(files) => {
         self.highlights = files.iter().map(|_| None).collect();
+        self.words = files.iter().map(|_| None).collect();
         self.files = Arc::new(files);
         self.load = Load::Ready;
         self.select(0);
