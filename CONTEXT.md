@@ -32,3 +32,10 @@ The run of lines a visual-mode action applies to.
 
 **Section**:
 One of the two groups in the file list: unstaged and staged. A file with both kinds of change appears in both. The diff shown for an entry covers only its own section.
+
+**Config file**:
+The TOML file holding the user's standing defaults for settings. A flag on the command line overrides it for one run.
+
+**Setting**:
+An option that can be set in the config file and on the command line. Scope, revisions and paths are not settings, because they define a changeset rather than how it is displayed.
+_Avoid_: preference, option

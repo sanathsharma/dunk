@@ -1,8 +1,10 @@
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use serde::Deserialize;
 use std::env;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Layout {
   Unified,
   Split,
@@ -23,11 +25,12 @@ pub struct Args {
   pub revisions: Vec<String>,
   pub paths: Vec<String>,
   pub scope: Scope,
-  pub layout: Layout,
+  pub layout: Option<Layout>,
   pub theme: Option<String>,
   pub context: Option<u32>,
-  pub watch: bool,
-  pub no_syntax: bool,
+  pub watch: Option<bool>,
+  pub syntax: Option<bool>,
+  pub config: Option<PathBuf>,
 }
 
 fn command() -> Command {
@@ -73,8 +76,7 @@ fn command() -> Command {
         .long("layout")
         .help("How to lay out the diff")
         .value_name("LAYOUT")
-        .value_parser(["unified", "split"])
-        .default_value("unified"),
+        .value_parser(["unified", "split"]),
     )
     .arg(
       Arg::new("theme")
@@ -96,13 +98,35 @@ fn command() -> Command {
         .short('w')
         .long("watch")
         .help("Refresh when files change")
-        .action(ArgAction::SetTrue),
+        .action(ArgAction::SetTrue)
+        .overrides_with("no-watch"),
+    )
+    .arg(
+      Arg::new("no-watch")
+        .long("no-watch")
+        .help("Do not refresh when files change, even if the config file asks for it")
+        .action(ArgAction::SetTrue)
+        .overrides_with("watch"),
+    )
+    .arg(
+      Arg::new("syntax")
+        .long("syntax")
+        .help("Enable syntax highlighting, even if the config file turns it off")
+        .action(ArgAction::SetTrue)
+        .overrides_with("no-syntax"),
     )
     .arg(
       Arg::new("no-syntax")
         .long("no-syntax")
         .help("Disable syntax highlighting")
-        .action(ArgAction::SetTrue),
+        .action(ArgAction::SetTrue)
+        .overrides_with("syntax"),
+    )
+    .arg(
+      Arg::new("config")
+        .long("config")
+        .help("Read settings from this file instead of the default config file")
+        .value_name("PATH"),
     )
 }
 
@@ -114,9 +138,22 @@ fn from_matches(m: &ArgMatches) -> Args {
   } else {
     Scope::All
   };
-  let layout = match m.get_one::<String>("layout").map(String::as_str) {
-    Some("split") => Layout::Split,
-    _ => Layout::Unified,
+  let layout = m.get_one::<String>("layout").map(|l| {
+    if l == "split" {
+      Layout::Split
+    } else {
+      Layout::Unified
+    }
+  });
+  // The later of a flag and its opposite wins, and neither means unset.
+  let toggle = |on: &str, off: &str| {
+    if m.get_flag(off) {
+      Some(false)
+    } else if m.get_flag(on) {
+      Some(true)
+    } else {
+      None
+    }
   };
   let many = |id: &str| {
     m.get_many::<String>(id)
@@ -132,13 +169,21 @@ fn from_matches(m: &ArgMatches) -> Args {
     layout,
     theme: m.get_one::<String>("theme").cloned(),
     context: m.get_one::<u32>("context").copied(),
-    watch: m.get_flag("watch"),
-    no_syntax: m.get_flag("no-syntax"),
+    watch: toggle("watch", "no-watch"),
+    syntax: toggle("syntax", "no-syntax"),
+    config: m.get_one::<String>("config").map(PathBuf::from),
   }
 }
 
 pub fn parse() -> Args {
   from_matches(&command().get_matches())
+}
+
+#[cfg(test)]
+impl Args {
+  pub fn parse_from(args: &[&str]) -> Args {
+    from_matches(&command().get_matches_from(args))
+  }
 }
 
 #[cfg(test)]
@@ -153,7 +198,8 @@ mod tests {
   fn defaults() {
     let a = parse_from(&["dunk"]);
     assert_eq!(a.scope, Scope::All);
-    assert_eq!(a.layout, Layout::Unified);
+    assert_eq!(a.layout, None);
+    assert!(a.watch.is_none() && a.syntax.is_none() && a.config.is_none());
     assert!(a.revisions.is_empty() && a.paths.is_empty());
   }
 
@@ -187,10 +233,21 @@ mod tests {
   }
 
   #[test]
+  fn the_last_of_a_flag_and_its_opposite_wins() {
+    assert_eq!(parse_from(&["dunk", "-w", "--no-watch"]).watch, Some(false));
+    assert_eq!(parse_from(&["dunk", "--no-watch", "-w"]).watch, Some(true));
+    assert_eq!(
+      parse_from(&["dunk", "--no-syntax", "--syntax"]).syntax,
+      Some(true)
+    );
+  }
+
+  #[test]
   fn flags() {
     let a = parse_from(&["dunk", "-w", "--layout", "split", "-U", "5", "--no-syntax"]);
-    assert!(a.watch && a.no_syntax);
-    assert_eq!(a.layout, Layout::Split);
+    assert_eq!(a.watch, Some(true));
+    assert_eq!(a.syntax, Some(false));
+    assert_eq!(a.layout, Some(Layout::Split));
     assert_eq!(a.context, Some(5));
   }
 }
