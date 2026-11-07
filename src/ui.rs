@@ -16,9 +16,10 @@ const REMOVED_BG: Color = Color::Rgb(66, 24, 28);
 const ADDED_WORD_BG: Color = Color::Rgb(30, 100, 52);
 const REMOVED_WORD_BG: Color = Color::Rgb(128, 40, 46);
 
-const HELP: &str = " j/k move  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  e expand  a stage hunk  - stage file  q quit";
+const HELP: &str = " j/k move  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  e expand  v select lines  a stage hunk or selection  - stage file  q quit";
 
 const CURRENT_HUNK_BG: Color = Color::Rgb(48, 54, 80);
+const SELECTED_BG: Color = Color::Rgb(70, 70, 110);
 
 enum Row<'a> {
   /// A hunk header, and whether the cursor is in that hunk.
@@ -53,7 +54,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// The mode at the left, then the notice or the key help.
 fn footer_line(app: &App) -> Line<'static> {
   let mode = Span::styled(
-    format!(" {} ", app.mode.label()),
+    format!(" {} ", app.mode_label()),
     Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
   );
   let rest = match &app.notice {
@@ -152,7 +153,12 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   let width = gutter_width(file);
   let current = app.cursor_hunk();
   let cursor = app.cursor.saturating_sub(app.scroll);
+  let selection = app.selection();
   let mark = |i: usize, line: Line<'static>| {
+    let selected = selection
+      .as_ref()
+      .is_some_and(|rows| rows.contains(&(app.scroll + i)));
+    let line = if selected { select(line) } else { line };
     if i == cursor {
       line.patch_style(Modifier::REVERSED)
     } else {
@@ -238,6 +244,16 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
       frame.render_widget(Paragraph::new(right), right_area);
     }
   }
+}
+
+/// Paints the selection background over a line, replacing the colors of its
+/// added or removed background.
+fn select(mut line: Line<'static>) -> Line<'static> {
+  line.style = line.style.bg(SELECTED_BG);
+  for span in &mut line.spans {
+    span.style = span.style.bg(SELECTED_BG);
+  }
+  line
 }
 
 fn title(file: &FileDiff) -> String {
@@ -495,6 +511,34 @@ new file mode 100644
     );
     let (y, _) = row_with(&rows, "@@ -1,1");
     assert_ne!(buffer[(5, y as u16)].bg, CURRENT_HUNK_BG);
+  }
+
+  #[test]
+  fn visual_mode_shows_the_line_count_and_highlights_the_selection() {
+    let mut app = app_with(DIFF);
+    let press = |app: &mut App, keys: &str| {
+      for c in keys.chars() {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+      }
+    };
+    // The cursor is on `-old`; the selection takes in `+new` too.
+    press(&mut app, "jjvj");
+    let (terminal, rows) = draw(&mut app, 100, 8);
+    assert!(rows[7].contains(" VISUAL 2 lines "), "{}", rows[7]);
+    let buffer = terminal.backend().buffer();
+    let bg = |needle: &str| {
+      let (y, row) = row_with(&rows, needle);
+      let x = row[..row.find(needle).unwrap()].chars().count() as u16;
+      buffer[(x, y as u16)].bg
+    };
+    assert_eq!(bg("-old"), SELECTED_BG);
+    assert_eq!(bg("+new"), SELECTED_BG);
+    assert_ne!(bg("keep"), SELECTED_BG);
+    assert_ne!(bg("tail"), SELECTED_BG);
+
+    press(&mut app, "k");
+    let (_, rows) = draw(&mut app, 100, 8);
+    assert!(rows[7].contains(" VISUAL 1 line "), "{}", rows[7]);
   }
 
   #[test]

@@ -91,6 +91,7 @@ mod tests {
   use super::*;
   use crate::diff::parse;
   use crate::vcs::{Error, Sides, VersionId};
+  use std::ops::Range;
   use std::sync::mpsc;
 
   struct Fake;
@@ -122,6 +123,14 @@ mod tests {
     }
 
     fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
+      unreachable!()
+    }
+
+    fn stage_lines(&self, _: &FileDiff, _: usize, _: Range<usize>) -> Result<(), Error> {
+      unreachable!()
+    }
+
+    fn unstage_lines(&self, _: &FileDiff, _: usize, _: Range<usize>) -> Result<(), Error> {
       unreachable!()
     }
   }

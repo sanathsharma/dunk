@@ -12,6 +12,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::io;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -49,14 +50,37 @@ pub struct Follow {
   pub hunk: Option<usize>,
 }
 
-/// A stage or unstage of a file or one of its hunks waiting to run.
+/// What a stage or unstage moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+  File,
+  Hunk(usize),
+  /// The lines of a hunk in this range of the hunk's lines.
+  Lines(usize, Range<usize>),
+}
+
+/// A stage or unstage of a file, a hunk or some of its lines waiting to run.
 pub struct IndexRequest {
   pub file: FileDiff,
-  /// The hunk to move, or `None` for the whole file.
-  pub hunk: Option<usize>,
+  pub target: Target,
   /// True to stage, false to unstage.
   pub stage: bool,
   pub follow: Option<Follow>,
+}
+
+impl IndexRequest {
+  /// Writes the index as the request asks.
+  pub fn run(&self, vcs: &(impl Vcs + ?Sized)) -> Result<(), vcs::Error> {
+    let file = &self.file;
+    match (&self.target, self.stage) {
+      (Target::File, true) => vcs.stage(file),
+      (Target::File, false) => vcs.unstage(file),
+      (Target::Hunk(hunk), true) => vcs.stage_hunk(file, *hunk),
+      (Target::Hunk(hunk), false) => vcs.unstage_hunk(file, *hunk),
+      (Target::Lines(hunk, lines), true) => vcs.stage_lines(file, *hunk, lines.clone()),
+      (Target::Lines(hunk, lines), false) => vcs.unstage_lines(file, *hunk, lines.clone()),
+    }
+  }
 }
 
 pub enum Load {
@@ -77,12 +101,15 @@ pub struct Rehighlight {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
   Normal,
+  /// Keys extend a selection of lines that `a` then stages or unstages.
+  Visual,
 }
 
 impl Mode {
   pub fn label(self) -> &'static str {
     match self {
       Mode::Normal => "NORMAL",
+      Mode::Visual => "VISUAL",
     }
   }
 }
@@ -124,6 +151,8 @@ pub struct App {
   /// Row of the line cursor in the selected file's diff, in the current
   /// layout. The viewport follows it.
   pub cursor: usize,
+  /// Row where the selection started, in visual mode.
+  visual_anchor: usize,
   /// Height of the diff pane in rows, as of the last render.
   pub viewport: usize,
   pub quit: bool,
@@ -151,6 +180,7 @@ impl Default for App {
       list_state: ListState::default(),
       scroll: 0,
       cursor: 0,
+      visual_anchor: 0,
       viewport: 0,
       quit: false,
     }
@@ -239,6 +269,8 @@ impl App {
     if *self.loaded == files {
       return false;
     }
+    // The rows the selection covered may be gone or hold other lines now.
+    self.mode = Mode::Normal;
     let kept = self.files.get(self.selected).and_then(|old| {
       files
         .iter()
@@ -364,23 +396,25 @@ impl App {
     };
     self.index_request = Some(IndexRequest {
       file: file.clone(),
-      hunk: None,
+      target: Target::File,
       stage: section == Section::Unstaged,
       follow: self.neighbour(),
     });
   }
 
   /// Asks to stage the hunk under the cursor, or to unstage it when the
-  /// selected entry is in the staged section. The cursor then goes to the
-  /// next hunk of the entry, or to the next file in the section after the
-  /// last hunk.
-  fn toggle_stage_hunk(&mut self) {
+  /// selected entry is in the staged section, or only the lines `lines` of
+  /// that hunk. When the whole hunk goes, the cursor moves to the next hunk of
+  /// the entry, or to the next file in the section after the last hunk. When
+  /// part of the hunk is left, the cursor stays on it. Returns whether a
+  /// request was made.
+  fn toggle_stage_hunk(&mut self, lines: Option<Range<usize>>) -> bool {
     let Some(file) = self.files.get(self.selected) else {
-      return;
+      return false;
     };
     let Some(section) = file.section else {
       self.notice = Some("read-only: revision".into());
-      return;
+      return false;
     };
     if matches!(
       file.status,
@@ -391,31 +425,132 @@ impl App {
         _ => "a renamed or copied",
       };
       self.notice = Some(format!("Cannot stage hunks of {what} file, use - instead"));
-      return;
+      return false;
     }
     let Some(hunk) = self.cursor_hunk() else {
       self.notice = Some("No hunk under the cursor".into());
-      return;
+      return false;
     };
+    let changed = file.hunks[hunk].changed();
+    if let Some(lines) = &lines
+      && !changed.clone().any(|i| lines.contains(&i))
+    {
+      self.notice = Some("no changed lines selected".into());
+      return false;
+    }
+    let leaves = lines
+      .as_ref()
+      .is_none_or(|lines| changed.clone().all(|i| lines.contains(&i)));
     let in_entry = |hunk| Follow {
       path: file.path().to_path_buf(),
       section,
       hunk: Some(hunk),
     };
-    // The staged hunk leaves the entry, so the next one takes its index.
-    let follow = if hunk + 1 < file.hunks.len() {
+    // A hunk that goes leaves the entry, so the next one takes its index.
+    // One that is left only in part is still there at that index.
+    let follow = if !leaves || hunk + 1 < file.hunks.len() {
       Some(in_entry(hunk))
     } else {
       self
         .neighbour()
         .or_else(|| hunk.checked_sub(1).map(in_entry))
     };
+    let target = match lines {
+      Some(lines) => Target::Lines(hunk, lines),
+      None => Target::Hunk(hunk),
+    };
     self.index_request = Some(IndexRequest {
       file: file.clone(),
-      hunk: Some(hunk),
+      target,
       stage: section == Section::Unstaged,
       follow,
     });
+    true
+  }
+
+  /// Starts a selection at the cursor.
+  fn enter_visual(&mut self) {
+    if self.layout != Layout::Unified {
+      self.notice = Some("Visual mode needs the unified layout, press s".into());
+    } else if self.cursor_hunk().is_some() {
+      self.mode = Mode::Visual;
+      self.visual_anchor = self.cursor;
+    }
+  }
+
+  /// The rows the selection covers, in visual mode.
+  pub fn selection(&self) -> Option<RangeInclusive<usize>> {
+    (self.mode == Mode::Visual)
+      .then(|| self.visual_anchor.min(self.cursor)..=self.visual_anchor.max(self.cursor))
+  }
+
+  /// The hunk the selection is in and the range of that hunk's lines it
+  /// covers. The header row holds no line. The selection never leaves the
+  /// hunk it started in.
+  pub fn selection_lines(&self) -> Option<(usize, Range<usize>)> {
+    let rows = self.selection()?;
+    let file = self.files.get(self.selected)?;
+    let (hunk, _) = locate(file, self.layout, *rows.start())?;
+    let first_line_row = row_of(file, self.layout, hunk, None) + 1;
+    let start = rows.start().saturating_sub(first_line_row);
+    let end = (rows.end() + 1).saturating_sub(first_line_row);
+    Some((hunk, start..end))
+  }
+
+  /// The mode for the footer, with the size of the selection in visual mode.
+  pub fn mode_label(&self) -> String {
+    match self.mode {
+      Mode::Normal => self.mode.label().to_string(),
+      Mode::Visual => {
+        let n = self.selected_line_count();
+        let noun = if n == 1 { "line" } else { "lines" };
+        format!("{} {n} {noun}", self.mode.label())
+      }
+    }
+  }
+
+  /// Rows of the selection that are lines of the diff.
+  fn selected_line_count(&self) -> usize {
+    self.selection_lines().map_or(0, |(_, lines)| lines.len())
+  }
+
+  /// Stages or unstages the selected lines. With none changed it only shows
+  /// a notice and stays in visual mode.
+  fn stage_selection(&mut self) {
+    let Some((_, lines)) = self.selection_lines() else {
+      return;
+    };
+    if self.toggle_stage_hunk(Some(lines)) {
+      self.mode = Mode::Normal;
+    }
+  }
+
+  /// Moves the cursor in visual mode, keeping it in the hunk the selection
+  /// started in.
+  fn extend_selection(&mut self, delta: isize) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    let Some((hunk, _)) = locate(file, self.layout, self.visual_anchor) else {
+      return;
+    };
+    let first = row_of(file, self.layout, hunk, None);
+    let last = first + hunk_rows(&file.hunks[hunk], self.layout) - 1;
+    self.cursor = self.cursor.saturating_add_signed(delta).clamp(first, last);
+    self.clamp_scroll();
+  }
+
+  fn on_visual_key(&mut self, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+      KeyCode::Char('q') => self.quit = true,
+      KeyCode::Char('c') if ctrl => self.quit = true,
+      KeyCode::Esc | KeyCode::Char('v') => self.mode = Mode::Normal,
+      KeyCode::Char('j') | KeyCode::Down => self.extend_selection(1),
+      KeyCode::Char('k') | KeyCode::Up => self.extend_selection(-1),
+      KeyCode::Char('a') => self.stage_selection(),
+      _ => {}
+    }
   }
 
   /// The entry after the selected one in its section, or the one before it
@@ -438,6 +573,9 @@ impl App {
       return;
     }
     self.notice = None;
+    if self.mode == Mode::Visual {
+      return self.on_visual_key(key);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let page = self.viewport.max(1);
     match key.code {
@@ -460,7 +598,10 @@ impl App {
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('e') => self.expand_at_top(),
       KeyCode::Char('-') => self.toggle_stage(),
-      KeyCode::Char('a') => self.toggle_stage_hunk(),
+      KeyCode::Char('a') => {
+        self.toggle_stage_hunk(None);
+      }
+      KeyCode::Char('v') => self.enter_visual(),
       KeyCode::Tab | KeyCode::Char('n') => self.select_by(1),
       KeyCode::BackTab | KeyCode::Char('p') => self.select_by(-1),
       _ => {}
@@ -683,12 +824,7 @@ fn spawn_index(
   tx: Sender<Event>,
 ) {
   thread::spawn(move || {
-    let result = match (request.hunk, request.stage) {
-      (None, true) => vcs.stage(&request.file),
-      (None, false) => vcs.unstage(&request.file),
-      (Some(hunk), true) => vcs.stage_hunk(&request.file, hunk),
-      (Some(hunk), false) => vcs.unstage_hunk(&request.file, hunk),
-    };
+    let result = request.run(&*vcs);
     let _ = tx.send(Event::Indexed(request.follow, result));
   });
 }
@@ -1437,6 +1573,14 @@ mod tests {
     fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
       unreachable!()
     }
+
+    fn stage_lines(&self, _: &FileDiff, _: usize, _: Range<usize>) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
+
+    fn unstage_lines(&self, _: &FileDiff, _: usize, _: Range<usize>) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
   }
 
   #[test]
@@ -1504,12 +1648,7 @@ mod tests {
   fn press_minus(app: &mut App, git: &crate::vcs::Git) {
     app.on_key(key(KeyCode::Char('-')));
     let request = app.take_index_request().expect("a stage request");
-    let result = match (request.hunk, request.stage) {
-      (None, true) => git.stage(&request.file),
-      (None, false) => git.unstage(&request.file),
-      (Some(h), true) => git.stage_hunk(&request.file, h),
-      (Some(h), false) => git.unstage_hunk(&request.file, h),
-    };
+    let result = request.run(git);
     assert!(app.on_indexed(request.follow, result));
     load(app, git);
   }
@@ -1631,11 +1770,8 @@ mod tests {
   fn press_a(app: &mut App, git: &crate::vcs::Git) {
     app.on_key(key(KeyCode::Char('a')));
     let request = app.take_index_request().expect("a hunk request");
-    assert!(request.hunk.is_some());
-    let result = match request.stage {
-      true => git.stage_hunk(&request.file, request.hunk.unwrap()),
-      false => git.unstage_hunk(&request.file, request.hunk.unwrap()),
-    };
+    assert!(matches!(request.target, Target::Hunk(_)));
+    let result = request.run(git);
     assert!(app.on_indexed(request.follow, result));
     load(app, git);
   }
@@ -1724,5 +1860,297 @@ mod tests {
     app.on_key(key(KeyCode::Char('a')));
     assert_eq!(app.notice.as_deref(), Some("No hunk under the cursor"));
     assert!(app.take_index_request().is_none());
+  }
+
+  /// One file `f` whose single hunk reads, by hunk line and by unified row
+  /// (the header is row 0): `1` `2` `-3` `+x3` ` 4` `-5` `+x5` and context.
+  fn line_repo() -> (tempfile::TempDir, crate::vcs::Git) {
+    use std::process::Command;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let d = tmp.path().to_path_buf();
+    let git = |args: &[&str]| {
+      let status = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(&d)
+        .status()
+        .unwrap();
+      assert!(status.success());
+    };
+    let body = |three: &str, five: &str| {
+      (1..=20)
+        .map(|n| match n {
+          3 => format!("{three}\n"),
+          5 => format!("{five}\n"),
+          n => format!("{n}\n"),
+        })
+        .collect::<String>()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(d.join("f"), body("3", "5")).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(d.join("f"), body("x3", "x5")).unwrap();
+    let repo = crate::vcs::Git::new(&d);
+    (tmp, repo)
+  }
+
+  /// The file as the index holds it.
+  fn index_of(dir: &Path, name: &str) -> String {
+    let out = std::process::Command::new("git")
+      .args(["show", &format!(":{name}")])
+      .current_dir(dir)
+      .output()
+      .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+  }
+
+  /// Runs the stage or unstage the last key press asked for, as the event
+  /// loop does, and reloads.
+  fn run_request(app: &mut App, git: &crate::vcs::Git) {
+    let request = app.take_index_request().expect("an index request");
+    let result = request.run(git);
+    assert!(app.on_indexed(request.follow, result));
+    load(app, git);
+  }
+
+  fn press(app: &mut App, keys: &str) {
+    for c in keys.chars() {
+      app.on_key(key(KeyCode::Char(c)));
+    }
+  }
+
+  /// Puts the cursor on `row` of the unified diff.
+  fn cursor_to(app: &mut App, row: usize) {
+    app.cursor = row;
+    app.clamp_scroll();
+  }
+
+  #[test]
+  fn v_then_a_stages_only_the_selected_lines() {
+    let (tmp, git) = line_repo();
+    let d = tmp.path();
+    let mut app = App::default();
+    load(&mut app, &git);
+    cursor_to(&mut app, 3); // `-3`
+    press(&mut app, "vj");
+    assert_eq!(app.mode, Mode::Visual);
+    press(&mut app, "a");
+    assert_eq!(app.mode, Mode::Normal);
+    run_request(&mut app, &git);
+    let expected: String = (1..=20)
+      .map(|n| {
+        if n == 3 {
+          "x3\n".into()
+        } else {
+          format!("{n}\n")
+        }
+      })
+      .collect();
+    assert_eq!(index_of(d, "f"), expected);
+  }
+
+  #[test]
+  fn selections_of_other_sizes_stage_what_they_cover() {
+    let numbered = |edits: &[(usize, &str)]| -> String {
+      (1..=20)
+        .map(|n| match edits.iter().find(|(at, _)| *at == n) {
+          Some((_, text)) => format!("{text}\n"),
+          None => format!("{n}\n"),
+        })
+        .collect()
+    };
+    // (first row, the keys after `v`, the index afterwards)
+    let cases = [
+      (3, "", numbered(&[(3, "")]).replacen("\n\n", "\n", 1)),
+      (4, "", numbered(&[(3, "3\nx3")])),
+      (6, "j", numbered(&[(5, "x5")])),
+      // Extending upwards works as well as downwards.
+      (4, "kk", numbered(&[(3, "x3")])),
+    ];
+    for (row, keys, expected) in cases {
+      let (tmp, git) = line_repo();
+      let mut app = App::default();
+      load(&mut app, &git);
+      cursor_to(&mut app, row);
+      press(&mut app, "v");
+      press(&mut app, keys);
+      press(&mut app, "a");
+      run_request(&mut app, &git);
+      assert_eq!(
+        index_of(tmp.path(), "f"),
+        expected,
+        "row {row} keys {keys:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_in_the_staged_section_unstages_only_the_selected_lines() {
+    let (tmp, git) = line_repo();
+    let d = tmp.path();
+    std::process::Command::new("git")
+      .args(["add", "f"])
+      .current_dir(d)
+      .status()
+      .unwrap();
+    let mut app = App::default();
+    load(&mut app, &git);
+    assert_eq!(selected_name(&app).1, Some(Section::Staged));
+    cursor_to(&mut app, 6); // `-5`
+    press(&mut app, "vj");
+    press(&mut app, "a");
+    run_request(&mut app, &git);
+    let expected: String = (1..=20)
+      .map(|n| match n {
+        3 => "x3\n".into(),
+        n => format!("{n}\n"),
+      })
+      .collect();
+    assert_eq!(index_of(d, "f"), expected);
+  }
+
+  #[test]
+  fn esc_and_v_leave_visual_mode_without_quitting() {
+    let (_tmp, git) = line_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    press(&mut app, "v");
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!((app.mode, app.quit), (Mode::Normal, false));
+    press(&mut app, "vv");
+    assert_eq!((app.mode, app.quit), (Mode::Normal, false));
+    // Esc in normal mode still quits, and so does q in visual mode.
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.quit);
+    let mut app = App::default();
+    load(&mut app, &git);
+    press(&mut app, "vq");
+    assert!(app.quit);
+  }
+
+  #[test]
+  fn a_selection_without_changed_lines_shows_a_notice_and_changes_nothing() {
+    let (_tmp, git) = line_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    // The header and the two context lines above the first change.
+    press(&mut app, "vjj");
+    press(&mut app, "a");
+    assert_eq!(app.notice.as_deref(), Some("no changed lines selected"));
+    assert!(app.take_index_request().is_none());
+    assert_eq!(app.mode, Mode::Visual);
+  }
+
+  #[test]
+  fn the_selection_stays_inside_its_hunk() {
+    let (_tmp, git) = hunk_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    let first = app.files[0].hunks[0].lines.len();
+    press(&mut app, "v");
+    for _ in 0..first + 5 {
+      press(&mut app, "j");
+    }
+    // The last row of the first hunk, not the header of the second.
+    assert_eq!(app.cursor, first);
+    assert_eq!(app.selection_lines(), Some((0, 0..first)));
+    for _ in 0..first + 5 {
+      press(&mut app, "k");
+    }
+    assert_eq!(app.cursor, 0);
+  }
+
+  #[test]
+  fn visual_mode_needs_the_unified_layout() {
+    let (_tmp, git) = line_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    press(&mut app, "sv");
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.notice.is_some());
+  }
+
+  #[test]
+  fn a_in_visual_mode_on_a_revision_shows_the_read_only_notice() {
+    let mut changed = file_in("a", None);
+    changed.hunks[0].lines[0].kind = LineKind::Added;
+    let mut app = ready(vec![changed], 5);
+    cursor_to(&mut app, 1);
+    press(&mut app, "va");
+    assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
+    assert!(app.take_index_request().is_none());
+  }
+
+  #[test]
+  fn the_cursor_stays_on_a_hunk_that_is_only_partly_staged() {
+    let (_tmp, git) = line_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    cursor_to(&mut app, 3); // `-3`
+    press(&mut app, "vja");
+    run_request(&mut app, &git);
+    // The pair on line 5 is left, in the same entry and hunk.
+    assert_eq!(selected_name(&app), ("f".into(), Some(Section::Unstaged)));
+    assert_eq!(app.cursor_hunk(), Some(0));
+    assert_eq!(app.cursor, 0);
+    assert_eq!(app.files[app.selected].hunks[0].changed().count(), 2);
+  }
+
+  #[test]
+  fn the_cursor_moves_on_when_the_selection_takes_the_whole_hunk() {
+    let (_tmp, git) = hunk_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    let first = app.files[0].hunks[0].clone();
+    let last = first.lines.len();
+    cursor_to(&mut app, 1);
+    press(&mut app, "v");
+    for _ in 0..last {
+      press(&mut app, "j");
+    }
+    press(&mut app, "a");
+    run_request(&mut app, &git);
+    // The first hunk is gone, so the second one is under the cursor.
+    assert_eq!(app.files[app.selected].hunks.len(), 1);
+    assert_eq!(app.cursor_hunk(), Some(0));
+    assert_eq!(app.files[app.selected].hunks[0].lines[4].content, b"BOTTOM");
+  }
+
+  #[test]
+  fn the_refusals_come_before_the_check_for_changed_lines() {
+    let mut app = ready(vec![file_in("a", None)], 5);
+    cursor_to(&mut app, 1);
+    // Context only, on a revision.
+    press(&mut app, "va");
+    assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
+  }
+
+  #[test]
+  fn unstaging_only_the_added_lines_of_a_selection() {
+    let (tmp, git) = line_repo();
+    let d = tmp.path();
+    std::process::Command::new("git")
+      .args(["add", "f"])
+      .current_dir(d)
+      .status()
+      .unwrap();
+    let mut app = App::default();
+    load(&mut app, &git);
+    cursor_to(&mut app, 4); // `+x3`
+    press(&mut app, "va");
+    run_request(&mut app, &git);
+    // `x3` leaves the index and the old 3 does not come back.
+    let expected: String = (1..=20)
+      .filter(|&n| n != 3)
+      .map(|n| {
+        if n == 5 {
+          "x5\n".into()
+        } else {
+          format!("{n}\n")
+        }
+      })
+      .collect();
+    assert_eq!(index_of(d, "f"), expected);
   }
 }

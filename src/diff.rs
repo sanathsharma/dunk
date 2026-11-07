@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::fmt;
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -96,6 +97,18 @@ pub struct FileDiff {
   pub hunks: Vec<Hunk>,
 }
 
+impl Hunk {
+  /// Indexes of the added and removed lines.
+  pub fn changed(&self) -> impl Iterator<Item = usize> + Clone + '_ {
+    self
+      .lines
+      .iter()
+      .enumerate()
+      .filter(|(_, l)| l.kind != LineKind::Context)
+      .map(|(i, _)| i)
+  }
+}
+
 impl FileDiff {
   /// The path the file has after the change, or before it for a deletion.
   pub fn path(&self) -> &Path {
@@ -155,9 +168,78 @@ impl FileDiff {
     out
   }
 
+  /// A patch that holds only the changed lines of hunk `hunk` that fall in
+  /// `lines`, an index range into the hunk's lines. A removed line outside the
+  /// range becomes context and an added one outside it is left out, so the
+  /// patch changes nothing but the selection.
+  pub fn line_patch(&self, hunk: usize, lines: Range<usize>) -> Vec<u8> {
+    let h = &self.hunks[hunk];
+    let mut kept: Vec<Line> = Vec::new();
+    for (i, line) in h.lines.iter().enumerate() {
+      if lines.contains(&i) || line.kind == LineKind::Context {
+        kept.push(line.clone());
+        continue;
+      }
+      match line.kind {
+        LineKind::Added => {}
+        LineKind::Removed
+          if line.no_newline
+            && h.lines[i + 1..]
+              .iter()
+              .enumerate()
+              .any(|(at, l)| l.kind == LineKind::Added && lines.contains(&(i + 1 + at))) =>
+        {
+          // Text can only follow a line that ends in a newline. The old line
+          // goes and comes back with its newline, ahead of the added lines.
+          kept.push(line.clone());
+          kept.push(Line {
+            kind: LineKind::Added,
+            old_no: None,
+            no_newline: false,
+            ..line.clone()
+          });
+        }
+        _ => kept.push(Line {
+          kind: LineKind::Context,
+          ..line.clone()
+        }),
+      }
+    }
+    let count = |kinds: [LineKind; 2]| kept.iter().filter(|l| kinds.contains(&l.kind)).count();
+    let narrowed = Hunk {
+      old_len: count([LineKind::Context, LineKind::Removed]) as u32,
+      new_len: count([LineKind::Context, LineKind::Added]) as u32,
+      lines: kept,
+      ..h.clone()
+    };
+    // A deleted file with lines left over is no longer deleted.
+    let new_path = match &self.new_path {
+      None if narrowed.new_len > 0 => self.old_path.clone(),
+      path => path.clone(),
+    };
+    FileDiff {
+      new_path,
+      hunks: vec![narrowed],
+      ..self.clone()
+    }
+    .hunk_patch(0)
+  }
+
   /// A patch that undoes hunk `hunk`. It is written out rather than left to
   /// `git apply --reverse`, which cannot read a `/dev/null` header backwards.
   pub fn reverse_hunk_patch(&self, hunk: usize) -> Vec<u8> {
+    self.reversed_hunk(hunk).hunk_patch(0)
+  }
+
+  /// A patch that undoes only the changed lines of hunk `hunk` that fall in
+  /// `lines`, as `line_patch` selects them.
+  pub fn reverse_line_patch(&self, hunk: usize, lines: Range<usize>) -> Vec<u8> {
+    self.reversed_hunk(hunk).line_patch(0, lines)
+  }
+
+  /// A file that holds hunk `hunk` turned around: the sides swap and so do
+  /// added and removed lines. The lines keep their order and index.
+  fn reversed_hunk(&self, hunk: usize) -> FileDiff {
     let mut h = self.hunks[hunk].clone();
     (h.old_start, h.new_start) = (h.new_start, h.old_start);
     (h.old_len, h.new_len) = (h.new_len, h.old_len);
@@ -174,7 +256,6 @@ impl FileDiff {
       hunks: vec![h],
       ..self.clone()
     }
-    .hunk_patch(0)
   }
 
   /// Reveals the unchanged lines of gap `gap` as context. Gap `i` lies above

@@ -5,6 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -124,6 +125,16 @@ impl Git {
     let out = self.command(&root, full)?;
     if !out.status.success() {
       return Err(git_error(&out));
+    }
+    Ok(())
+  }
+
+  /// An unstaged added file is untracked or already intent-to-add, and
+  /// `add -N` is harmless for the second. Either way its hunks then apply
+  /// like those of a tracked file.
+  fn mark_intent_to_add(&self, file: &FileDiff) -> Result<(), Error> {
+    if file.status == FileStatus::Added {
+      self.write_index(&["add", "-N"], file)?;
     }
     Ok(())
   }
@@ -334,12 +345,17 @@ impl Vcs for Git {
   }
 
   fn stage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {
-    // An unstaged added file is untracked or already intent-to-add, and
-    // `add -N` is harmless for the second.
-    if file.status == FileStatus::Added {
-      self.write_index(&["add", "-N"], file)?;
-    }
+    self.mark_intent_to_add(file)?;
     self.apply_to_index(&file.hunk_patch(hunk))
+  }
+
+  fn stage_lines(&self, file: &FileDiff, hunk: usize, lines: Range<usize>) -> Result<(), Error> {
+    self.mark_intent_to_add(file)?;
+    self.apply_to_index(&file.line_patch(hunk, lines))
+  }
+
+  fn unstage_lines(&self, file: &FileDiff, hunk: usize, lines: Range<usize>) -> Result<(), Error> {
+    self.apply_to_index(&file.reverse_line_patch(hunk, lines))
   }
 
   fn unstage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {
@@ -1034,6 +1050,118 @@ mod tests {
     assert_eq!(index_of(d, "f.txt"), numbered(&[(19, "NINETEEN")]));
     assert_eq!(entry(&git, "f.txt", Section::Staged).hunks.len(), 1);
     assert_eq!(entry(&git, "f.txt", Section::Unstaged).hunks.len(), 1);
+  }
+
+  /// Lines 3 and 5 changed, with 4 between them, so one hunk holds
+  /// `-3 +x3 4 -5 +x5` after two lines of context.
+  fn interleaved_repo() -> TempDir {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "f.txt", &numbered(&[]));
+    commit_all(d, "init");
+    write(d, "f.txt", &numbered(&[(3, "x3"), (5, "x5")]));
+    tmp
+  }
+
+  #[test]
+  fn stages_only_the_selected_lines_of_a_hunk() {
+    // Hunk lines: 0 `1`, 1 `2`, 2 `-3`, 3 `+x3`, 4 ` 4`, 5 `-5`, 6 `+x5`, ...
+    let cases: [(std::ops::Range<usize>, String); 4] = [
+      (2..4, numbered(&[(3, "x3")])),
+      (5..7, numbered(&[(5, "x5")])),
+      // Only the removal: the line goes away without its replacement.
+      (2..3, numbered(&[(3, "")]).replacen("\n\n", "\n", 1)),
+      // Only the addition: it lands next to the old line.
+      (3..4, numbered(&[(3, "3\nx3")])),
+    ];
+    for (lines, expected) in cases {
+      let tmp = interleaved_repo();
+      let d = tmp.path();
+      let git = Git::new(d);
+      let file = entry(&git, "f.txt", Section::Unstaged);
+      assert_eq!(file.hunks.len(), 1);
+      git.stage_lines(&file, 0, lines.clone()).unwrap();
+      assert_eq!(index_of(d, "f.txt"), expected, "{lines:?}");
+    }
+  }
+
+  #[test]
+  fn unstages_only_the_selected_lines_of_a_staged_hunk() {
+    let cases: [(std::ops::Range<usize>, String); 3] = [
+      // The second pair leaves the index, the first stays.
+      (5..7, numbered(&[(3, "x3")])),
+      (2..4, numbered(&[(5, "x5")])),
+      // Only the removal of 3 is taken back: the old line returns but the
+      // staged replacement stays.
+      (2..3, numbered(&[(3, "3\nx3"), (5, "x5")])),
+    ];
+    for (lines, expected) in cases {
+      let tmp = interleaved_repo();
+      let d = tmp.path();
+      git(d, &["add", "f.txt"]);
+      let git = Git::new(d);
+      let file = entry(&git, "f.txt", Section::Staged);
+      git.unstage_lines(&file, 0, lines.clone()).unwrap();
+      assert_eq!(index_of(d, "f.txt"), expected, "{lines:?}");
+    }
+  }
+
+  #[test]
+  fn stages_selected_lines_of_an_untracked_file() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "keep.txt", "k\n");
+    commit_all(d, "init");
+    write(d, "new.txt", "a\nb\nc\nd\n");
+    let git = Git::new(d);
+    let file = entry(&git, "new.txt", Section::Unstaged);
+    git.stage_lines(&file, 0, 1..3).unwrap();
+    assert_eq!(index_of(d, "new.txt"), "b\nc\n");
+    let rest = entry(&git, "new.txt", Section::Unstaged);
+    let added: Vec<&[u8]> = rest.hunks[0]
+      .lines
+      .iter()
+      .filter(|l| l.kind == crate::diff::LineKind::Added)
+      .map(|l| l.content.as_slice())
+      .collect();
+    assert_eq!(added, [b"a".as_slice(), b"d".as_slice()]);
+  }
+
+  #[test]
+  fn stages_part_of_a_deleted_file_and_unstages_part_of_a_new_one() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "gone.txt", "1\n2\n3\n");
+    commit_all(d, "init");
+    fs::remove_file(d.join("gone.txt")).unwrap();
+    write(d, "new.txt", "a\nb\nc\n");
+    git(d, &["add", "new.txt"]);
+    let git = Git::new(d);
+    git
+      .stage_lines(&entry(&git, "gone.txt", Section::Unstaged), 0, 0..1)
+      .unwrap();
+    // Only the first line is gone from the index.
+    assert_eq!(index_of(d, "gone.txt"), "2\n3\n");
+
+    git
+      .unstage_lines(&entry(&git, "new.txt", Section::Staged), 0, 1..2)
+      .unwrap();
+    assert_eq!(index_of(d, "new.txt"), "a\nc\n");
+  }
+
+  #[test]
+  fn stages_an_addition_after_a_line_that_had_no_trailing_newline() {
+    let tmp = repo();
+    let d = tmp.path();
+    fs::write(d.join("f.txt"), "a\nb").unwrap();
+    commit_all(d, "init");
+    fs::write(d.join("f.txt"), "a\nc\n").unwrap();
+    let git = Git::new(d);
+    let file = entry(&git, "f.txt", Section::Unstaged);
+    // Lines: ` a`, `-b` without a newline, `+c`. Only the addition is picked,
+    // so `b` stays but now ends its line.
+    git.stage_lines(&file, 0, 2..3).unwrap();
+    assert_eq!(index_of(d, "f.txt"), "a\nb\nc\n");
   }
 
   #[test]
