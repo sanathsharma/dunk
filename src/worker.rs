@@ -19,13 +19,13 @@ struct Shared {
 pub struct Worker(Arc<Shared>);
 
 impl Worker {
-  /// Highlights `files` on a new thread, nearest to the focused file first,
+  /// Highlights `files` on a new thread with the shared `highlighter`, nearest to the focused file first,
   /// and calls `done` with each result. `done` returns false to stop.
   pub fn spawn<V, F>(
     vcs: Arc<V>,
     request: DiffRequest,
     files: Arc<Vec<FileDiff>>,
-    theme: String,
+    highlighter: Arc<Highlighter>,
     focus: usize,
     done: F,
   ) -> Worker
@@ -42,16 +42,13 @@ impl Worker {
     });
     let worker = Worker(shared.clone());
     thread::spawn(move || {
-      let Ok(highlighter) = Highlighter::new(&theme) else {
-        return;
-      };
       while let Some(index) = shared.next() {
         let file = &files[index];
         let result = if file.binary || file.hunks.is_empty() {
           FileHighlight::default()
         } else {
           let sides = vcs.sides(&request, file);
-          highlighter.diff(file, sides.old.as_deref(), sides.new.as_deref())
+          highlighter.diff(file, &sides)
         };
         if !done(index, result) {
           break;
@@ -93,7 +90,7 @@ impl Shared {
 mod tests {
   use super::*;
   use crate::diff::parse;
-  use crate::vcs::{Error, Sides, Status};
+  use crate::vcs::{Error, Sides, Status, VersionId};
   use std::sync::mpsc;
 
   struct Fake;
@@ -111,6 +108,8 @@ mod tests {
       Sides {
         old: Some(b"a\n".to_vec()),
         new: Some(b"b\n".to_vec()),
+        old_id: Some(VersionId::Object("old".into())),
+        new_id: Some(VersionId::Object("new".into())),
       }
     }
   }
@@ -146,7 +145,7 @@ mod tests {
       Arc::new(Fake),
       DiffRequest::default(),
       files(3),
-      crate::highlight::DEFAULT_THEME.into(),
+      Arc::new(Highlighter::new(crate::highlight::DEFAULT_THEME).unwrap()),
       2,
       move |i, h| tx.send((i, h)).is_ok(),
     );
@@ -154,5 +153,27 @@ mod tests {
     seen.sort_by_key(|(i, _)| *i);
     assert_eq!(seen.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2]);
     assert!(seen[0].1.hunks[0].iter().all(Option::is_some));
+  }
+
+  #[test]
+  fn a_refresh_with_unchanged_files_highlights_nothing() {
+    let highlighter = Arc::new(Highlighter::new(crate::highlight::DEFAULT_THEME).unwrap());
+    let refresh = || {
+      let (tx, rx) = mpsc::channel();
+      let _worker = Worker::spawn(
+        Arc::new(Fake),
+        DiffRequest::default(),
+        files(3),
+        highlighter.clone(),
+        0,
+        move |i, h| tx.send((i, h)).is_ok(),
+      );
+      (0..3).for_each(|_| drop(rx.recv().unwrap()));
+      3
+    };
+    assert_eq!(refresh(), 3);
+    let after_first = highlighter.runs();
+    assert_eq!(refresh(), 3);
+    assert_eq!(highlighter.runs(), after_first);
   }
 }

@@ -1,6 +1,10 @@
 use crate::diff::{FileDiff, LineKind};
+use crate::vcs::{Sides, VersionId};
 use ratatui::style::{Color, Modifier, Style};
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme};
 use syntect::parsing::SyntaxSet;
@@ -13,6 +17,9 @@ pub const DEFAULT_THEME: &str = "base16-ocean.dark";
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 /// A file with a longer line is drawn uncolored (minified or generated code).
 const MAX_LINE_BYTES: usize = 10_000;
+
+/// Highlighted file versions kept for reuse across refreshes.
+const CACHE_ENTRIES: usize = 256;
 
 /// One line of text split into colored pieces, without its newline.
 pub type Styled = Vec<(Style, String)>;
@@ -42,9 +49,53 @@ pub fn resolve_theme(name: &str) -> Result<String, String> {
     })
 }
 
+/// A file version's highlighting, `None` when it could not be highlighted.
+type Lines = Option<Arc<Vec<Styled>>>;
+
+/// Highlighted versions keyed by version ID and path. The path is part of
+/// the key because it picks the syntax. The oldest entry goes first when
+/// the cache is full, where a lookup counts as a use.
+#[derive(Default)]
+struct Cache {
+  entries: HashMap<(VersionId, PathBuf), Lines>,
+  /// Keys from least to most recently used.
+  order: VecDeque<(VersionId, PathBuf)>,
+}
+
+impl Cache {
+  fn get(&mut self, key: &(VersionId, PathBuf)) -> Option<Lines> {
+    let hit = self.entries.get(key)?.clone();
+    self.touch(key);
+    Some(hit)
+  }
+
+  fn insert(&mut self, key: (VersionId, PathBuf), lines: Lines) {
+    if self.entries.insert(key.clone(), lines).is_some() {
+      self.touch(&key);
+      return;
+    }
+    self.order.push_back(key);
+    if self.order.len() > CACHE_ENTRIES
+      && let Some(oldest) = self.order.pop_front()
+    {
+      self.entries.remove(&oldest);
+    }
+  }
+
+  fn touch(&mut self, key: &(VersionId, PathBuf)) {
+    if let Some(at) = self.order.iter().position(|k| k == key)
+      && let Some(key) = self.order.remove(at)
+    {
+      self.order.push_back(key);
+    }
+  }
+}
+
 pub struct Highlighter {
   syntaxes: SyntaxSet,
   theme: Theme,
+  cache: Mutex<Cache>,
+  runs: AtomicUsize,
 }
 
 impl Highlighter {
@@ -59,6 +110,8 @@ impl Highlighter {
     Ok(Highlighter {
       syntaxes: two_face::syntax::extra_newlines(),
       theme: two_face::theme::extra().get(id).clone(),
+      cache: Mutex::default(),
+      runs: AtomicUsize::new(0),
     })
   }
 
@@ -66,6 +119,7 @@ impl Highlighter {
   /// comments carry across lines. Returns `None` for files that are too
   /// big, have very long lines, or have no known syntax.
   pub fn file(&self, path: &Path, bytes: &[u8]) -> Option<Vec<Styled>> {
+    self.runs.fetch_add(1, Ordering::Relaxed);
     if bytes.len() > MAX_FILE_BYTES
       || bytes
         .split(|&b| b == b'\n')
@@ -104,16 +158,45 @@ impl Highlighter {
     })
   }
 
+  /// How many files `file` has highlighted so far.
+  #[cfg(test)]
+  pub(crate) fn runs(&self) -> usize {
+    self.runs.load(Ordering::Relaxed)
+  }
+
   /// Highlights both versions of a file and maps the colors onto its diff
-  /// lines through their line numbers.
-  pub fn diff(&self, file: &FileDiff, old: Option<&[u8]>, new: Option<&[u8]>) -> FileHighlight {
-    let old = old
-      .zip(file.old_path.as_deref())
-      .and_then(|(bytes, path)| self.file(path, bytes));
-    let new = new
-      .zip(file.new_path.as_deref())
-      .and_then(|(bytes, path)| self.file(path, bytes));
-    map_lines(file, old.as_deref(), new.as_deref())
+  /// lines through their line numbers. A version with an ID is highlighted
+  /// once and reused until the cache drops it.
+  pub fn diff(&self, file: &FileDiff, sides: &Sides) -> FileHighlight {
+    let old = self.version(
+      file.old_path.as_deref(),
+      sides.old.as_deref(),
+      &sides.old_id,
+    );
+    let new = self.version(
+      file.new_path.as_deref(),
+      sides.new.as_deref(),
+      &sides.new_id,
+    );
+    map_lines(
+      file,
+      old.as_deref().map(Vec::as_slice),
+      new.as_deref().map(Vec::as_slice),
+    )
+  }
+
+  fn version(&self, path: Option<&Path>, bytes: Option<&[u8]>, id: &Option<VersionId>) -> Lines {
+    let (path, bytes) = path.zip(bytes)?;
+    let Some(id) = id else {
+      return self.file(path, bytes).map(Arc::new);
+    };
+    let key = (id.clone(), path.to_path_buf());
+    if let Some(hit) = self.cache.lock().unwrap().get(&key) {
+      return hit;
+    }
+    let lines = self.file(path, bytes).map(Arc::new);
+    self.cache.lock().unwrap().insert(key, lines.clone());
+    lines
   }
 }
 
@@ -254,7 +337,7 @@ diff --git a/a.rs b/a.rs
     let file = parse(diff.as_bytes()).unwrap().remove(0);
     let old = b"one\ntwo\n/* gone\n*/\n";
     let new = b"one\ntwo\nlet x = 1;\n*/\n";
-    let h = highlighter().diff(&file, Some(old), Some(new));
+    let h = highlighter().diff(&file, &sides(Some(old), Some(new)));
     let lines = &h.hunks[0];
     let text = |l: &Option<Styled>| {
       l.as_ref()
@@ -275,9 +358,96 @@ diff --git a/a.rs b/a.rs
   fn missing_versions_leave_lines_uncolored() {
     let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b\n";
     let file = parse(diff.as_bytes()).unwrap().remove(0);
-    let h = highlighter().diff(&file, None, Some(b"b\n"));
+    let h = highlighter().diff(&file, &sides(None, Some(b"b\n")));
     assert!(h.hunks[0][0].is_none());
     assert!(h.hunks[0][1].is_some());
+  }
+
+  fn sides(old: Option<&[u8]>, new: Option<&[u8]>) -> Sides {
+    Sides {
+      old: old.map(<[u8]>::to_vec),
+      new: new.map(<[u8]>::to_vec),
+      ..Sides::default()
+    }
+  }
+
+  fn one_line_file() -> FileDiff {
+    let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b\n";
+    parse(diff.as_bytes()).unwrap().remove(0)
+  }
+
+  fn identified(old: &[u8], new: &[u8], old_id: &str, new_id: &str) -> Sides {
+    Sides {
+      old_id: Some(VersionId::Object(old_id.into())),
+      new_id: Some(VersionId::Object(new_id.into())),
+      ..sides(Some(old), Some(new))
+    }
+  }
+
+  #[test]
+  fn a_repeated_diff_reuses_highlighted_versions() {
+    let h = highlighter();
+    let file = one_line_file();
+    let first = h.diff(&file, &identified(b"a\n", b"b\n", "o1", "o2"));
+    assert_eq!(h.runs(), 2);
+    let again = h.diff(&file, &identified(b"a\n", b"b\n", "o1", "o2"));
+    assert_eq!(h.runs(), 2);
+    assert_eq!(first, again);
+    // A changed version is highlighted again, the unchanged one is not.
+    h.diff(&file, &identified(b"a\n", b"c\n", "o1", "o3"));
+    assert_eq!(h.runs(), 3);
+  }
+
+  #[test]
+  fn versions_without_an_id_are_never_cached() {
+    let h = highlighter();
+    let file = one_line_file();
+    h.diff(&file, &sides(Some(b"a\n"), Some(b"b\n")));
+    h.diff(&file, &sides(Some(b"a\n"), Some(b"b\n")));
+    assert_eq!(h.runs(), 4);
+  }
+
+  #[test]
+  fn the_cache_forgets_old_versions_past_its_limit() {
+    let h = highlighter();
+    let file = one_line_file();
+    for i in 0..CACHE_ENTRIES + 10 {
+      h.diff(
+        &file,
+        &identified(b"a\n", b"b\n", "old", &format!("new{i}")),
+      );
+    }
+    let before = h.runs();
+    // The first new version was evicted, the latest one is still held.
+    h.diff(&file, &identified(b"a\n", b"b\n", "old", "new0"));
+    assert_eq!(h.runs(), before + 1);
+    let last = format!("new{}", CACHE_ENTRIES + 9);
+    h.diff(&file, &identified(b"a\n", b"b\n", "old", &last));
+    assert_eq!(h.runs(), before + 1);
+  }
+
+  #[test]
+  fn a_cache_hit_keeps_the_version_from_being_evicted() {
+    let h = highlighter();
+    let file = one_line_file();
+    // The shared "old" version takes one slot, so this fills the cache exactly.
+    for i in 0..CACHE_ENTRIES - 1 {
+      h.diff(
+        &file,
+        &identified(b"a\n", b"b\n", "old", &format!("new{i}")),
+      );
+    }
+    // Use the oldest version again, then overflow the cache.
+    h.diff(&file, &identified(b"a\n", b"b\n", "old", "new0"));
+    for i in CACHE_ENTRIES..CACHE_ENTRIES + 5 {
+      h.diff(
+        &file,
+        &identified(b"a\n", b"b\n", "old", &format!("new{i}")),
+      );
+    }
+    let before = h.runs();
+    h.diff(&file, &identified(b"a\n", b"b\n", "old", "new0"));
+    assert_eq!(h.runs(), before);
   }
 
   #[test]

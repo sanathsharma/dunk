@@ -1,6 +1,7 @@
 use crate::args::Layout;
 use crate::diff::{FileDiff, Hunk};
 use crate::highlight::FileHighlight;
+use crate::highlight::Highlighter;
 use crate::split;
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Vcs};
@@ -296,6 +297,9 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
     layout,
     ..App::default()
   };
+  let highlighter = theme
+    .and_then(|theme| Highlighter::new(&theme).ok())
+    .map(Arc::new);
   let mut worker: Option<Worker> = None;
   while !app.quit {
     terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -309,16 +313,16 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
       Ok(Event::Loaded(id, result)) if id == latest => {
         if app.on_loaded(result) {
           applied = id;
-          worker = theme
+          worker = highlighter
             .clone()
             .filter(|_| !app.files.is_empty())
-            .map(|theme| {
+            .map(|highlighter| {
               let tx = tx.clone();
               Worker::spawn(
                 vcs.clone(),
                 request.clone(),
                 app.files.clone(),
-                theme,
+                highlighter,
                 app.selected,
                 move |i, h| tx.send(Event::Highlighted(id, i, h)).is_ok(),
               )

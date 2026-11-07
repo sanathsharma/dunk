@@ -105,12 +105,24 @@ pub struct DiffRequest {
   pub context: Option<u32>,
 }
 
+/// Names one version of a file so its highlighting can be reused.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VersionId {
+  /// The git object ID of a committed or staged version.
+  Object(String),
+  /// A hash of the contents of a working-tree file.
+  Content(u64),
+}
+
 /// The full contents of a file on each side of a diff. A side is `None` when
-/// the file does not exist there or cannot be read.
+/// the file does not exist there or cannot be read. An ID is `None` when the
+/// side has no contents or the backend cannot name the version.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Sides {
   pub old: Option<Vec<u8>>,
   pub new: Option<Vec<u8>>,
+  pub old_id: Option<VersionId>,
+  pub new_id: Option<VersionId>,
 }
 
 pub trait Vcs {

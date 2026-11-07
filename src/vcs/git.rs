@@ -1,7 +1,9 @@
-use super::{ChangeKind, DiffRequest, Error, FileChange, Sides, Status, Vcs};
+use super::{ChangeKind, DiffRequest, Error, FileChange, Sides, Status, Vcs, VersionId};
 use crate::args::Scope;
 use crate::diff::{FileDiff, parse};
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
+use std::hash::{Hash, Hasher};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -63,27 +65,30 @@ impl Git {
     Ok(String::from_utf8_lossy(&empty).trim().to_string())
   }
 
-  /// Reads a file from a commit, the index or the working tree. The path is
-  /// relative to the repository root.
-  fn read(&self, root: &Path, source: &Source, file: &Path) -> Option<Vec<u8>> {
+  /// Reads a file from a commit, the index or the working tree, with an ID
+  /// for that version. The path is relative to the repository root.
+  fn read(&self, root: &Path, source: &Source, file: &Path) -> Option<(Vec<u8>, VersionId)> {
     let spec = |prefix: &str| {
       let mut spec = std::ffi::OsString::from(prefix);
       spec.push(file);
       spec
     };
-    match source {
-      Source::WorkingTree => std::fs::read(root.join(file)).ok(),
-      Source::Index => self
-        .run([OsStr::new("cat-file"), OsStr::new("blob"), &spec(":")])
-        .ok(),
-      Source::Commit(rev) => self
-        .run([
-          OsStr::new("cat-file"),
-          OsStr::new("blob"),
-          &spec(&format!("{rev}:")),
-        ])
-        .ok(),
-    }
+    let spec = match source {
+      Source::WorkingTree => {
+        let bytes = std::fs::read(root.join(file)).ok()?;
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        return Some((bytes, VersionId::Content(hasher.finish())));
+      }
+      Source::Index => spec(":"),
+      Source::Commit(rev) => spec(&format!("{rev}:")),
+    };
+    let oid = self
+      .run([OsStr::new("rev-parse"), OsStr::new("--verify"), &spec])
+      .ok()?;
+    let oid = String::from_utf8_lossy(&oid).trim().to_string();
+    let bytes = self.run(["cat-file", "blob", &oid]).ok()?;
+    Some((bytes, VersionId::Object(oid)))
   }
 
   /// Resolves `a...b` to the merge base of `a` and `b` on the old side.
@@ -233,15 +238,15 @@ impl Vcs for Git {
     };
     let (old, new) = sources(req, &head);
     let old = self.resolve_range_base(req, old);
+    let read =
+      |path: Option<&Path>, source: &Source| path.and_then(|p| self.read(&root, source, p)).unzip();
+    let (old, old_id) = read(file.old_path.as_deref(), &old);
+    let (new, new_id) = read(file.new_path.as_deref(), &new);
     Sides {
-      old: file
-        .old_path
-        .as_deref()
-        .and_then(|p| self.read(&root, &old, p)),
-      new: file
-        .new_path
-        .as_deref()
-        .and_then(|p| self.read(&root, &new, p)),
+      old,
+      new,
+      old_id,
+      new_id,
     }
   }
 }
@@ -756,5 +761,35 @@ mod tests {
     let tmp = TempDir::new().unwrap();
     let err = Git::new(tmp.path()).status().unwrap_err();
     assert!(matches!(err, Error::Git(ref m) if m.contains("not a git repository")));
+  }
+
+  #[test]
+  fn names_committed_and_staged_versions_by_object_id_and_working_files_by_content() {
+    let d = repo();
+    write(d.path(), "a.rs", "fn a() {}\n");
+    commit_all(d.path(), "one");
+    write(d.path(), "a.rs", "fn b() {}\n");
+    let git = Git::new(d.path());
+    let request = DiffRequest::default();
+    let file = git.diff(&request).unwrap().remove(0);
+    let sides = git.sides(&request, &file);
+    assert!(matches!(&sides.old_id, Some(VersionId::Object(id)) if id.len() >= 40));
+    assert!(matches!(sides.new_id, Some(VersionId::Content(_))));
+
+    let same = git.sides(&request, &file);
+    assert_eq!(sides.new_id, same.new_id);
+    write(d.path(), "a.rs", "fn c() {}\n");
+    assert_ne!(sides.new_id, git.sides(&request, &file).new_id);
+
+    git.run(["add", "a.rs"]).unwrap();
+    let staged = DiffRequest {
+      scope: Scope::Staged,
+      ..DiffRequest::default()
+    };
+    let file = git.diff(&staged).unwrap().remove(0);
+    assert!(matches!(
+      git.sides(&staged, &file).new_id,
+      Some(VersionId::Object(_))
+    ));
   }
 }
