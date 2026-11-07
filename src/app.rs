@@ -50,7 +50,22 @@ pub struct Rehighlight {
   pub sides: Arc<Sides>,
 }
 
+/// What the keys currently do. The footer names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+  Normal,
+}
+
+impl Mode {
+  pub fn label(self) -> &'static str {
+    match self {
+      Mode::Normal => "NORMAL",
+    }
+  }
+}
+
 pub struct App {
+  pub mode: Mode,
   pub load: Load,
   /// The files as shown, with any expanded gaps.
   pub files: Arc<Vec<FileDiff>>,
@@ -80,6 +95,9 @@ pub struct App {
   pub list_state: ListState,
   /// Index of the first visible row of the selected file's diff.
   pub scroll: usize,
+  /// Row of the line cursor in the selected file's diff, in the current
+  /// layout. The viewport follows it.
+  pub cursor: usize,
   /// Height of the diff pane in rows, as of the last render.
   pub viewport: usize,
   pub quit: bool,
@@ -88,6 +106,7 @@ pub struct App {
 impl Default for App {
   fn default() -> Self {
     App {
+      mode: Mode::Normal,
       load: Load::Loading,
       files: Arc::new(Vec::new()),
       loaded: Arc::new(Vec::new()),
@@ -103,6 +122,7 @@ impl Default for App {
       selected: 0,
       list_state: ListState::default(),
       scroll: 0,
+      cursor: 0,
       viewport: 0,
       quit: false,
     }
@@ -195,7 +215,11 @@ impl App {
         .iter()
         .position(|f| f.path() == old.path() && f.section == old.section)
     });
-    let scroll = if kept.is_some() { self.scroll } else { 0 };
+    let (scroll, cursor) = if kept.is_some() {
+      (self.scroll, self.cursor)
+    } else {
+      (0, 0)
+    };
     self.highlights = files.iter().map(|_| None).collect();
     self.words = files.iter().map(|_| None).collect();
     self.sides = files.iter().map(|_| None).collect();
@@ -208,6 +232,7 @@ impl App {
     self.files = self.loaded.clone();
     self.select(index);
     self.scroll = scroll;
+    self.cursor = cursor;
     self.clamp_scroll();
     true
   }
@@ -274,14 +299,20 @@ impl App {
     match key.code {
       KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
       KeyCode::Char('c') if ctrl => self.quit = true,
-      KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
-      KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
+      KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
+      KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
       KeyCode::Char('d') if ctrl => self.scroll_by(page as isize / 2),
       KeyCode::Char('u') if ctrl => self.scroll_by(-(page as isize / 2)),
       KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(page as isize),
       KeyCode::PageUp => self.scroll_by(-(page as isize)),
-      KeyCode::Char('g') | KeyCode::Home => self.scroll = 0,
-      KeyCode::Char('G') | KeyCode::End => self.scroll = self.max_scroll(),
+      KeyCode::Char('g') | KeyCode::Home => {
+        self.scroll = 0;
+        self.cursor = 0;
+      }
+      KeyCode::Char('G') | KeyCode::End => {
+        self.scroll = self.max_scroll();
+        self.cursor = self.rows().saturating_sub(1);
+      }
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('e') => self.expand_at_top(),
       KeyCode::Tab | KeyCode::Char('n') => self.select_by(1),
@@ -290,16 +321,39 @@ impl App {
     }
   }
 
-  pub fn max_scroll(&self) -> usize {
-    let rows = self
+  /// Rows in the selected file's diff.
+  fn rows(&self) -> usize {
+    self
       .files
       .get(self.selected)
-      .map_or(0, |f| row_count(f, self.layout));
-    rows.saturating_sub(self.viewport)
+      .map_or(0, |f| row_count(f, self.layout))
   }
 
+  pub fn max_scroll(&self) -> usize {
+    self.rows().saturating_sub(self.viewport)
+  }
+
+  /// Keeps the scroll position and the cursor inside the diff, and the
+  /// cursor inside the viewport.
   pub fn clamp_scroll(&mut self) {
     self.scroll = self.scroll.min(self.max_scroll());
+    self.cursor = self.cursor.min(self.rows().saturating_sub(1));
+    if self.cursor < self.scroll {
+      self.scroll = self.cursor;
+    } else if self.viewport > 0 && self.cursor >= self.scroll + self.viewport {
+      self.scroll = self.cursor + 1 - self.viewport;
+    }
+  }
+
+  fn move_cursor(&mut self, delta: isize) {
+    self.cursor = self.cursor.saturating_add_signed(delta);
+    self.clamp_scroll();
+  }
+
+  /// The hunk under the cursor, as an index into the selected file's hunks.
+  pub fn cursor_hunk(&self) -> Option<usize> {
+    let file = self.files.get(self.selected)?;
+    locate(file, self.layout, self.cursor).map(|(hunk, _)| hunk)
   }
 
   /// Switches between unified and split, keeping the hunk and line at the top
@@ -310,10 +364,13 @@ impl App {
       Layout::Unified => Layout::Split,
       Layout::Split => Layout::Unified,
     };
-    if let Some(file) = self.files.get(self.selected)
-      && let Some((hunk, line)) = locate(file, from, self.scroll)
-    {
-      self.scroll = row_of(file, to, hunk, line);
+    if let Some(file) = self.files.get(self.selected) {
+      if let Some((hunk, line)) = locate(file, from, self.scroll) {
+        self.scroll = row_of(file, to, hunk, line);
+      }
+      if let Some((hunk, line)) = locate(file, from, self.cursor) {
+        self.cursor = row_of(file, to, hunk, line);
+      }
     }
     self.layout = to;
     self.clamp_scroll();
@@ -348,6 +405,7 @@ impl App {
     let Some(text) = sides.new.as_deref() else {
       return;
     };
+    let anchor = self.cursor_line_numbers();
     let files = Arc::make_mut(&mut self.files);
     let lines = |f: &FileDiff| f.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
     let before = lines(&files[index]);
@@ -370,11 +428,50 @@ impl App {
       file: self.files[index].clone(),
       sides: sides.clone(),
     });
-    self.clamp_scroll();
+    self.scroll = self.scroll.min(self.max_scroll());
+    self.cursor = anchor
+      .and_then(|numbers| self.row_with_numbers(numbers))
+      .unwrap_or(self.cursor);
+    self.clamp_cursor_to_view();
+  }
+
+  /// Old and new line numbers of the line under the cursor, if it is on a
+  /// line rather than a header.
+  fn cursor_line_numbers(&self) -> Option<(Option<u32>, Option<u32>)> {
+    let file = self.files.get(self.selected)?;
+    let (hunk, line) = locate(file, self.layout, self.cursor)?;
+    let l = &file.hunks[hunk].lines[line?];
+    Some((l.old_no, l.new_no))
+  }
+
+  /// The row showing the line with these numbers.
+  fn row_with_numbers(&self, numbers: (Option<u32>, Option<u32>)) -> Option<usize> {
+    let file = self.files.get(self.selected)?;
+    file.hunks.iter().enumerate().find_map(|(hi, h)| {
+      let li = h
+        .lines
+        .iter()
+        .position(|l| (l.old_no, l.new_no) == numbers)?;
+      Some(row_of(file, self.layout, hi, Some(li)))
+    })
+  }
+
+  /// Moves the cursor into the viewport without scrolling.
+  fn clamp_cursor_to_view(&mut self) {
+    if self.viewport > 0 {
+      self.cursor = self
+        .cursor
+        .clamp(self.scroll, self.scroll + self.viewport - 1);
+    }
+    self.cursor = self.cursor.min(self.rows().saturating_sub(1));
   }
 
   fn scroll_by(&mut self, delta: isize) {
-    self.scroll = self.scroll.saturating_add_signed(delta);
+    self.scroll = self
+      .scroll
+      .saturating_add_signed(delta)
+      .min(self.max_scroll());
+    self.clamp_cursor_to_view();
     self.clamp_scroll();
   }
 
@@ -403,6 +500,7 @@ impl App {
   fn select(&mut self, index: usize) {
     self.selected = index;
     self.scroll = 0;
+    self.cursor = 0;
     let row = self
       .list_rows()
       .iter()
@@ -644,6 +742,77 @@ mod tests {
   }
 
   #[test]
+  fn j_and_k_move_the_cursor_and_the_viewport_follows_it() {
+    // 11 rows, 4 visible.
+    let mut app = ready(vec![file("a", 10)], 4);
+    for _ in 0..3 {
+      app.on_key(key(KeyCode::Char('j')));
+    }
+    assert_eq!((app.cursor, app.scroll), (3, 0));
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!((app.cursor, app.scroll), (4, 1));
+    app.on_key(key(KeyCode::Char('k')));
+    assert_eq!((app.cursor, app.scroll), (3, 1));
+    for _ in 0..20 {
+      app.on_key(key(KeyCode::Char('k')));
+    }
+    assert_eq!((app.cursor, app.scroll), (0, 0));
+    for _ in 0..20 {
+      app.on_key(key(KeyCode::Char('j')));
+    }
+    assert_eq!((app.cursor, app.scroll), (10, 7));
+  }
+
+  #[test]
+  fn the_cursor_moves_by_row_in_the_split_layout() {
+    let mut app = ready(vec![mixed_file()], 20);
+    app.layout = Layout::Split;
+    // Split rows: 0 header, 1 keep, 2 r1|a1, 3 r2, 4 r3, 5 header, 6 x, 7 y.
+    for _ in 0..20 {
+      app.on_key(key(KeyCode::Char('j')));
+    }
+    assert_eq!(app.cursor, 7);
+  }
+
+  #[test]
+  fn the_cursor_stays_on_its_line_when_the_layout_changes() {
+    let mut app = ready(vec![mixed_file()], 20);
+    app.cursor = 7; // unified: line "x" of the second hunk
+    app.on_key(key(KeyCode::Char('s')));
+    assert_eq!(app.cursor, 6);
+    app.on_key(key(KeyCode::Char('s')));
+    assert_eq!(app.cursor, 7);
+  }
+
+  #[test]
+  fn the_hunk_comes_from_the_cursor_row() {
+    let mut app = ready(vec![mixed_file()], 20);
+    for (layout, rows) in [
+      (Layout::Unified, [0, 5, 6, 8]),
+      (Layout::Split, [0, 4, 5, 7]),
+    ] {
+      app.layout = layout;
+      let hunks: Vec<_> = rows
+        .iter()
+        .map(|&row| {
+          app.cursor = row;
+          app.cursor_hunk()
+        })
+        .collect();
+      assert_eq!(hunks, [Some(0), Some(0), Some(1), Some(1)], "{layout:?}");
+    }
+    assert_eq!(App::default().cursor_hunk(), None);
+  }
+
+  #[test]
+  fn changing_file_puts_the_cursor_back_at_the_top() {
+    let mut app = ready(vec![file("a", 10), file("b", 10)], 4);
+    app.on_key(key(KeyCode::Char('j')));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.cursor, 0);
+  }
+
+  #[test]
   fn paging_moves_by_viewport_and_half_viewport() {
     let mut app = ready(vec![file("a", 30)], 10);
     app.on_key(key(KeyCode::PageDown));
@@ -760,11 +929,13 @@ mod tests {
     ] {
       app.layout = Layout::Unified;
       app.scroll = unified;
+      app.cursor = unified;
       app.on_key(key(KeyCode::Char('s')));
       assert_eq!(app.layout, Layout::Split);
       assert_eq!(app.scroll, split, "unified row {unified}");
     }
     app.scroll = 6;
+    app.cursor = 6;
     app.on_key(key(KeyCode::Char('s')));
     assert_eq!(app.layout, Layout::Unified);
     assert_eq!(app.scroll, 7);
@@ -941,6 +1112,7 @@ mod tests {
   fn the_expand_key_asks_for_the_file_then_reveals_the_gap_at_the_top() {
     let mut app = ready(vec![gapped_file()], 5);
     app.scroll = 2;
+    app.cursor = 2;
     app.on_key(key(KeyCode::Char('e')));
     assert_eq!(app.take_sides_request(), Some(0));
     assert_eq!(app.take_sides_request(), None);
@@ -964,6 +1136,16 @@ mod tests {
       ]
     );
     assert_eq!(app.scroll, 2);
+  }
+
+  #[test]
+  fn expanding_keeps_the_viewport_and_the_cursor_inside_it() {
+    let mut app = ready(vec![gapped_file()], 5);
+    app.cursor = 4;
+    app.on_key(key(KeyCode::Char('e')));
+    app.on_sides(0, gapped_sides());
+    assert_eq!(app.scroll, 0);
+    assert!((app.scroll..app.scroll + 5).contains(&app.cursor));
   }
 
   #[test]

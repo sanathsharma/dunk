@@ -16,21 +16,20 @@ const REMOVED_BG: Color = Color::Rgb(66, 24, 28);
 const ADDED_WORD_BG: Color = Color::Rgb(30, 100, 52);
 const REMOVED_WORD_BG: Color = Color::Rgb(128, 40, 46);
 
-const HELP: &str = " j/k scroll  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  e expand  q quit";
+const HELP: &str = " j/k move  space/PgDn page  ctrl-d/u half page  g/G top/bottom  n/p file  s split/unified  e expand  q quit";
+
+const CURRENT_HUNK_BG: Color = Color::Rgb(48, 54, 80);
 
 enum Row<'a> {
-  Header(&'a Hunk),
-  Line(&'a DiffLine, Option<&'a Styled>, &'a [Range<usize>]),
+  /// A hunk header, and whether the cursor is in that hunk.
+  Header(&'a Hunk, bool),
+  Line(&'a DiffLine, Option<&'a Styled>, &'a [Range<usize>], bool),
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
   let [main, footer] =
     Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-  let footer_text = match &app.notice {
-    Some(notice) => Paragraph::new(format!(" {notice}")).style(Style::new().fg(Color::Yellow)),
-    None => Paragraph::new(HELP).style(Style::new().fg(Color::DarkGray)),
-  };
-  frame.render_widget(footer_text, footer);
+  frame.render_widget(Paragraph::new(footer_line(app)), footer);
 
   if let Load::Failed(message) = &app.load {
     let text = Paragraph::new(format!("Error: {message}")).style(Style::new().fg(Color::Red));
@@ -49,6 +48,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     Layout::horizontal([Constraint::Length(list_width), Constraint::Min(1)]).areas(main);
   render_files(frame, list, app);
   render_diff(frame, diff, app);
+}
+
+/// The mode at the left, then the notice or the key help.
+fn footer_line(app: &App) -> Line<'static> {
+  let mode = Span::styled(
+    format!(" {} ", app.mode.label()),
+    Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+  );
+  let rest = match &app.notice {
+    Some(notice) => Span::styled(format!(" {notice}"), Style::new().fg(Color::Yellow)),
+    None => Span::styled(HELP, Style::new().fg(Color::DarkGray)),
+  };
+  Line::from(vec![mode, rest])
 }
 
 fn message(frame: &mut Frame, area: Rect, text: &str) {
@@ -137,6 +149,15 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   }
 
   let width = gutter_width(file);
+  let current = app.cursor_hunk();
+  let cursor = app.cursor.saturating_sub(app.scroll);
+  let mark = |i: usize, line: Line<'static>| {
+    if i == cursor {
+      line.patch_style(Modifier::REVERSED)
+    } else {
+      line
+    }
+  };
   let hunks = file.hunks.iter().enumerate();
   let line_of = |hi: usize, li: usize| {
     let h = &file.hunks[hi];
@@ -154,13 +175,15 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         .flat_map(|(hi, h)| {
           let lines = (0..h.lines.len()).map(move |li| {
             let (l, styled, ranges) = line_of(hi, li);
-            Row::Line(l, styled, ranges)
+            Row::Line(l, styled, ranges, current == Some(hi))
           });
-          std::iter::once(Row::Header(h)).chain(lines)
+          std::iter::once(Row::Header(h, current == Some(hi))).chain(lines)
         })
         .skip(app.scroll)
         .take(app.viewport)
         .map(|row| row_line(row, width, usize::from(inner.width)))
+        .enumerate()
+        .map(|(i, line)| mark(i, line))
         .collect::<Vec<_>>();
       frame.render_widget(Paragraph::new(rows), inner);
     }
@@ -181,14 +204,21 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
             "{:>width$} ",
             number.map_or(String::new(), |n| n.to_string())
           );
-          line_spans(l, styled, ranges, gutter, usize::from(fill))
+          line_spans(
+            l,
+            styled,
+            ranges,
+            gutter,
+            usize::from(fill),
+            current == Some(hi),
+          )
         }
         None => Line::raw(""),
       };
       let rows: Vec<(Line, Line)> = hunks
         .flat_map(|(hi, h)| {
-          let header = Row::Header(h);
-          let header = (row_line(header, width, 0), Line::raw(""));
+          let header = Row::Header(h, current == Some(hi));
+          let header = (row_line(header, width, left_width.into()), Line::raw(""));
           let pairs = pairs(h).into_iter().map(move |(l, r)| {
             (
               side(l, hi, false, left_width),
@@ -199,6 +229,8 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .skip(app.scroll)
         .take(app.viewport)
+        .enumerate()
+        .map(|(i, (l, r))| (mark(i, l), mark(i, r)))
         .collect();
       let (left, right): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
       frame.render_widget(Paragraph::new(left), left_area);
@@ -239,21 +271,31 @@ fn gutter_width(file: &FileDiff) -> usize {
 /// `fill` pads changed lines to the pane width so their background spans it.
 fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
   match row {
-    Row::Header(h) => Line::styled(
+    Row::Header(h, current) => Line::styled(
       format!(
-        "@@ -{},{} +{},{} @@ {}",
-        h.old_start,
-        h.old_len,
-        h.new_start,
-        h.new_len,
-        sanitize(&h.heading)
+        "{:<fill$}",
+        format!(
+          "@@ -{},{} +{},{} @@ {}",
+          h.old_start,
+          h.old_len,
+          h.new_start,
+          h.new_len,
+          sanitize(&h.heading)
+        )
       ),
-      Style::new().fg(Color::Cyan),
+      if current {
+        Style::new()
+          .fg(Color::Cyan)
+          .bg(CURRENT_HUNK_BG)
+          .add_modifier(Modifier::BOLD)
+      } else {
+        Style::new().fg(Color::Cyan)
+      },
     ),
-    Row::Line(l, styled, changed) => {
+    Row::Line(l, styled, changed, current) => {
       let no = |n: Option<u32>| n.map_or(String::new(), |n| n.to_string());
       let gutter = format!("{:>width$} {:>width$} ", no(l.old_no), no(l.new_no));
-      line_spans(l, styled, changed, gutter, fill)
+      line_spans(l, styled, changed, gutter, fill, current)
     }
   }
 }
@@ -266,14 +308,20 @@ fn line_spans(
   changed: &[Range<usize>],
   gutter: String,
   fill: usize,
+  current: bool,
 ) -> Line<'static> {
   let (marker, style, word_bg) = match l.kind {
     LineKind::Context => (' ', Style::new(), None),
     LineKind::Added => ('+', Style::new().bg(ADDED_BG), Some(ADDED_WORD_BG)),
     LineKind::Removed => ('-', Style::new().bg(REMOVED_BG), Some(REMOVED_WORD_BG)),
   };
+  let gutter_color = if current {
+    Color::Gray
+  } else {
+    Color::DarkGray
+  };
   let mut spans = vec![
-    Span::styled(gutter, Style::new().fg(Color::DarkGray)),
+    Span::styled(gutter, Style::new().fg(gutter_color)),
     Span::raw(marker.to_string()),
   ];
   let plain;
@@ -402,6 +450,50 @@ new file mode 100644
       .enumerate()
       .find(|(_, r)| r.contains(needle))
       .unwrap_or_else(|| panic!("no row contains {needle:?} in {rows:#?}"))
+  }
+
+  #[test]
+  fn the_footer_shows_the_mode_at_the_left_and_notices_beside_it() {
+    let mut app = app_with(DIFF);
+    let (_, rows) = draw(&mut app, 100, 8);
+    assert!(rows[7].starts_with("\" NORMAL  j/k move"), "{}", rows[7]);
+    app.notice = Some("No unchanged lines to show here".into());
+    let (_, rows) = draw(&mut app, 100, 8);
+    assert!(
+      rows[7].starts_with("\" NORMAL  No unchanged lines to show here"),
+      "{}",
+      rows[7]
+    );
+  }
+
+  #[test]
+  fn the_hunk_under_the_cursor_is_highlighted_and_the_cursor_line_reversed() {
+    let mut app =
+      app_with("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d\n");
+    let (terminal, rows) = draw(&mut app, 60, 12);
+    let buffer = terminal.backend().buffer();
+    let bg = |rows: &[String], needle: &str| {
+      let (y, row) = row_with(rows, needle);
+      let x = row.find(needle).unwrap() as u16;
+      buffer[(x, y as u16)].bg
+    };
+    assert_eq!(bg(&rows, "@@ -1,1"), CURRENT_HUNK_BG);
+    assert_ne!(bg(&rows, "@@ -9,1"), CURRENT_HUNK_BG);
+    let (y, _) = row_with(&rows, "@@ -1,1");
+    assert!(buffer[(5, y as u16)].modifier.contains(Modifier::REVERSED));
+
+    for _ in 0..3 {
+      app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    }
+    let (terminal, rows) = draw(&mut app, 60, 12);
+    let buffer = terminal.backend().buffer();
+    let (y, row) = row_with(&rows, "@@ -9,1");
+    assert_eq!(
+      buffer[(row.find("@@").unwrap() as u16, y as u16)].bg,
+      CURRENT_HUNK_BG
+    );
+    let (y, _) = row_with(&rows, "@@ -1,1");
+    assert_ne!(buffer[(5, y as u16)].bg, CURRENT_HUNK_BG);
   }
 
   #[test]
