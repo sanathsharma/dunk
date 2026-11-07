@@ -764,6 +764,32 @@ mod tests {
   }
 
   #[test]
+  fn reads_the_old_side_from_the_revision_and_the_new_side_from_disk() {
+    let d = repo();
+    write(d.path(), "a.txt", "one\ntwo\n");
+    commit_all(d.path(), "one");
+    write(d.path(), "a.txt", "one\ntwo\nthree\n");
+    commit_all(d.path(), "two");
+    write(d.path(), "a.txt", "uncommitted\n");
+    let git = Git::new(d.path());
+
+    let request = DiffRequest::default();
+    let file = git.diff(&request).unwrap().remove(0);
+    let sides = git.sides(&request, &file);
+    assert_eq!(sides.old.as_deref(), Some(&b"one\ntwo\nthree\n"[..]));
+    assert_eq!(sides.new.as_deref(), Some(&b"uncommitted\n"[..]));
+
+    let request = DiffRequest {
+      revisions: vec!["HEAD~1".into()],
+      ..DiffRequest::default()
+    };
+    let file = git.diff(&request).unwrap().remove(0);
+    let sides = git.sides(&request, &file);
+    assert_eq!(sides.old.as_deref(), Some(&b"one\ntwo\n"[..]));
+    assert_eq!(sides.new.as_deref(), Some(&b"uncommitted\n"[..]));
+  }
+
+  #[test]
   fn names_committed_and_staged_versions_by_object_id_and_working_files_by_content() {
     let d = repo();
     write(d.path(), "a.rs", "fn a() {}\n");

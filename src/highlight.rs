@@ -355,6 +355,24 @@ diff --git a/a.rs b/a.rs
   }
 
   #[test]
+  fn expanded_lines_are_colored_from_the_whole_file() {
+    let diff =
+      "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -4 +4 @@\n-let x = 0;\n+let x = 1;\n";
+    let mut file = parse(diff.as_bytes()).unwrap().remove(0);
+    let old = b"/* start\nmiddle\nend */\nlet x = 0;\n";
+    let new = b"/* start\nmiddle\nend */\nlet x = 1;\n";
+    file.expand(0, new);
+    let h = highlighter().diff(&file, &sides(Some(old), Some(new)));
+    let lines = &h.hunks[0];
+    assert_eq!(lines.len(), 5);
+    // "middle" is only a comment because the highlighter saw the line above.
+    let comment = colors(lines[0].as_ref().unwrap());
+    assert_eq!(colors(lines[1].as_ref().unwrap()), comment);
+    assert_eq!(colors(lines[2].as_ref().unwrap()), comment);
+    assert_ne!(colors(lines[4].as_ref().unwrap()), comment);
+  }
+
+  #[test]
   fn missing_versions_leave_lines_uncolored() {
     let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b\n";
     let file = parse(diff.as_bytes()).unwrap().remove(0);

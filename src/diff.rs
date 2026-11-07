@@ -80,6 +80,86 @@ impl FileDiff {
       .filter(|l| l.kind == kind)
       .count()
   }
+
+  /// Reveals the unchanged lines of gap `gap` as context. Gap `i` lies above
+  /// hunk `i`, so gap 0 is the top of the file and gap `hunks.len()` the
+  /// bottom. Revealing a gap between two hunks merges them. `text` is the
+  /// file after the change. A gap that is out of range or already empty is
+  /// left alone.
+  pub fn expand(&mut self, gap: usize, text: &[u8]) {
+    let hunks = &self.hunks;
+    if gap > hunks.len() {
+      return;
+    }
+    let mut file: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
+    let ends_with_newline = file.last().is_some_and(|l| l.is_empty());
+    if ends_with_newline {
+      file.pop();
+    }
+    let total = file.len() as u32;
+    let above = gap.checked_sub(1).map(|i| &hunks[i]);
+    let below = hunks.get(gap);
+    let lo = above.map_or(1, |h| h.last_new() + 1);
+    let hi = below.map_or(total, |h| h.first_new() - 1).min(total);
+    if lo > hi {
+      return;
+    }
+    // Old line numbers trail the new ones by the same amount across a gap.
+    let delta = match (above, below) {
+      (Some(h), _) => i64::from(h.last_old()) - i64::from(h.last_new()),
+      (None, Some(h)) => i64::from(h.first_old()) - i64::from(h.first_new()),
+      (None, None) => return,
+    };
+    let (has_above, has_below) = (above.is_some(), below.is_some());
+    let revealed = (lo..=hi).map(|new_no| Line {
+      kind: LineKind::Context,
+      old_no: u32::try_from(i64::from(new_no) + delta).ok(),
+      new_no: Some(new_no),
+      content: file[new_no as usize - 1].to_vec(),
+      no_newline: !ends_with_newline && new_no == total,
+    });
+    let at = gap.saturating_sub(1);
+    let mut hunk = self.hunks.remove(at);
+    if has_above {
+      hunk.lines.extend(revealed);
+    } else {
+      hunk.lines.splice(0..0, revealed);
+    }
+    if has_above && has_below {
+      hunk.lines.extend(self.hunks.remove(at).lines);
+    }
+    let old = hunk.lines.iter().filter_map(|l| l.old_no);
+    let new = hunk.lines.iter().filter_map(|l| l.new_no);
+    hunk.old_start = old.clone().next().unwrap_or(hunk.old_start);
+    hunk.old_len = old.count() as u32;
+    hunk.new_start = new.clone().next().unwrap_or(hunk.new_start);
+    hunk.new_len = new.count() as u32;
+    self.hunks.insert(at, hunk);
+  }
+}
+
+impl Hunk {
+  /// The first line the hunk covers on the old side. A hunk with no lines on a
+  /// side names the line before it, so its first line is the next one.
+  fn first_old(&self) -> u32 {
+    self.old_start + u32::from(self.old_len == 0)
+  }
+
+  fn first_new(&self) -> u32 {
+    self.new_start + u32::from(self.new_len == 0)
+  }
+
+  fn last_old(&self) -> u32 {
+    (self.old_start + self.old_len)
+      .saturating_sub(1)
+      .max(self.old_start)
+  }
+
+  fn last_new(&self) -> u32 {
+    (self.new_start + self.new_len)
+      .saturating_sub(1)
+      .max(self.new_start)
+  }
 }
 
 #[derive(Debug)]
@@ -413,6 +493,87 @@ index 111..222 100644
     );
     assert_eq!(f.count(LineKind::Added), 3);
     assert_eq!(f.count(LineKind::Removed), 2);
+  }
+
+  /// The new side of `MODIFIED`: 22 lines named `l1` to `l22`.
+  fn new_text() -> Vec<u8> {
+    (1..=22)
+      .map(|n| format!("l{n}\n"))
+      .collect::<String>()
+      .into_bytes()
+  }
+
+  #[test]
+  fn expanding_a_gap_between_hunks_merges_them_and_keeps_line_numbers() {
+    let mut f = one(MODIFIED);
+    f.expand(1, &new_text());
+    assert_eq!(f.hunks.len(), 1);
+    let h = &f.hunks[0];
+    assert_eq!(
+      (h.old_start, h.old_len, h.new_start, h.new_len),
+      (1, 20, 1, 21)
+    );
+    assert_eq!(h.heading, b"fn main() {");
+    let revealed: Vec<_> = h
+      .lines
+      .iter()
+      .filter(|l| l.kind == LineKind::Context && l.new_no > Some(5) && l.new_no < Some(21))
+      .collect();
+    assert_eq!(revealed.len(), 15);
+    assert_eq!(revealed[0].content, b"l6");
+    assert_eq!((revealed[0].old_no, revealed[0].new_no), (Some(5), Some(6)));
+    assert_eq!(revealed[14].content, b"l20");
+    assert_eq!(
+      (revealed[14].old_no, revealed[14].new_no),
+      (Some(19), Some(20))
+    );
+    // The hunk after the gap keeps its own numbers.
+    let last = h.lines.last().unwrap();
+    assert_eq!(
+      (last.kind, last.old_no, last.new_no),
+      (LineKind::Added, None, Some(21))
+    );
+  }
+
+  #[test]
+  fn expanding_the_top_and_bottom_extends_the_first_and_last_hunk() {
+    let mut f = one(MODIFIED);
+    f.expand(2, &new_text());
+    let last = &f.hunks[1];
+    assert_eq!(
+      (last.old_start, last.old_len, last.new_start, last.new_len),
+      (20, 2, 21, 2)
+    );
+    assert_eq!(last.lines[2].content, b"l22");
+    assert_eq!(
+      (last.lines[2].old_no, last.lines[2].new_no),
+      (Some(21), Some(22))
+    );
+    let mut text = new_text();
+    text.extend(b"l23");
+    f.expand(2, &text);
+    assert_eq!(f.hunks[1].lines.last().unwrap().content, b"l23");
+    assert!(f.hunks[1].lines.last().unwrap().no_newline);
+
+    let mut top = one("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3 +3 @@\n-x\n+y\n");
+    top.expand(0, b"a\nb\ny\n");
+    let h = &top.hunks[0];
+    assert_eq!(
+      (h.old_start, h.old_len, h.new_start, h.new_len),
+      (1, 3, 1, 3)
+    );
+    assert_eq!((h.lines[0].old_no, h.lines[0].new_no), (Some(1), Some(1)));
+    assert_eq!(h.lines[1].content, b"b");
+  }
+
+  #[test]
+  fn expanding_an_empty_or_unknown_gap_changes_nothing() {
+    let mut f = one(MODIFIED);
+    f.expand(0, &new_text());
+    let before = f.clone();
+    f.expand(0, &new_text());
+    f.expand(9, &new_text());
+    assert_eq!(f, before);
   }
 
   #[test]

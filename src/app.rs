@@ -4,7 +4,7 @@ use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
 use crate::split;
 use crate::ui;
-use crate::vcs::{self, DiffRequest, Vcs};
+use crate::vcs::{self, DiffRequest, Sides, Vcs};
 use crate::watch::Watch;
 use crate::worker::Worker;
 use ratatui::DefaultTerminal;
@@ -27,6 +27,9 @@ pub enum Event {
   Changed,
   /// A highlight for a file of the load with this number.
   Highlighted(u64, usize, FileHighlight),
+  /// The full contents of a file of the load with this number, read for an
+  /// expansion.
+  Sides(u64, usize, Arc<Sides>),
   InputFailed(io::Error),
 }
 
@@ -38,7 +41,22 @@ pub enum Load {
 
 pub struct App {
   pub load: Load,
+  /// The files as shown, with any expanded gaps.
   pub files: Arc<Vec<FileDiff>>,
+  /// The files as git reported them, without expansion.
+  pub loaded: Arc<Vec<FileDiff>>,
+  /// Full file contents per file, parallel to `files`. `None` until the
+  /// first expansion of that file asks for them.
+  sides: Vec<Option<Arc<Sides>>>,
+  /// Which files `take_sides_request` already handed out.
+  sides_requested: Vec<bool>,
+  /// An expansion waiting for its file contents: the file and the gaps to
+  /// try, best first.
+  pending_expand: Option<(usize, [usize; 2])>,
+  /// Which files have expanded gaps, so their original highlights are stale.
+  expanded: Vec<bool>,
+  /// Recolors a file after an expansion. `None` leaves diffs uncolored.
+  pub highlighter: Option<Arc<Highlighter>>,
   /// Colors per file, parallel to `files`. `None` until the worker delivers.
   pub highlights: Vec<Option<FileHighlight>>,
   /// Changed word ranges per file, hunk and line, filled when a file is first
@@ -59,6 +77,12 @@ impl Default for App {
     App {
       load: Load::Loading,
       files: Arc::new(Vec::new()),
+      loaded: Arc::new(Vec::new()),
+      sides: Vec::new(),
+      sides_requested: Vec::new(),
+      pending_expand: None,
+      expanded: Vec::new(),
+      highlighter: None,
       highlights: Vec::new(),
       words: Vec::new(),
       layout: Layout::Unified,
@@ -140,7 +164,7 @@ impl App {
       }
     };
     self.load = Load::Ready;
-    if *self.files == files {
+    if *self.loaded == files {
       return false;
     }
     let kept = self
@@ -150,8 +174,13 @@ impl App {
     let scroll = if kept.is_some() { self.scroll } else { 0 };
     self.highlights = files.iter().map(|_| None).collect();
     self.words = files.iter().map(|_| None).collect();
+    self.sides = files.iter().map(|_| None).collect();
+    self.sides_requested = vec![false; files.len()];
+    self.expanded = vec![false; files.len()];
+    self.pending_expand = None;
     let index = kept.unwrap_or(self.selected.min(files.len().saturating_sub(1)));
-    self.files = Arc::new(files);
+    self.loaded = Arc::new(files);
+    self.files = self.loaded.clone();
     self.select(index);
     self.scroll = scroll;
     self.clamp_scroll();
@@ -159,8 +188,34 @@ impl App {
   }
 
   pub fn on_highlighted(&mut self, index: usize, highlight: FileHighlight) {
-    if let Some(slot) = self.highlights.get_mut(index) {
+    // A highlight made for the unexpanded file would not fit its lines.
+    if self.expanded.get(index) == Some(&false)
+      && let Some(slot) = self.highlights.get_mut(index)
+    {
       *slot = Some(highlight);
+    }
+  }
+
+  /// Takes the file whose full contents an expansion is waiting for. Each
+  /// file is handed out once, until a reload replaces it.
+  pub fn take_sides_request(&mut self) -> Option<usize> {
+    let (index, _) = self.pending_expand?;
+    let requested = self.sides_requested.get_mut(index)?;
+    (!std::mem::replace(requested, true)).then_some(index)
+  }
+
+  /// Takes the full contents of a file and finishes the expansion waiting
+  /// for them.
+  pub fn on_sides(&mut self, index: usize, sides: Arc<Sides>) {
+    let Some(slot) = self.sides.get_mut(index) else {
+      return;
+    };
+    *slot = Some(sides.clone());
+    if let Some((wanted, gaps)) = self.pending_expand
+      && wanted == index
+    {
+      self.pending_expand = None;
+      self.reveal(index, &sides, gaps);
     }
   }
 
@@ -182,6 +237,7 @@ impl App {
       KeyCode::Char('g') | KeyCode::Home => self.scroll = 0,
       KeyCode::Char('G') | KeyCode::End => self.scroll = self.max_scroll(),
       KeyCode::Char('s') => self.toggle_layout(),
+      KeyCode::Char('e') => self.expand_at_top(),
       KeyCode::Tab | KeyCode::Char('n') => self.select_by(1),
       KeyCode::BackTab | KeyCode::Char('p') => self.select_by(-1),
       _ => {}
@@ -217,6 +273,55 @@ impl App {
     self.clamp_scroll();
   }
 
+  /// Reveals the unchanged lines next to the hunk at the top of the pane:
+  /// the gap above it when the top row is in its first half, the gap below
+  /// otherwise. An empty gap falls back to the other one. The scroll position
+  /// stays, so the revealed lines appear where the hunk edge was.
+  fn expand_at_top(&mut self) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    let Some((hunk, line)) = locate(file, self.layout, self.scroll) else {
+      return;
+    };
+    let lower_half = line.is_some_and(|l| l >= file.hunks[hunk].lines.len().div_ceil(2));
+    let gaps = if lower_half {
+      [hunk + 1, hunk]
+    } else {
+      [hunk, hunk + 1]
+    };
+    match self.sides.get(self.selected).cloned().flatten() {
+      Some(sides) => self.reveal(self.selected, &sides, gaps),
+      None => self.pending_expand = Some((self.selected, gaps)),
+    }
+  }
+
+  /// Expands the first of `gaps` that has lines to show.
+  fn reveal(&mut self, index: usize, sides: &Sides, gaps: [usize; 2]) {
+    let Some(text) = sides.new.as_deref() else {
+      return;
+    };
+    let files = Arc::make_mut(&mut self.files);
+    let lines = |f: &FileDiff| f.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
+    let before = lines(&files[index]);
+    for gap in gaps {
+      files[index].expand(gap, text);
+      if lines(&files[index]) != before {
+        break;
+      }
+    }
+    if lines(&files[index]) == before {
+      return;
+    }
+    self.expanded[index] = true;
+    self.words[index] = None;
+    self.highlights[index] = self
+      .highlighter
+      .as_ref()
+      .map(|h| h.diff(&self.files[index], sides));
+    self.clamp_scroll();
+  }
+
   fn scroll_by(&mut self, delta: isize) {
     self.scroll = self.scroll.saturating_add_signed(delta);
     self.clamp_scroll();
@@ -248,6 +353,21 @@ fn spawn_load(
 ) {
   thread::spawn(move || {
     let _ = tx.send(Event::Loaded(id, vcs.diff(&request)));
+  });
+}
+
+/// Reads both versions of a file off the UI thread for an expansion.
+fn spawn_sides(
+  vcs: Arc<impl Vcs + Send + Sync + 'static>,
+  request: DiffRequest,
+  files: Arc<Vec<FileDiff>>,
+  index: usize,
+  id: u64,
+  tx: Sender<Event>,
+) {
+  thread::spawn(move || {
+    let sides = vcs.sides(&request, &files[index]);
+    let _ = tx.send(Event::Sides(id, index, Arc::new(sides)));
   });
 }
 
@@ -300,6 +420,7 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   let highlighter = theme
     .and_then(|theme| Highlighter::new(&theme).ok())
     .map(Arc::new);
+  app.highlighter = highlighter.clone();
   let mut worker: Option<Worker> = None;
   while !app.quit {
     terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -321,7 +442,7 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
               Worker::spawn(
                 vcs.clone(),
                 request.clone(),
-                app.files.clone(),
+                app.loaded.clone(),
                 highlighter,
                 app.selected,
                 move |i, h| tx.send(Event::Highlighted(id, i, h)).is_ok(),
@@ -334,8 +455,20 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
         app.on_highlighted(index, highlight)
       }
       Ok(Event::Highlighted(..)) => {}
+      Ok(Event::Sides(id, index, sides)) if id == applied => app.on_sides(index, sides),
+      Ok(Event::Sides(..)) => {}
       Ok(Event::InputFailed(e)) => return Err(e),
       Err(_) => break,
+    }
+    if let Some(index) = app.take_sides_request() {
+      spawn_sides(
+        vcs.clone(),
+        request.clone(),
+        app.loaded.clone(),
+        index,
+        applied,
+        tx.clone(),
+      );
     }
     if let Some(worker) = &worker {
       worker.focus(app.selected);
@@ -347,7 +480,8 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::diff::{FileStatus, Hunk, Line, LineKind};
+  use crate::diff::{FileStatus, Hunk, Line, LineKind, parse};
+  use crate::vcs::Sides;
   use std::path::{Path, PathBuf};
 
   fn file(name: &str, lines: usize) -> FileDiff {
@@ -612,6 +746,73 @@ mod tests {
     assert!(!app.on_loaded(Ok(vec![file("a", 5), file("b", 5)])));
     assert!(matches!(app.load, Load::Ready));
     assert_eq!(app.selected, 1);
+  }
+
+  /// Two hunks with four unchanged lines (`d` to `g`) between them.
+  fn gapped_file() -> FileDiff {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n";
+    parse(diff.as_bytes()).unwrap().remove(0)
+  }
+
+  fn gapped_sides() -> Arc<Sides> {
+    Arc::new(Sides {
+      new: Some(b"a\nB\nc\nd\ne\nf\ng\nh\nI\n".to_vec()),
+      ..Sides::default()
+    })
+  }
+
+  #[test]
+  fn the_expand_key_asks_for_the_file_then_reveals_the_gap_at_the_top() {
+    let mut app = ready(vec![gapped_file()], 5);
+    app.scroll = 2;
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.take_sides_request(), Some(0));
+    assert_eq!(app.take_sides_request(), None);
+    assert_eq!(app.files[0].hunks.len(), 2);
+
+    app.on_sides(0, gapped_sides());
+    let hunks = &app.files[0].hunks;
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(row_count(&app.files[0], Layout::Unified), 1 + 11);
+    let numbers: Vec<_> = hunks[0].lines[4..8]
+      .iter()
+      .map(|l| (l.old_no, l.new_no))
+      .collect();
+    assert_eq!(
+      numbers,
+      [
+        (Some(4), Some(4)),
+        (Some(5), Some(5)),
+        (Some(6), Some(6)),
+        (Some(7), Some(7))
+      ]
+    );
+    assert_eq!(app.scroll, 2);
+  }
+
+  #[test]
+  fn expanding_again_uses_the_file_already_read_and_a_reload_keeps_it() {
+    let mut app = ready(vec![gapped_file()], 20);
+    app.on_key(key(KeyCode::Char('e')));
+    app.on_sides(0, gapped_sides());
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.take_sides_request(), None);
+    assert!(!app.on_loaded(Ok(vec![gapped_file()])));
+    assert_eq!(app.files[0].hunks.len(), 1);
+
+    let mut other = gapped_file();
+    other.hunks.pop();
+    assert!(app.on_loaded(Ok(vec![other])));
+    assert_eq!(app.files[0].hunks.len(), 1);
+    assert_eq!(app.files[0].hunks[0].lines.len(), 4);
+  }
+
+  #[test]
+  fn an_unreadable_file_leaves_the_diff_as_it_was() {
+    let mut app = ready(vec![gapped_file()], 20);
+    app.on_key(key(KeyCode::Char('e')));
+    app.on_sides(0, Arc::new(Sides::default()));
+    assert_eq!(app.files[0], gapped_file());
   }
 
   #[test]
