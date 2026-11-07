@@ -1,8 +1,10 @@
 mod app;
 mod args;
 mod diff;
+mod highlight;
 mod ui;
 mod vcs;
+mod worker;
 
 use std::error::Error;
 use std::io::{self, IsTerminal};
@@ -23,8 +25,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         context: args.context,
     };
 
+    let theme = (!args.no_syntax).then(|| {
+        args.theme
+            .unwrap_or_else(|| highlight::DEFAULT_THEME.to_string())
+    });
+
     let mut terminal = ratatui::try_init()?;
-    let result = app::run(&mut terminal, Git::new(dir), request);
+    let result = app::run(&mut terminal, Git::new(dir), request, theme);
     ratatui::try_restore()?;
     Ok(result?)
 }

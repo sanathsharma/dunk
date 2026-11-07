@@ -1,5 +1,6 @@
 use crate::app::{App, Load};
 use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind};
+use crate::highlight::Styled;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,7 +15,7 @@ const HELP: &str =
 
 enum Row<'a> {
     Header(&'a Hunk),
-    Line(&'a DiffLine),
+    Line(&'a DiffLine, Option<&'a Styled>),
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -92,6 +93,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     app.viewport = usize::from(inner.height);
     app.clamp_scroll();
     let file = &app.files[app.selected];
+    let colors = app.highlights.get(app.selected).and_then(Option::as_ref);
 
     if file.hunks.is_empty() {
         let text = if file.binary {
@@ -110,7 +112,14 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows = file
         .hunks
         .iter()
-        .flat_map(|h| std::iter::once(Row::Header(h)).chain(h.lines.iter().map(Row::Line)))
+        .enumerate()
+        .flat_map(|(hi, h)| {
+            let lines = h.lines.iter().enumerate().map(move |(li, l)| {
+                let styled = colors.and_then(|c| c.hunks.get(hi)?.get(li)?.as_ref());
+                Row::Line(l, styled)
+            });
+            std::iter::once(Row::Header(h)).chain(lines)
+        })
         .skip(app.scroll)
         .take(app.viewport)
         .map(|row| row_line(row, width, usize::from(inner.width)));
@@ -160,7 +169,7 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
             ),
             Style::new().fg(Color::Cyan),
         ),
-        Row::Line(l) => {
+        Row::Line(l, styled) => {
             let (marker, style) = match l.kind {
                 LineKind::Context => (' ', Style::new()),
                 LineKind::Added => ('+', Style::new().bg(ADDED_BG)),
@@ -172,8 +181,16 @@ fn row_line(row: Row, width: usize, fill: usize) -> Line<'static> {
                     format!("{:>width$} {:>width$} ", no(l.old_no), no(l.new_no)),
                     Style::new().fg(Color::DarkGray),
                 ),
-                Span::raw(format!("{marker}{}", sanitize(&l.content))),
+                Span::raw(marker.to_string()),
             ];
+            match styled {
+                Some(pieces) => spans.extend(
+                    pieces
+                        .iter()
+                        .map(|(style, text)| Span::styled(sanitize(text.as_bytes()), *style)),
+                ),
+                None => spans.push(Span::raw(sanitize(&l.content))),
+            }
             if l.no_newline {
                 spans.push(Span::styled(
                     " [no newline at end of file]",
@@ -304,6 +321,28 @@ new file mode 100644
         assert_eq!(buffer[(last_col, y as u16)].bg, REMOVED_BG);
         let (y, _) = row_with(&rows, " keep");
         assert_ne!(buffer[(last_col, y as u16)].bg, ADDED_BG);
+    }
+
+    #[test]
+    fn draws_uncolored_until_highlights_arrive_then_colors_the_code() {
+        use crate::highlight::FileHighlight;
+        let mut app = app_with(DIFF);
+        let (terminal, rows) = draw(&mut app, 80, 14);
+        let (y, row) = row_with(&rows, "+new");
+        let x = row[..row.find("+new").unwrap()].chars().count() as u16 + 1;
+        assert_eq!(terminal.backend().buffer()[(x, y as u16)].fg, Color::Reset);
+
+        let red = Style::new().fg(Color::Rgb(200, 1, 2));
+        let mut h = FileHighlight::default();
+        h.hunks = vec![vec![None, None, Some(vec![(red, "new".to_string())]), None]];
+        app.on_highlighted(0, h);
+        let (terminal, rows) = draw(&mut app, 80, 14);
+        let (y, row) = row_with(&rows, "+new");
+        let x = row[..row.find("+new").unwrap()].chars().count() as u16 + 1;
+        let cell = &terminal.backend().buffer()[(x, y as u16)];
+        assert_eq!(cell.fg, Color::Rgb(200, 1, 2));
+        assert_eq!(cell.bg, ADDED_BG);
+        assert!(rows.iter().any(|r| r.contains("-old")));
     }
 
     #[test]

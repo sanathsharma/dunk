@@ -80,7 +80,8 @@ fn command() -> Command {
             Arg::new("theme")
                 .long("theme")
                 .help("Syntax highlighting theme")
-                .value_name("NAME"),
+                .value_name("NAME")
+                .value_parser(crate::highlight::resolve_theme),
         )
         .arg(
             Arg::new("context")
@@ -170,6 +171,19 @@ mod tests {
                 .try_get_matches_from(["dunk", "--staged", "HEAD"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn theme_is_validated_and_canonicalized() {
+        assert_eq!(
+            parse_from(&["dunk", "--theme", "nord"]).theme.as_deref(),
+            Some("Nord")
+        );
+        let err = command()
+            .try_get_matches_from(["dunk", "--theme", "nope"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown theme 'nope'"), "{err}");
     }
 
     #[test]

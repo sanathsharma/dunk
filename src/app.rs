@@ -1,10 +1,13 @@
 use crate::diff::FileDiff;
+use crate::highlight::FileHighlight;
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Vcs};
+use crate::worker::Worker;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::io;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
@@ -12,6 +15,7 @@ pub enum Event {
     Key(KeyEvent),
     Resize,
     Loaded(Result<Vec<FileDiff>, vcs::Error>),
+    Highlighted(usize, FileHighlight),
     InputFailed(io::Error),
 }
 
@@ -23,7 +27,9 @@ pub enum Load {
 
 pub struct App {
     pub load: Load,
-    pub files: Vec<FileDiff>,
+    pub files: Arc<Vec<FileDiff>>,
+    /// Colors per file, parallel to `files`. `None` until the worker delivers.
+    pub highlights: Vec<Option<FileHighlight>>,
     pub selected: usize,
     pub list_state: ListState,
     /// Index of the first visible row of the selected file's diff.
@@ -37,7 +43,8 @@ impl Default for App {
     fn default() -> Self {
         App {
             load: Load::Loading,
-            files: Vec::new(),
+            files: Arc::new(Vec::new()),
+            highlights: Vec::new(),
             selected: 0,
             list_state: ListState::default(),
             scroll: 0,
@@ -56,11 +63,18 @@ impl App {
     pub fn on_loaded(&mut self, result: Result<Vec<FileDiff>, vcs::Error>) {
         match result {
             Ok(files) => {
-                self.files = files;
+                self.highlights = files.iter().map(|_| None).collect();
+                self.files = Arc::new(files);
                 self.load = Load::Ready;
                 self.select(0);
             }
             Err(e) => self.load = Load::Failed(e.to_string()),
+        }
+    }
+
+    pub fn on_highlighted(&mut self, index: usize, highlight: FileHighlight) {
+        if let Some(slot) = self.highlights.get_mut(index) {
+            *slot = Some(highlight);
         }
     }
 
@@ -118,7 +132,7 @@ impl App {
 }
 
 /// Runs git off the UI thread and reports the result over the channel.
-fn spawn_load(vcs: impl Vcs + Send + 'static, request: DiffRequest, tx: Sender<Event>) {
+fn spawn_load(vcs: Arc<impl Vcs + Send + Sync + 'static>, request: DiffRequest, tx: Sender<Event>) {
     thread::spawn(move || {
         let _ = tx.send(Event::Loaded(vcs.diff(&request)));
     });
@@ -143,24 +157,48 @@ fn spawn_input(tx: Sender<Event>) {
     });
 }
 
-pub fn run(
+/// `theme` turns syntax highlighting on; `None` leaves diffs uncolored.
+pub fn run<V: Vcs + Send + Sync + 'static>(
     terminal: &mut DefaultTerminal,
-    vcs: impl Vcs + Send + 'static,
+    vcs: V,
     request: DiffRequest,
+    theme: Option<String>,
 ) -> io::Result<()> {
+    let vcs = Arc::new(vcs);
     let (tx, rx) = mpsc::channel();
     spawn_input(tx.clone());
-    spawn_load(vcs, request, tx);
+    spawn_load(vcs.clone(), request.clone(), tx.clone());
 
     let mut app = App::default();
+    let mut worker: Option<Worker> = None;
     while !app.quit {
         terminal.draw(|frame| ui::render(frame, &mut app))?;
         match rx.recv() {
             Ok(Event::Key(key)) => app.on_key(key),
             Ok(Event::Resize) => {}
-            Ok(Event::Loaded(result)) => app.on_loaded(result),
+            Ok(Event::Loaded(result)) => {
+                app.on_loaded(result);
+                worker = theme
+                    .clone()
+                    .filter(|_| !app.files.is_empty())
+                    .map(|theme| {
+                        let tx = tx.clone();
+                        Worker::spawn(
+                            vcs.clone(),
+                            request.clone(),
+                            app.files.clone(),
+                            theme,
+                            app.selected,
+                            move |i, h| tx.send(Event::Highlighted(i, h)).is_ok(),
+                        )
+                    });
+            }
+            Ok(Event::Highlighted(index, highlight)) => app.on_highlighted(index, highlight),
             Ok(Event::InputFailed(e)) => return Err(e),
             Err(_) => break,
+        }
+        if let Some(worker) = &worker {
+            worker.focus(app.selected);
         }
     }
     Ok(())
@@ -285,6 +323,15 @@ mod tests {
     }
 
     #[test]
+    fn highlights_attach_to_their_file() {
+        let mut app = ready(vec![file("a", 1), file("b", 1)], 5);
+        assert!(app.highlights.iter().all(Option::is_none));
+        app.on_highlighted(1, FileHighlight::default());
+        assert!(app.highlights[0].is_none() && app.highlights[1].is_some());
+        app.on_highlighted(9, FileHighlight::default());
+    }
+
+    #[test]
     fn quit_keys_stop_the_app() {
         for k in [
             key(KeyCode::Char('q')),
@@ -306,7 +353,7 @@ mod tests {
         assert!(!app.quit);
     }
 
-    struct Slow(mpsc::Receiver<()>);
+    struct Slow(std::sync::Mutex<mpsc::Receiver<()>>);
 
     impl Vcs for Slow {
         fn status(&self) -> Result<vcs::Status, vcs::Error> {
@@ -314,8 +361,12 @@ mod tests {
         }
 
         fn diff(&self, _: &DiffRequest) -> Result<Vec<FileDiff>, vcs::Error> {
-            self.0.recv().unwrap();
+            self.0.lock().unwrap().recv().unwrap();
             Ok(vec![file("slow", 1)])
+        }
+
+        fn sides(&self, _: &DiffRequest, _: &FileDiff) -> vcs::Sides {
+            vcs::Sides::default()
         }
     }
 
@@ -324,7 +375,11 @@ mod tests {
         let (release, gate) = mpsc::channel();
         let (tx, rx) = mpsc::channel();
         // Returns at once even though the backend blocks until released.
-        spawn_load(Slow(gate), DiffRequest::default(), tx);
+        spawn_load(
+            Arc::new(Slow(std::sync::Mutex::new(gate))),
+            DiffRequest::default(),
+            tx,
+        );
         assert!(rx.try_recv().is_err());
         release.send(()).unwrap();
         match rx.recv().unwrap() {

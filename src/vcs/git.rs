@@ -1,4 +1,4 @@
-use super::{ChangeKind, DiffRequest, Error, FileChange, Status, Vcs};
+use super::{ChangeKind, DiffRequest, Error, FileChange, Sides, Status, Vcs};
 use crate::args::Scope;
 use crate::diff::{FileDiff, parse};
 use std::ffi::OsStr;
@@ -60,6 +60,45 @@ impl Git {
         }
         let empty = self.run(["hash-object", "-t", "tree", "/dev/null"])?;
         Ok(String::from_utf8_lossy(&empty).trim().to_string())
+    }
+
+    /// Reads a file from a commit, the index or the working tree. The path is
+    /// relative to the repository root.
+    fn read(&self, root: &Path, source: &Source, file: &Path) -> Option<Vec<u8>> {
+        let spec = |prefix: &str| {
+            let mut spec = std::ffi::OsString::from(prefix);
+            spec.push(file);
+            spec
+        };
+        match source {
+            Source::WorkingTree => std::fs::read(root.join(file)).ok(),
+            Source::Index => self
+                .run([OsStr::new("cat-file"), OsStr::new("blob"), &spec(":")])
+                .ok(),
+            Source::Commit(rev) => self
+                .run([
+                    OsStr::new("cat-file"),
+                    OsStr::new("blob"),
+                    &spec(&format!("{rev}:")),
+                ])
+                .ok(),
+        }
+    }
+
+    /// Resolves `a...b` to the merge base of `a` and `b` on the old side.
+    fn resolve_range_base(&self, req: &DiffRequest, old: Source) -> Source {
+        let [range] = req.revisions.as_slice() else {
+            return old;
+        };
+        let Some((a, b)) = range.split_once("...") else {
+            return old;
+        };
+        let a = if a.is_empty() { "HEAD" } else { a };
+        let b = if b.is_empty() { "HEAD" } else { b };
+        match self.run(["merge-base", a, b]) {
+            Ok(out) => Source::Commit(String::from_utf8_lossy(&out).trim().to_string()),
+            Err(_) => old,
+        }
     }
 
     fn tracked_diff(&self, req: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
@@ -127,6 +166,31 @@ impl Git {
     }
 }
 
+/// Where one side of a diff reads its file from.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    Commit(String),
+    Index,
+    WorkingTree,
+}
+
+/// The sources of the old and new side for a request.
+fn sources(req: &DiffRequest, head: &str) -> (Source, Source) {
+    let commit = |rev: &str| Source::Commit(if rev.is_empty() { "HEAD" } else { rev }.to_string());
+    match req.revisions.as_slice() {
+        [] => match req.scope {
+            Scope::All => (Source::Commit(head.into()), Source::WorkingTree),
+            Scope::Staged => (Source::Commit(head.into()), Source::Index),
+            Scope::Unstaged => (Source::Index, Source::WorkingTree),
+        },
+        [range] => match range.split_once("...").or_else(|| range.split_once("..")) {
+            Some((a, b)) => (commit(a), commit(b)),
+            None => (commit(range), Source::WorkingTree),
+        },
+        [a, b, ..] => (commit(a), commit(b)),
+    }
+}
+
 fn git_error(out: &Output) -> Error {
     Error::Git(String::from_utf8_lossy(&out.stderr).trim().to_string())
 }
@@ -160,6 +224,24 @@ impl Vcs for Git {
             files.extend(self.untracked_diff(req)?);
         }
         Ok(files)
+    }
+
+    fn sides(&self, req: &DiffRequest, file: &FileDiff) -> Sides {
+        let (Ok(root), Ok(head)) = (self.root(), self.head()) else {
+            return Sides::default();
+        };
+        let (old, new) = sources(req, &head);
+        let old = self.resolve_range_base(req, old);
+        Sides {
+            old: file
+                .old_path
+                .as_deref()
+                .and_then(|p| self.read(&root, &old, p)),
+            new: file
+                .new_path
+                .as_deref()
+                .and_then(|p| self.read(&root, &new, p)),
+        }
     }
 }
 

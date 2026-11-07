@@ -97,7 +97,7 @@ impl Status {
 }
 
 /// What changeset to diff. With revisions the working tree scope is ignored.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DiffRequest {
     pub scope: Scope,
     pub revisions: Vec<String>,
@@ -105,7 +105,17 @@ pub struct DiffRequest {
     pub context: Option<u32>,
 }
 
+/// The full contents of a file on each side of a diff. A side is `None` when
+/// the file does not exist there or cannot be read.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Sides {
+    pub old: Option<Vec<u8>>,
+    pub new: Option<Vec<u8>>,
+}
+
 pub trait Vcs {
     fn status(&self) -> Result<Status, Error>;
     fn diff(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error>;
+    /// Reads both versions of `file` as `request` compared them.
+    fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;
 }
