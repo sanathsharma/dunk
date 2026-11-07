@@ -2,6 +2,7 @@ mod app;
 mod args;
 mod config;
 mod diff;
+mod editor;
 mod highlight;
 mod palette;
 mod split;
@@ -34,14 +35,10 @@ fn run() -> Result<(), Box<dyn Error>> {
   };
 
   let git = Git::new(dir);
-  let root = if settings.watch {
-    Some(git.root()?)
-  } else {
-    None
-  };
+  let root = git.root()?;
 
   let mut terminal = ratatui::try_init()?;
-  let result = app::run(&mut terminal, git, request, settings, root.as_deref());
+  let result = app::run(&mut terminal, git, request, settings, &root);
   ratatui::try_restore()?;
   Ok(result?)
 }

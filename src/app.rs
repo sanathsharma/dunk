@@ -1,6 +1,7 @@
 use crate::args::{Border, Layout};
 use crate::config::Settings;
 use crate::diff::{FileDiff, FileStatus, Hunk, Section};
+use crate::editor::Editor;
 use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
 use crate::palette::Palette;
@@ -17,9 +18,16 @@ use std::collections::BTreeSet;
 use std::io;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::Duration;
+
+/// How long the input thread waits for a key before checking whether it
+/// should step aside.
+const INPUT_POLL: Duration = Duration::from_millis(50);
 
 pub enum Event {
   Key(KeyEvent),
@@ -84,6 +92,13 @@ impl IndexRequest {
       (Target::Lines(hunk, lines), false) => vcs.unstage_lines(file, *hunk, lines),
     }
   }
+}
+
+/// A file, relative to the repository root, and the 1-based line to open it at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditRequest {
+  pub path: PathBuf,
+  pub line: u32,
 }
 
 pub enum Load {
@@ -161,6 +176,8 @@ pub struct App {
   follow: Option<Follow>,
   /// A short message for the footer, cleared by the next key press.
   pub notice: Option<String>,
+  /// The file and line `e` asked to open, until the run loop takes it.
+  edit: Option<EditRequest>,
   /// Colors per file, parallel to `files`. `None` until the worker delivers.
   pub highlights: Vec<Option<FileHighlight>>,
   /// Changed word ranges per file, hunk and line, filled when a file is first
@@ -201,6 +218,7 @@ impl Default for App {
       index_request: None,
       follow: None,
       notice: None,
+      edit: None,
       highlights: Vec::new(),
       words: Vec::new(),
       layout: Layout::Unified,
@@ -665,6 +683,7 @@ impl App {
         self.toggle_stage_hunk(None);
       }
       KeyCode::Char('v') => self.enter_visual(),
+      KeyCode::Char('e') => self.request_edit(),
       KeyCode::Tab | KeyCode::Char('n' | '}') => self.select_by(1),
       KeyCode::BackTab | KeyCode::Char('p' | '{') => self.select_by(-1),
       KeyCode::Char(']') => self.jump_hunk(1),
@@ -760,6 +779,40 @@ impl App {
     self.scroll = row_of(file, self.layout, target, None);
     self.cursor = self.scroll + 1;
     self.clamp_scroll();
+  }
+
+  /// Asks the run loop to open the cursor's file at the cursor's line. A
+  /// removed line has no line in the file, so it opens at the next line that
+  /// has one in the hunk, or the previous one when none follows.
+  fn request_edit(&mut self) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    if file.status == FileStatus::Deleted {
+      self.notice = Some("Cannot edit a deleted file".into());
+      return;
+    }
+    let Some((hunk, Some(index))) = locate(file, self.layout, self.cursor) else {
+      return;
+    };
+    let lines = &file.hunks[hunk].lines;
+    let new_no = |l: &crate::diff::Line| l.new_no;
+    let line = lines[index..]
+      .iter()
+      .find_map(new_no)
+      .or_else(|| lines[..index].iter().rev().find_map(new_no));
+    let Some(line) = line else {
+      self.notice = Some("No line of the file to open".into());
+      return;
+    };
+    self.edit = Some(EditRequest {
+      path: file.path().to_path_buf(),
+      line,
+    });
+  }
+
+  pub fn take_edit(&mut self) -> Option<EditRequest> {
+    self.edit.take()
   }
 
   /// The hunk under the cursor, as an index into the selected file's hunks.
@@ -1011,9 +1064,55 @@ fn spawn_sides(
   });
 }
 
-fn spawn_input(tx: Sender<Event>) {
+/// Lets the run loop take the keyboard from the input thread while an editor
+/// uses the terminal.
+#[derive(Default)]
+struct InputGate {
+  paused: AtomicBool,
+  /// Held by the input thread while it polls and reads.
+  reading: Mutex<()>,
+}
+
+impl InputGate {
+  /// Blocks until the input thread is out of its read, then keeps it out
+  /// until the guard drops.
+  fn pause(&self) -> PauseGuard<'_> {
+    self.paused.store(true, Ordering::SeqCst);
+    let held = self.reading.lock().unwrap_or_else(|e| e.into_inner());
+    PauseGuard {
+      gate: self,
+      _held: held,
+    }
+  }
+}
+
+struct PauseGuard<'a> {
+  gate: &'a InputGate,
+  _held: MutexGuard<'a, ()>,
+}
+
+impl Drop for PauseGuard<'_> {
+  fn drop(&mut self) {
+    self.gate.paused.store(false, Ordering::SeqCst);
+  }
+}
+
+fn spawn_input(tx: Sender<Event>, gate: Arc<InputGate>) {
   thread::spawn(move || {
     loop {
+      if gate.paused.load(Ordering::SeqCst) {
+        thread::sleep(INPUT_POLL);
+        continue;
+      }
+      let _reading = gate.reading.lock().unwrap_or_else(|e| e.into_inner());
+      match event::poll(INPUT_POLL) {
+        Ok(true) => {}
+        Ok(false) => continue,
+        Err(e) => {
+          let _ = tx.send(Event::InputFailed(e));
+          break;
+        }
+      }
       let event = match event::read() {
         Ok(event::Event::Key(key)) => Event::Key(key),
         Ok(event::Event::Resize(..)) => Event::Resize,
@@ -1030,6 +1129,41 @@ fn spawn_input(tx: Sender<Event>) {
   });
 }
 
+/// Opens `request` in `editor`. A terminal editor gets the screen until it
+/// exits and the call returns true so the caller reloads. An editor with its
+/// own window is started and left running.
+fn open_editor(
+  terminal: &mut DefaultTerminal,
+  gate: &InputGate,
+  editor: &Editor,
+  root: &Path,
+  request: &EditRequest,
+) -> io::Result<Result<bool, String>> {
+  let mut command = editor.command(&root.join(&request.path), request.line);
+  let failed = |e: io::Error| format!("Cannot run {}: {e}", editor.program());
+  if editor.is_gui() {
+    let child = command
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn();
+    return Ok(match child {
+      Ok(mut child) => {
+        thread::spawn(move || {
+          let _ = child.wait();
+        });
+        Ok(false)
+      }
+      Err(e) => Err(failed(e)),
+    });
+  }
+  let _paused = gate.pause();
+  ratatui::try_restore()?;
+  let status = command.status();
+  *terminal = ratatui::try_init()?;
+  Ok(status.map(|_| true).map_err(failed))
+}
+
 /// A `theme` in `settings` turns syntax highlighting on; `None` leaves diffs
 /// uncolored.
 pub fn run<V: Vcs + Send + Sync + 'static>(
@@ -1037,18 +1171,19 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   vcs: V,
   request: DiffRequest,
   settings: Settings,
-  watch: Option<&Path>,
+  root: &Path,
 ) -> io::Result<()> {
   let vcs = Arc::new(vcs);
   let (tx, rx) = mpsc::channel();
-  spawn_input(tx.clone());
+  let gate = Arc::new(InputGate::default());
+  spawn_input(tx.clone(), gate.clone());
+  let editor = Editor::from_env();
   spawn_load(vcs.clone(), request.clone(), 0, tx.clone());
-  let _watch = match watch {
-    Some(root) => {
-      let tx = tx.clone();
-      Some(Watch::start(root, move || tx.send(Event::Changed).is_ok()).map_err(io::Error::other)?)
-    }
-    None => None,
+  let _watch = if settings.watch {
+    let tx = tx.clone();
+    Some(Watch::start(root, move || tx.send(Event::Changed).is_ok()).map_err(io::Error::other)?)
+  } else {
+    None
   };
   // `latest` numbers the newest load asked for, `applied` the one on screen.
   let (mut latest, mut applied) = (0, 0);
@@ -1111,6 +1246,19 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
       Ok(Event::Rehighlighted(..)) => {}
       Ok(Event::InputFailed(e)) => return Err(e),
       Err(_) => break,
+    }
+    if let Some(edit) = app.take_edit() {
+      match &editor {
+        None => app.notice = Some("Set $VISUAL or $EDITOR to open files".into()),
+        Some(editor) => match open_editor(terminal, &gate, editor, root, &edit)? {
+          Ok(true) => {
+            latest += 1;
+            spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
+          }
+          Ok(false) => {}
+          Err(message) => app.notice = Some(message),
+        },
+      }
     }
     if let Some(r) = app.take_rehighlight()
       && let Some(highlighter) = highlighter.clone()
@@ -1183,6 +1331,61 @@ mod tests {
     app.on_loaded(Ok(files));
     app.viewport = viewport;
     app
+  }
+
+  const EDIT_DIFF: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,2 @@\n a\n-b\n-c\n d\n@@ -9,2 +7,3 @@\n h\n+I\n i\n";
+
+  fn edit_after(keys: &[char]) -> (Option<EditRequest>, Option<String>) {
+    let mut app = ready(parse(EDIT_DIFF.as_bytes()).unwrap(), 20);
+    for &c in keys {
+      app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Char('e')));
+    (app.take_edit(), app.notice.clone())
+  }
+
+  #[test]
+  fn e_asks_to_open_the_file_at_the_cursor_line() {
+    let (edit, _) = edit_after(&[]);
+    assert_eq!(
+      edit,
+      Some(EditRequest {
+        path: PathBuf::from("f"),
+        line: 1
+      })
+    );
+    assert_eq!(edit_after(&['j'; 5]).0.unwrap().line, 8);
+  }
+
+  #[test]
+  fn e_on_a_removed_line_opens_the_next_line_of_the_file() {
+    assert_eq!(edit_after(&['j']).0.unwrap().line, 2);
+    assert_eq!(edit_after(&['j', 'j']).0.unwrap().line, 2);
+  }
+
+  #[test]
+  fn e_on_a_removed_line_with_none_after_it_opens_the_one_before() {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,1 @@\n a\n-b\n-c\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
+    app.on_key(key(KeyCode::Char('G')));
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.take_edit().unwrap().line, 1);
+  }
+
+  #[test]
+  fn e_on_a_deleted_file_only_shows_a_notice() {
+    let diff =
+      "diff --git a/f b/f\ndeleted file mode 100644\n--- a/f\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-a\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
+    app.on_key(key(KeyCode::Char('e')));
+    assert_eq!(app.take_edit(), None);
+    assert_eq!(app.notice.as_deref(), Some("Cannot edit a deleted file"));
+  }
+
+  #[test]
+  fn e_in_visual_mode_does_nothing() {
+    let (edit, _) = edit_after(&['v']);
+    assert_eq!(edit, None);
   }
 
   #[test]

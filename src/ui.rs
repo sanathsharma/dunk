@@ -26,6 +26,7 @@ const HELP_MENU: &[(&str, &str)] = &[
   ("+/-", "show 3 more, fewer unchanged lines around the hunk"),
   ("=", "back to the default context"),
   ("v", "select lines (esc or v leaves)"),
+  ("e", "open the cursor's line in $VISUAL or $EDITOR"),
   ("a", "stage or unstage hunk or selection"),
   ("f", "stage or unstage file"),
   ("?", "open this help"),
@@ -82,7 +83,9 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     .iter()
     .map(|(key, what)| Line::from(format!(" {key:<key_width$}  {what}")))
     .collect();
-  let width = (key_width + 40).min(area.width as usize) as u16;
+  let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+  // The widest line, a space after it and the two borders.
+  let width = (widest + 3).max(" Help (esc or q closes) ".len() + 2).min(area.width as usize) as u16;
   let height = (lines.len() as u16 + 2).min(area.height);
   let [_, row, _] = Layout::vertical([
     Constraint::Fill(1),
