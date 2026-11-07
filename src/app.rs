@@ -119,6 +119,8 @@ impl Mode {
 
 pub struct App {
   pub mode: Mode,
+  /// Whether the help menu covers the diff. It takes every key until closed.
+  pub help: bool,
   pub load: Load,
   /// The files as shown, with any expanded gaps.
   pub files: Arc<Vec<FileDiff>>,
@@ -167,6 +169,7 @@ impl Default for App {
   fn default() -> Self {
     App {
       mode: Mode::Normal,
+      help: false,
       load: Load::Loading,
       files: Arc::new(Vec::new()),
       loaded: Arc::new(Vec::new()),
@@ -449,7 +452,7 @@ impl App {
         FileStatus::Conflicted => "a conflicted",
         _ => "a renamed or copied",
       };
-      self.notice = Some(format!("Cannot stage hunks of {what} file, use - instead"));
+      self.notice = Some(format!("Cannot stage hunks of {what} file, use f instead"));
       return false;
     }
     let Some(hunk) = self.cursor_hunk() else {
@@ -573,6 +576,7 @@ impl App {
       KeyCode::Char('k') | KeyCode::Up => self.extend_selection(-1),
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('a') => self.stage_selection(),
+      KeyCode::Char('?') => self.help = true,
       _ => {}
     }
   }
@@ -597,6 +601,14 @@ impl App {
       return;
     }
     self.notice = None;
+    if self.help {
+      match key.code {
+        KeyCode::Esc | KeyCode::Char('q' | '?') => self.help = false,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+        _ => {}
+      }
+      return;
+    }
     if self.mode == Mode::Visual {
       return self.on_visual_key(key);
     }
@@ -621,13 +633,16 @@ impl App {
       }
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('e') => self.expand_at_top(),
-      KeyCode::Char('-') => self.toggle_stage(),
+      KeyCode::Char('f') => self.toggle_stage(),
       KeyCode::Char('a') => {
         self.toggle_stage_hunk(None);
       }
       KeyCode::Char('v') => self.enter_visual(),
-      KeyCode::Tab | KeyCode::Char('n') => self.select_by(1),
-      KeyCode::BackTab | KeyCode::Char('p') => self.select_by(-1),
+      KeyCode::Tab | KeyCode::Char('n' | '}') => self.select_by(1),
+      KeyCode::BackTab | KeyCode::Char('p' | '{') => self.select_by(-1),
+      KeyCode::Char(']') => self.jump_hunk(1),
+      KeyCode::Char('[') => self.jump_hunk(-1),
+      KeyCode::Char('?') => self.help = true,
       _ => {}
     }
   }
@@ -658,6 +673,34 @@ impl App {
 
   fn move_cursor(&mut self, delta: isize) {
     self.cursor = self.cursor.saturating_add_signed(delta);
+    self.clamp_scroll();
+  }
+
+  /// Moves the cursor to the header of the next hunk, or with a negative
+  /// `delta` to the header of the hunk under the cursor, or of the one before
+  /// it when the cursor is already on a header. Stays put past either end. The
+  /// header goes to the top of the pane, or as near as the diff's end allows.
+  fn jump_hunk(&mut self, delta: isize) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    let Some((hunk, line)) = locate(file, self.layout, self.cursor) else {
+      return;
+    };
+    let target = if delta > 0 {
+      hunk + 1
+    } else if line.is_some() {
+      hunk
+    } else if let Some(previous) = hunk.checked_sub(1) {
+      previous
+    } else {
+      return;
+    };
+    if target >= file.hunks.len() {
+      return;
+    }
+    self.cursor = row_of(file, self.layout, target, None);
+    self.scroll = self.cursor;
     self.clamp_scroll();
   }
 
@@ -1055,6 +1098,79 @@ mod tests {
     app.on_loaded(Ok(files));
     app.viewport = viewport;
     app
+  }
+
+  #[test]
+  fn brackets_jump_between_hunk_headers() {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
+    app.on_key(key(KeyCode::Char(']')));
+    assert_eq!(app.cursor_hunk(), Some(1));
+    assert_eq!(app.cursor, 5);
+    app.on_key(key(KeyCode::Char(']')));
+    assert_eq!(app.cursor, 5);
+    app.on_key(key(KeyCode::Char('j')));
+    app.on_key(key(KeyCode::Char('[')));
+    assert_eq!(app.cursor, 5);
+    app.on_key(key(KeyCode::Char('[')));
+    assert_eq!(app.cursor, 0);
+    app.on_key(key(KeyCode::Char('[')));
+    assert_eq!(app.cursor, 0);
+  }
+
+  #[test]
+  fn a_hunk_jump_puts_the_header_at_the_top_of_the_pane() {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n@@ -20,2 +20,2 @@\n x\n-y\n+Y\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 4);
+    app.on_key(key(KeyCode::Char(']')));
+    assert_eq!((app.cursor, app.scroll), (5, 5));
+    app.on_key(key(KeyCode::Char(']')));
+    assert_eq!(app.cursor, 9);
+    assert_eq!(app.scroll, app.max_scroll());
+    app.on_key(key(KeyCode::Char('[')));
+    assert_eq!((app.cursor, app.scroll), (5, 5));
+  }
+
+  #[test]
+  fn brackets_do_nothing_in_visual_mode_or_without_hunks() {
+    let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n";
+    let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
+    app.on_key(key(KeyCode::Char('j')));
+    app.on_key(key(KeyCode::Char('v')));
+    app.on_key(key(KeyCode::Char(']')));
+    assert_eq!(app.cursor, 1);
+    let mut empty = file("e", 1);
+    empty.hunks.clear();
+    let mut app = ready(vec![empty], 20);
+    app.on_key(key(KeyCode::Char(']')));
+    app.on_key(key(KeyCode::Char('[')));
+    assert_eq!(app.cursor, 0);
+  }
+
+  #[test]
+  fn braces_move_between_files_like_n_and_p() {
+    let mut app = ready(vec![file("a", 3), file("b", 3)], 5);
+    app.on_key(key(KeyCode::Char('}')));
+    assert_eq!(app.selected, 1);
+    app.on_key(key(KeyCode::Char('{')));
+    assert_eq!(app.selected, 0);
+  }
+
+  #[test]
+  fn question_mark_opens_help_and_escape_closes_it_without_quitting() {
+    let mut app = ready(vec![file("a", 3)], 5);
+    app.on_key(key(KeyCode::Char('?')));
+    assert!(app.help);
+    app.on_key(key(KeyCode::Char('j')));
+    assert!(app.help && app.cursor == 0);
+    app.on_key(key(KeyCode::Char('q')));
+    assert!(!app.help && !app.quit);
+    app.on_key(key(KeyCode::Char('?')));
+    app.on_key(key(KeyCode::Esc));
+    assert!(!app.help && !app.quit);
+    app.on_key(key(KeyCode::Char('v')));
+    app.on_key(key(KeyCode::Char('?')));
+    assert!(app.help);
   }
 
   #[test]
@@ -1686,9 +1802,9 @@ mod tests {
     app.on_loaded(git.changeset(&DiffRequest::default()))
   }
 
-  /// Presses `-` and runs what it asked for, as the event loop does.
+  /// Presses `f` and runs what it asked for, as the event loop does.
   fn press_minus(app: &mut App, git: &crate::vcs::Git) {
-    app.on_key(key(KeyCode::Char('-')));
+    app.on_key(key(KeyCode::Char('f')));
     let request = app.take_index_request().expect("a stage request");
     let result = request.run(git);
     assert!(app.on_indexed(request.follow, result));
@@ -1746,7 +1862,7 @@ mod tests {
   #[test]
   fn minus_on_a_revision_changeset_only_shows_a_notice() {
     let mut app = ready(vec![file_in("a", None)], 5);
-    app.on_key(key(KeyCode::Char('-')));
+    app.on_key(key(KeyCode::Char('f')));
     assert!(app.take_index_request().is_none());
     assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
   }
@@ -1763,7 +1879,7 @@ mod tests {
     let (_tmp, git) = stage_repo();
     let mut app = App::default();
     load(&mut app, &git);
-    app.on_key(key(KeyCode::Char('-')));
+    app.on_key(key(KeyCode::Char('f')));
     let (tx, rx) = mpsc::channel();
     spawn_index(Arc::new(git), app.take_index_request().unwrap(), tx);
     assert!(matches!(
@@ -1890,7 +2006,7 @@ mod tests {
     app.on_key(key(KeyCode::Char('a')));
     assert_eq!(
       app.notice.as_deref(),
-      Some("Cannot stage hunks of a conflicted file, use - instead")
+      Some("Cannot stage hunks of a conflicted file, use f instead")
     );
 
     let binary = FileDiff {

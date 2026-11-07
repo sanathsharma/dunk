@@ -9,10 +9,27 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 use std::ops::Range;
 
-const HELP: &str = " j/k move · space/PgDn page · ctrl-d/u half page · g/G top/bottom · n/p file · s split/unified · e expand · v select lines · a stage hunk or selection · - stage file · q quit";
+const HELP: &str = " j/k move · n/p file · [/] hunk · a stage · ? help · q quit";
+
+/// Every key, grouped, for the help menu.
+const HELP_MENU: &[(&str, &str)] = &[
+  ("j/k, up/down", "move the cursor"),
+  ("space/PgDn, PgUp", "page down, up"),
+  ("ctrl-d/u", "half page down, up"),
+  ("g/G, Home/End", "top, bottom"),
+  ("]/[", "next, previous hunk"),
+  ("n/p, }/{, Tab/Shift-Tab", "next, previous file"),
+  ("s", "split or unified layout"),
+  ("e", "expand unchanged lines"),
+  ("v", "select lines (esc or v leaves)"),
+  ("a", "stage or unstage hunk or selection"),
+  ("f", "stage or unstage file"),
+  ("?", "open this help"),
+  ("q, esc", "quit"),
+];
 
 impl Row<'_> {
   /// Whether the row is in the hunk under the cursor.
@@ -53,6 +70,41 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     Layout::horizontal([Constraint::Length(list_width), Constraint::Min(1)]).areas(main);
   render_files(frame, list, app);
   render_diff(frame, diff, app);
+  if app.help {
+    render_help(frame, main, app);
+  }
+}
+
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+  let key_width = HELP_MENU.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+  let lines: Vec<Line> = HELP_MENU
+    .iter()
+    .map(|(key, what)| Line::from(format!(" {key:<key_width$}  {what}")))
+    .collect();
+  let width = (key_width + 40).min(area.width as usize) as u16;
+  let height = (lines.len() as u16 + 2).min(area.height);
+  let [_, row, _] = Layout::vertical([
+    Constraint::Fill(1),
+    Constraint::Length(height),
+    Constraint::Fill(1),
+  ])
+  .areas(area);
+  let [_, popup, _] = Layout::horizontal([
+    Constraint::Fill(1),
+    Constraint::Length(width),
+    Constraint::Fill(1),
+  ])
+  .areas(row);
+  frame.render_widget(Clear, popup);
+  let block = Block::bordered()
+    .border_type(border_type(app.border))
+    .border_style(app.palette.border)
+    .title_style(app.palette.border)
+    .title(" Help (esc or q closes) ");
+  frame.render_widget(
+    Paragraph::new(lines).block(block).style(app.palette.normal),
+    popup,
+  );
 }
 
 /// The mode at the left, then the notice or the key help.
@@ -543,6 +595,18 @@ new file mode 100644
       .enumerate()
       .find(|(_, r)| r.contains(needle))
       .unwrap_or_else(|| panic!("no row contains {needle:?} in {rows:#?}"))
+  }
+
+  #[test]
+  fn the_help_menu_lists_the_keys_over_the_diff() {
+    let mut app = app_with(DIFF);
+    app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    let (_, rows) = draw(&mut app, 100, 24);
+    row_with(&rows, "Help (esc or q closes)");
+    row_with(&rows, "next, previous hunk");
+    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let (_, rows) = draw(&mut app, 100, 24);
+    assert!(!rows.iter().any(|r| r.contains("Help (esc or q closes)")));
   }
 
   #[test]
