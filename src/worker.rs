@@ -108,6 +108,14 @@ mod tests {
         new_id: Some(VersionId::Object("new".into())),
       }
     }
+
+    fn stage(&self, _: &FileDiff) -> Result<(), Error> {
+      unreachable!()
+    }
+
+    fn unstage(&self, _: &FileDiff) -> Result<(), Error> {
+      unreachable!()
+    }
   }
 
   fn files(n: usize) -> Arc<Vec<FileDiff>> {

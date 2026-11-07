@@ -12,7 +12,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -33,7 +33,22 @@ pub enum Event {
   /// The colors of an expanded file: the load, the file and which of its
   /// expansions they were made for.
   Rehighlighted(u64, usize, u32, FileHighlight),
+  /// A stage or unstage finished. Carries the entry the selection moves to
+  /// once the changeset is read again.
+  Indexed(Option<Follow>, Result<(), vcs::Error>),
   InputFailed(io::Error),
+}
+
+/// An entry of the file list, named by path and section so it can be found
+/// again after a reload.
+pub type Follow = (PathBuf, Section);
+
+/// A stage or unstage of a whole file waiting to run.
+pub struct IndexRequest {
+  pub file: FileDiff,
+  /// True to stage the file, false to unstage it.
+  pub stage: bool,
+  pub follow: Option<Follow>,
 }
 
 pub enum Load {
@@ -83,6 +98,9 @@ pub struct App {
   /// do not fit its lines.
   expansions: Vec<u32>,
   rehighlight: Option<Rehighlight>,
+  index_request: Option<IndexRequest>,
+  /// Where the selection goes when the entry it is on has left the list.
+  follow: Option<Follow>,
   /// A short message for the footer, cleared by the next key press.
   pub notice: Option<String>,
   /// Colors per file, parallel to `files`. `None` until the worker delivers.
@@ -115,6 +133,8 @@ impl Default for App {
       pending_expand: None,
       expansions: Vec::new(),
       rehighlight: None,
+      index_request: None,
+      follow: None,
       notice: None,
       highlights: Vec::new(),
       words: Vec::new(),
@@ -199,6 +219,7 @@ impl App {
   /// still in the changeset; otherwise the selection moves to the nearest
   /// index.
   pub fn on_loaded(&mut self, result: Result<Vec<FileDiff>, vcs::Error>) -> bool {
+    let follow = self.follow.take();
     let files = match result {
       Ok(files) => files,
       Err(e) => {
@@ -215,6 +236,12 @@ impl App {
         .iter()
         .position(|f| f.path() == old.path() && f.section == old.section)
     });
+    let followed = || {
+      let (path, section) = follow.as_ref()?;
+      files
+        .iter()
+        .position(|f| f.path() == path && f.section == Some(*section))
+    };
     let (scroll, cursor) = if kept.is_some() {
       (self.scroll, self.cursor)
     } else {
@@ -227,7 +254,9 @@ impl App {
     self.expansions = vec![0; files.len()];
     self.rehighlight = None;
     self.pending_expand = None;
-    let index = kept.unwrap_or(self.selected.min(files.len().saturating_sub(1)));
+    let index = kept
+      .or_else(followed)
+      .unwrap_or(self.selected.min(files.len().saturating_sub(1)));
     self.loaded = Arc::new(files);
     self.files = self.loaded.clone();
     self.select(index);
@@ -289,6 +318,54 @@ impl App {
     }
   }
 
+  /// Takes the stage or unstage the last key press asked for.
+  pub fn take_index_request(&mut self) -> Option<IndexRequest> {
+    self.index_request.take()
+  }
+
+  /// Takes the result of a stage or unstage. Returns true when the changeset
+  /// needs reading again.
+  pub fn on_indexed(&mut self, follow: Option<Follow>, result: Result<(), vcs::Error>) -> bool {
+    match result {
+      Ok(()) => {
+        self.follow = follow;
+        true
+      }
+      Err(e) => {
+        self.notice = Some(e.to_string());
+        false
+      }
+    }
+  }
+
+  /// Asks to stage the selected file, or to unstage it when it is in the
+  /// staged section.
+  fn toggle_stage(&mut self) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    let Some(section) = file.section else {
+      self.notice = Some("read-only: revision".into());
+      return;
+    };
+    self.index_request = Some(IndexRequest {
+      file: file.clone(),
+      stage: section == Section::Unstaged,
+      follow: self.neighbour(),
+    });
+  }
+
+  /// The entry after the selected one in its section, or the one before it
+  /// when the selected entry is the last.
+  fn neighbour(&self) -> Option<Follow> {
+    let section = self.files.get(self.selected)?.section?;
+    let in_section = |i: &usize| self.files[*i].section == Some(section);
+    let next = (self.selected + 1..self.files.len()).find(in_section);
+    let previous = (0..self.selected).rev().find(in_section);
+    let at = next.or(previous)?;
+    Some((self.files[at].path().to_path_buf(), section))
+  }
+
   pub fn on_key(&mut self, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
       return;
@@ -315,6 +392,7 @@ impl App {
       }
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('e') => self.expand_at_top(),
+      KeyCode::Char('-') => self.toggle_stage(),
       KeyCode::Tab | KeyCode::Char('n') => self.select_by(1),
       KeyCode::BackTab | KeyCode::Char('p') => self.select_by(-1),
       _ => {}
@@ -529,6 +607,23 @@ fn spawn_load(
   });
 }
 
+/// Writes the index off the UI thread and reports the result over the
+/// channel.
+fn spawn_index(
+  vcs: Arc<impl Vcs + Send + Sync + 'static>,
+  request: IndexRequest,
+  tx: Sender<Event>,
+) {
+  thread::spawn(move || {
+    let result = if request.stage {
+      vcs.stage(&request.file)
+    } else {
+      vcs.unstage(&request.file)
+    };
+    let _ = tx.send(Event::Indexed(request.follow, result));
+  });
+}
+
 /// Reads both versions of a file off the UI thread for an expansion.
 fn spawn_sides(
   vcs: Arc<impl Vcs + Send + Sync + 'static>,
@@ -603,6 +698,12 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
         latest += 1;
         spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
       }
+      Ok(Event::Indexed(follow, result)) => {
+        if app.on_indexed(follow, result) {
+          latest += 1;
+          spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
+        }
+      }
       Ok(Event::Loaded(id, result)) if id == latest => {
         if app.on_loaded(result) {
           applied = id;
@@ -644,6 +745,9 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
         let highlight = highlighter.diff(&r.file, &r.sides);
         let _ = tx.send(Event::Rehighlighted(id, r.index, r.generation, highlight));
       });
+    }
+    if let Some(index_request) = app.take_index_request() {
+      spawn_index(vcs.clone(), index_request, tx.clone());
     }
     if let Some(index) = app.take_sides_request() {
       spawn_sides(
@@ -1248,6 +1352,14 @@ mod tests {
     fn sides(&self, _: &DiffRequest, _: &FileDiff) -> vcs::Sides {
       vcs::Sides::default()
     }
+
+    fn stage(&self, _: &FileDiff) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
+
+    fn unstage(&self, _: &FileDiff) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
   }
 
   #[test]
@@ -1269,5 +1381,135 @@ mod tests {
       Event::Loaded(7, Ok(files)) => assert_eq!(files.len(), 2),
       _ => panic!("expected a loaded diff"),
     }
+  }
+
+  fn file_in(name: &str, section: Option<Section>) -> FileDiff {
+    FileDiff {
+      section,
+      ..file(name, 2)
+    }
+  }
+
+  /// A real repository with `a` and `b` unstaged and `c` staged.
+  fn stage_repo() -> (tempfile::TempDir, crate::vcs::Git) {
+    use std::process::Command;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let d = tmp.path().to_path_buf();
+    let d = d.as_path();
+    let git = |args: &[&str]| {
+      let status = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .current_dir(d)
+        .status()
+        .unwrap();
+      assert!(status.success());
+    };
+    git(&["init", "-q", "-b", "main"]);
+    for f in ["a", "b", "c"] {
+      std::fs::write(d.join(f), "1\n").unwrap();
+    }
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    for f in ["a", "b", "c"] {
+      std::fs::write(d.join(f), "2\n").unwrap();
+    }
+    git(&["add", "c"]);
+    let repo = crate::vcs::Git::new(d);
+    (tmp, repo)
+  }
+
+  fn load(app: &mut App, git: &crate::vcs::Git) -> bool {
+    app.on_loaded(git.changeset(&DiffRequest::default()))
+  }
+
+  /// Presses `-` and runs what it asked for, as the event loop does.
+  fn press_minus(app: &mut App, git: &crate::vcs::Git) {
+    app.on_key(key(KeyCode::Char('-')));
+    let request = app.take_index_request().expect("a stage request");
+    let result = if request.stage {
+      git.stage(&request.file)
+    } else {
+      git.unstage(&request.file)
+    };
+    assert!(app.on_indexed(request.follow, result));
+    load(app, git);
+  }
+
+  fn selected_name(app: &App) -> (String, Option<Section>) {
+    let f = &app.files[app.selected];
+    (f.path().display().to_string(), f.section)
+  }
+
+  #[test]
+  fn minus_moves_a_file_between_sections_and_selects_the_next_one() {
+    let (_tmp, git) = stage_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    let (u, s) = (Some(Section::Unstaged), Some(Section::Staged));
+    assert_eq!(selected_name(&app), ("a".into(), u));
+
+    press_minus(&mut app, &git);
+    assert_eq!(selected_name(&app), ("b".into(), u));
+    let count = |section| app.files.iter().filter(|f| f.section == section).count();
+    assert_eq!((count(u), count(s)), (1, 2));
+
+    // The last entry of a section hands the selection to the one before it.
+    press_minus(&mut app, &git);
+    assert_eq!(app.files.iter().filter(|f| f.section == u).count(), 0);
+    assert_eq!(app.files.len(), 3);
+    assert_eq!(selected_name(&app).1, s);
+
+    // Unstaging keeps the selection in the staged section.
+    app.select(
+      app
+        .files
+        .iter()
+        .position(|f| f.path() == Path::new("b"))
+        .unwrap(),
+    );
+    press_minus(&mut app, &git);
+    assert_eq!(selected_name(&app).1, s);
+    assert_eq!(app.files.iter().filter(|f| f.section == u).count(), 1);
+  }
+
+  #[test]
+  fn a_watch_refresh_after_a_stage_keeps_the_selection() {
+    let (_tmp, git) = stage_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    press_minus(&mut app, &git);
+    let selected = selected_name(&app);
+    assert!(!load(&mut app, &git));
+    assert_eq!(selected_name(&app), selected);
+  }
+
+  #[test]
+  fn minus_on_a_revision_changeset_only_shows_a_notice() {
+    let mut app = ready(vec![file_in("a", None)], 5);
+    app.on_key(key(KeyCode::Char('-')));
+    assert!(app.take_index_request().is_none());
+    assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
+  }
+
+  #[test]
+  fn a_failed_stage_shows_the_error_and_does_not_reload() {
+    let mut app = ready(vec![file_in("a", Some(Section::Unstaged))], 5);
+    assert!(!app.on_indexed(None, Err(vcs::Error::Git("locked".into()))));
+    assert_eq!(app.notice.as_deref(), Some("locked"));
+  }
+
+  #[test]
+  fn indexing_runs_off_the_calling_thread() {
+    let (_tmp, git) = stage_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('-')));
+    let (tx, rx) = mpsc::channel();
+    spawn_index(Arc::new(git), app.take_index_request().unwrap(), tx);
+    assert!(matches!(
+      rx.recv().unwrap(),
+      Event::Indexed(Some(_), Ok(()))
+    ));
   }
 }

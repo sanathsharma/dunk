@@ -104,6 +104,12 @@ pub trait Vcs {
     Ok(entries)
   }
 
+  /// Adds all of `file`'s working tree changes to the index.
+  fn stage(&self, file: &FileDiff) -> Result<(), Error>;
+
+  /// Resets `file` in the index to the commit, keeping the working tree.
+  fn unstage(&self, file: &FileDiff) -> Result<(), Error>;
+
   /// Reads both versions of `file` as `request` compared them.
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;
 }

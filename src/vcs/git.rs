@@ -1,6 +1,6 @@
 use super::{DiffRequest, Error, Sides, Vcs, VersionId};
 use crate::args::Scope;
-use crate::diff::{FileDiff, Section, parse};
+use crate::diff::{FileDiff, FileStatus, Section, parse};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
@@ -89,6 +89,58 @@ impl Git {
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
     let bytes = self.run(["cat-file", "blob", &oid]).ok()?;
     Some((bytes, VersionId::Object(oid)))
+  }
+
+  /// Runs a git command that writes the index, with the paths taken
+  /// literally. It runs at the repository root because the paths of a
+  /// `FileDiff` are relative to it.
+  fn write_index(&self, args: &[&str], file: &FileDiff) -> Result<(), Error> {
+    let root = self.root()?;
+    let mut paths = vec![file.path()];
+    if file.status == FileStatus::Renamed {
+      paths.extend(file.old_path.as_deref());
+    }
+    let mut full: Vec<&OsStr> = vec!["--literal-pathspecs".as_ref()];
+    full.extend(args.iter().map(OsStr::new));
+    full.push("--".as_ref());
+    full.extend(paths.iter().map(|p| p.as_os_str()));
+    let out = self.command(&root, full)?;
+    if !out.status.success() {
+      return Err(git_error(&out));
+    }
+    Ok(())
+  }
+
+  /// Files with unresolved merge conflicts. `git diff` prints these as a
+  /// combined diff the parser skips, so they are listed without hunks.
+  fn unmerged(&self, req: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
+    let mut ls = vec!["ls-files", "--unmerged", "-z", "--full-name", "--"];
+    if req.paths.is_empty() {
+      ls.push(":/");
+    }
+    ls.extend(req.paths.iter().map(String::as_str));
+    let listing = self.run(ls)?;
+    let mut files: Vec<FileDiff> = Vec::new();
+    // Each line is `<mode> <object> <stage>\t<path>` and a path repeats once
+    // per stage.
+    for entry in listing.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+      let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+        continue;
+      };
+      let name = path(&entry[tab + 1..]);
+      if files.iter().any(|f| f.path() == name) {
+        continue;
+      }
+      files.push(FileDiff {
+        old_path: Some(name.clone()),
+        new_path: Some(name),
+        status: FileStatus::Modified,
+        binary: false,
+        section: None,
+        hunks: Vec::new(),
+      });
+    }
+    Ok(files)
   }
 
   /// Resolves `a...b` to the merge base of `a` and `b` on the old side.
@@ -224,7 +276,22 @@ impl Vcs for Git {
     if req.revisions.is_empty() && req.scope != Scope::Staged {
       files.extend(self.untracked_diff(req)?);
     }
+    if req.revisions.is_empty() && req.scope != Scope::Staged {
+      for file in self.unmerged(req)? {
+        if !files.iter().any(|f| f.path() == file.path()) {
+          files.push(file);
+        }
+      }
+    }
     Ok(files)
+  }
+
+  fn stage(&self, file: &FileDiff) -> Result<(), Error> {
+    self.write_index(&["add", "-A"], file)
+  }
+
+  fn unstage(&self, file: &FileDiff) -> Result<(), Error> {
+    self.write_index(&["reset", "-q"], file)
   }
 
   fn sides(&self, req: &DiffRequest, file: &FileDiff) -> Sides {
@@ -722,5 +789,135 @@ mod tests {
       git.sides(&staged, &file).new_id,
       Some(VersionId::Object(_))
     ));
+  }
+
+  fn status(d: &Path) -> String {
+    let out = Command::new("git")
+      .args(["status", "--porcelain"])
+      .current_dir(d)
+      .output()
+      .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+  }
+
+  fn entry(git: &Git, name: &str, section: Section) -> FileDiff {
+    git
+      .changeset(&DiffRequest::default())
+      .unwrap()
+      .into_iter()
+      .find(|f| f.path() == Path::new(name) && f.section == Some(section))
+      .unwrap_or_else(|| panic!("no {section:?} entry for {name}"))
+  }
+
+  #[test]
+  fn stages_and_unstages_a_whole_file() {
+    let tmp = mixed_repo();
+    let d = tmp.path();
+    let git = Git::new(d);
+    git
+      .stage(&entry(&git, "unstaged.txt", Section::Unstaged))
+      .unwrap();
+    assert!(status(d).contains("M  unstaged.txt"));
+    // The unstaged half of both.txt joins its staged half.
+    git
+      .stage(&entry(&git, "both.txt", Section::Unstaged))
+      .unwrap();
+    assert!(status(d).contains("M  both.txt"));
+    git
+      .unstage(&entry(&git, "staged.txt", Section::Staged))
+      .unwrap();
+    assert!(status(d).contains(" M staged.txt"));
+  }
+
+  #[test]
+  fn stages_an_untracked_file_and_a_deletion() {
+    let tmp = mixed_repo();
+    let d = tmp.path();
+    fs::remove_file(d.join("unstaged.txt")).unwrap();
+    let git = Git::new(d);
+    git
+      .stage(&entry(&git, "loose.txt", Section::Unstaged))
+      .unwrap();
+    git
+      .stage(&entry(&git, "unstaged.txt", Section::Unstaged))
+      .unwrap();
+    let status = status(d);
+    assert!(status.contains("A  loose.txt"));
+    assert!(status.contains("D  unstaged.txt"));
+  }
+
+  #[test]
+  fn unstages_a_file_on_an_unborn_branch() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "a\n");
+    git(d, &["add", "a.txt"]);
+    let git = Git::new(d);
+    git.unstage(&entry(&git, "a.txt", Section::Staged)).unwrap();
+    assert!(status(d).contains("?? a.txt"));
+  }
+
+  #[test]
+  fn unstaging_a_rename_resets_both_paths() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "old.txt", "1\n2\n3\n4\n5\n6\n");
+    commit_all(d, "init");
+    git(d, &["mv", "old.txt", "new.txt"]);
+    let git = Git::new(d);
+    git
+      .unstage(&entry(&git, "new.txt", Section::Staged))
+      .unwrap();
+    let status = status(d);
+    assert!(status.contains(" D old.txt"));
+    assert!(status.contains("?? new.txt"));
+  }
+
+  #[test]
+  fn paths_are_taken_literally_and_from_the_repository_root() {
+    let tmp = repo();
+    let d = tmp.path();
+    fs::create_dir(d.join("sub")).unwrap();
+    write(d, "sub/a.txt", "a\n");
+    write(d, "*.txt", "star\n");
+    let git = Git::new(d.join("sub"));
+    git.stage(&entry(&git, "*.txt", Section::Unstaged)).unwrap();
+    let status = status(d);
+    assert!(status.contains("A  *.txt"));
+    assert!(status.contains("?? sub/"));
+  }
+
+  fn conflicted_repo() -> TempDir {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "c.txt", "base\n");
+    commit_all(d, "init");
+    git(d, &["checkout", "-q", "-b", "other"]);
+    write(d, "c.txt", "theirs\n");
+    commit_all(d, "theirs");
+    git(d, &["checkout", "-q", "main"]);
+    write(d, "c.txt", "ours\n");
+    commit_all(d, "ours");
+    let merged = Command::new("git")
+      .args(["merge", "other"])
+      .current_dir(d)
+      .output()
+      .unwrap();
+    assert!(!merged.status.success());
+    tmp
+  }
+
+  #[test]
+  fn lists_a_conflicted_file_once_and_stages_it_whole() {
+    let tmp = conflicted_repo();
+    let d = tmp.path();
+    let git = Git::new(d);
+    let files = git.changeset(&DiffRequest::default()).unwrap();
+    assert_eq!(
+      sections(&files),
+      [("c.txt".into(), Some(Section::Unstaged))]
+    );
+    git.stage(&entry(&git, "c.txt", Section::Unstaged)).unwrap();
+    assert!(status(d).contains("M  c.txt"));
   }
 }
