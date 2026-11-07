@@ -1,6 +1,7 @@
 mod git;
 
 use crate::args::Scope;
+use crate::diff::{FileDiff, ParseError};
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -25,6 +26,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<ParseError> for Error {
+    fn from(e: ParseError) -> Self {
+        Error::Parse(e.to_string())
+    }
+}
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
@@ -89,6 +96,16 @@ impl Status {
     }
 }
 
+/// What changeset to diff. With revisions the working tree scope is ignored.
+#[derive(Debug, Default)]
+pub struct DiffRequest {
+    pub scope: Scope,
+    pub revisions: Vec<String>,
+    pub paths: Vec<String>,
+    pub context: Option<u32>,
+}
+
 pub trait Vcs {
     fn status(&self) -> Result<Status, Error>;
+    fn diff(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error>;
 }

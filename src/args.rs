@@ -8,9 +8,10 @@ pub enum Layout {
     Split,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// Staged, unstaged and untracked changes together.
+    #[default]
     All,
     Staged,
     Unstaged,
@@ -164,7 +165,11 @@ mod tests {
 
     #[test]
     fn staged_conflicts_with_revision() {
-        assert!(command().try_get_matches_from(["dunk", "--staged", "HEAD"]).is_err());
+        assert!(
+            command()
+                .try_get_matches_from(["dunk", "--staged", "HEAD"])
+                .is_err()
+        );
     }
 
     #[test]

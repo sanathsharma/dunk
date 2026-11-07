@@ -1,51 +1,77 @@
 mod args;
+mod diff;
 mod vcs;
 
-use std::path::{Path, PathBuf};
+use diff::{FileDiff, LineKind};
+use std::path::Path;
 use std::process::ExitCode;
-use vcs::{FileChange, Git, Vcs};
+use vcs::{DiffRequest, Git, Vcs};
 
-fn print_changes(title: &str, changes: &[FileChange]) {
-    if changes.is_empty() {
-        return;
-    }
-    println!("{title}");
-    for c in changes {
-        match &c.kind {
-            vcs::ChangeKind::Renamed { from } | vcs::ChangeKind::Copied { from } => println!(
-                "  {} {} -> {}",
-                c.kind.letter(),
+fn print_diff(files: &[FileDiff]) {
+    for f in files {
+        let (added, removed) = (f.count(LineKind::Added), f.count(LineKind::Removed));
+        match (&f.old_path, f.status) {
+            (Some(from), diff::FileStatus::Renamed | diff::FileStatus::Copied) => println!(
+                "{} {} -> {} (+{added} -{removed})",
+                f.status.letter(),
                 from.display(),
-                c.path.display()
+                f.path().display()
             ),
-            _ => println!("  {} {}", c.kind.letter(), c.path.display()),
+            _ => println!(
+                "{} {} (+{added} -{removed})",
+                f.status.letter(),
+                f.path().display()
+            ),
         }
-    }
-}
-
-fn print_untracked(paths: &[PathBuf]) {
-    if paths.is_empty() {
-        return;
-    }
-    println!("Untracked");
-    for p in paths {
-        println!("  ? {}", p.display());
+        if f.binary {
+            println!("  binary file");
+        }
+        for h in &f.hunks {
+            println!(
+                "@@ -{},{} +{},{} @@ {}",
+                h.old_start,
+                h.old_len,
+                h.new_start,
+                h.new_len,
+                String::from_utf8_lossy(&h.heading)
+            );
+            for l in &h.lines {
+                let marker = match l.kind {
+                    LineKind::Context => ' ',
+                    LineKind::Added => '+',
+                    LineKind::Removed => '-',
+                };
+                let no = |n: Option<u32>| n.map_or(String::new(), |n| n.to_string());
+                println!(
+                    "{:>5} {:>5} {marker}{}",
+                    no(l.old_no),
+                    no(l.new_no),
+                    String::from_utf8_lossy(&l.content)
+                );
+                if l.no_newline {
+                    println!("{:>11} \\ No newline at end of file", "");
+                }
+            }
+        }
     }
 }
 
 fn run() -> Result<(), vcs::Error> {
     let args = args::parse();
     let dir = args.directory.as_deref().unwrap_or(Path::new("."));
-    let mut status = Git::new(dir).status()?;
-    status.retain_scope(args.scope);
+    let request = DiffRequest {
+        scope: args.scope,
+        revisions: args.revisions,
+        paths: args.paths,
+        context: args.context,
+    };
+    let files = Git::new(dir).diff(&request)?;
 
-    if status.is_empty() {
+    if files.is_empty() {
         println!("No changes");
-        return Ok(());
+    } else {
+        print_diff(&files);
     }
-    print_changes("Staged", &status.staged);
-    print_changes("Unstaged", &status.unstaged);
-    print_untracked(&status.untracked);
     Ok(())
 }
 
