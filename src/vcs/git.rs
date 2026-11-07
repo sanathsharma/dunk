@@ -46,6 +46,11 @@ impl Git {
         Ok(out.stdout)
     }
 
+    fn root(&self) -> Result<PathBuf, Error> {
+        let out = self.run(["rev-parse", "--show-toplevel"])?;
+        Ok(path(out.strip_suffix(b"\n").unwrap_or(&out)))
+    }
+
     /// The commit to compare the working tree with. An unborn branch has no
     /// HEAD, so it compares with the empty tree.
     fn head(&self) -> Result<String, Error> {
@@ -83,8 +88,7 @@ impl Git {
     /// Untracked files are not in `git diff`, so each one is diffed against
     /// /dev/null. `--no-index` exits with 1 when the files differ.
     fn untracked_diff(&self, req: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
-        let root = self.run(["rev-parse", "--show-toplevel"])?;
-        let root = path(root.strip_suffix(b"\n").unwrap_or(&root));
+        let root = self.root()?;
 
         let mut ls = vec![
             "ls-files",
@@ -148,6 +152,9 @@ impl Vcs for Git {
         if let Some(rev) = req.revisions.iter().find(|r| r.starts_with('-')) {
             return Err(Error::Git(format!("invalid revision: {rev}")));
         }
+        // Outside a repository `git diff` falls back to comparing two paths
+        // and prints its usage text, so fail early with the real error.
+        self.root()?;
         let mut files = self.tracked_diff(req)?;
         if req.revisions.is_empty() && req.scope != Scope::Staged {
             files.extend(self.untracked_diff(req)?);
@@ -534,6 +541,15 @@ mod tests {
             ["a.txt", "b.txt"]
         );
         assert!(git.diff(&req(&["HEAD", "HEAD"])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_outside_a_repository_reports_the_real_error() {
+        let tmp = TempDir::new().unwrap();
+        let err = Git::new(tmp.path())
+            .diff(&DiffRequest::default())
+            .unwrap_err();
+        assert!(matches!(err, Error::Git(ref m) if m.contains("not a git repository")));
     }
 
     #[test]
