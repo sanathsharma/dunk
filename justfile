@@ -1,0 +1,2 @@
+release:
+	cargo install --path .
