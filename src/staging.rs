@@ -498,4 +498,24 @@ mod tests {
       Some(Refusal::ReadOnly)
     );
   }
+
+  #[test]
+  fn staging_lines_of_an_untracked_file_and_taking_them_back() {
+    let vcs = Memory::default().edit("n", "a\nb\nc\n");
+    let files = load(&vcs);
+    let changed: Vec<usize> = files[0].hunks[0].changed().collect();
+    let first_two = BTreeSet::from([changed[0], changed[1]]);
+
+    let request = toggle_hunk(&files, 0, Some(0), Some(first_two.clone())).unwrap();
+    assert!(request.stage);
+    request.run(&vcs).unwrap();
+    assert_eq!(vcs.index_text("n").as_deref(), Some("a\nb\n"));
+
+    let files = load(&vcs);
+    let staged = position_of(&files, "n", Section::Staged);
+    let request = toggle_hunk(&files, staged, Some(0), Some(first_two)).unwrap();
+    assert!(!request.stage);
+    request.run(&vcs).unwrap();
+    assert_eq!(vcs.index_text("n"), None);
+  }
 }

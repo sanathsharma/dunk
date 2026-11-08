@@ -2497,19 +2497,7 @@ mod tests {
 
   /// One file `f` whose single hunk reads, by hunk line and by unified row
   /// (the header is row 0): `1` `2` `-3` `+x3` ` 4` `-5` `+x5` and context.
-  fn line_repo() -> (tempfile::TempDir, crate::vcs::Git) {
-    use std::process::Command;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let d = tmp.path().to_path_buf();
-    let git = |args: &[&str]| {
-      let status = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .current_dir(&d)
-        .status()
-        .unwrap();
-      assert!(status.success());
-    };
+  fn line_repo() -> crate::vcs::Memory {
     let body = |three: &str, five: &str| {
       (1..=20)
         .map(|n| match n {
@@ -2519,23 +2507,14 @@ mod tests {
         })
         .collect::<String>()
     };
-    git(&["init", "-q", "-b", "main"]);
-    std::fs::write(d.join("f"), body("3", "5")).unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-    std::fs::write(d.join("f"), body("x3", "x5")).unwrap();
-    let repo = crate::vcs::Git::new(&d);
-    (tmp, repo)
+    crate::vcs::Memory::default()
+      .commit("f", &body("3", "5"))
+      .edit("f", &body("x3", "x5"))
   }
 
   /// The file as the index holds it.
-  fn index_of(dir: &Path, name: &str) -> String {
-    let out = std::process::Command::new("git")
-      .args(["show", &format!(":{name}")])
-      .current_dir(dir)
-      .output()
-      .unwrap();
-    String::from_utf8(out.stdout).unwrap()
+  fn index_of(git: &crate::vcs::Memory, name: &str) -> String {
+    git.index_text(name).unwrap_or_default()
   }
 
   /// Runs the stage or unstage the last key press asked for, as the event
@@ -2561,8 +2540,7 @@ mod tests {
 
   #[test]
   fn v_then_a_stages_only_the_selected_lines() {
-    let (tmp, git) = line_repo();
-    let d = tmp.path();
+    let git = line_repo();
     let mut app = App::default();
     load(&mut app, &git);
     cursor_to(&mut app, 3); // `-3`
@@ -2580,7 +2558,7 @@ mod tests {
         }
       })
       .collect();
-    assert_eq!(index_of(d, "f"), expected);
+    assert_eq!(index_of(&git, "f"), expected);
   }
 
   #[test]
@@ -2602,7 +2580,7 @@ mod tests {
       (4, "kk", numbered(&[(3, "x3")])),
     ];
     for (row, keys, expected) in cases {
-      let (tmp, git) = line_repo();
+      let git = line_repo();
       let mut app = App::default();
       load(&mut app, &git);
       cursor_to(&mut app, row);
@@ -2610,23 +2588,13 @@ mod tests {
       press(&mut app, keys);
       press(&mut app, "a");
       run_request(&mut app, &git);
-      assert_eq!(
-        index_of(tmp.path(), "f"),
-        expected,
-        "row {row} keys {keys:?}"
-      );
+      assert_eq!(index_of(&git, "f"), expected, "row {row} keys {keys:?}");
     }
   }
 
   #[test]
   fn a_in_the_staged_section_unstages_only_the_selected_lines() {
-    let (tmp, git) = line_repo();
-    let d = tmp.path();
-    std::process::Command::new("git")
-      .args(["add", "f"])
-      .current_dir(d)
-      .status()
-      .unwrap();
+    let git = line_repo().staged("f");
     let mut app = App::default();
     load(&mut app, &git);
     assert_eq!(selected_name(&app).1, Some(Section::Staged));
@@ -2640,12 +2608,12 @@ mod tests {
         n => format!("{n}\n"),
       })
       .collect();
-    assert_eq!(index_of(d, "f"), expected);
+    assert_eq!(index_of(&git, "f"), expected);
   }
 
   #[test]
   fn esc_and_v_leave_visual_mode_without_quitting() {
-    let (_tmp, git) = line_repo();
+    let git = line_repo();
     let mut app = App::default();
     load(&mut app, &git);
     press(&mut app, "v");
@@ -2664,7 +2632,7 @@ mod tests {
 
   #[test]
   fn a_selection_without_changed_lines_shows_a_notice_and_changes_nothing() {
-    let (_tmp, git) = line_repo();
+    let git = line_repo();
     let mut app = App::default();
     load(&mut app, &git);
     // The two context lines above the first change.
@@ -2698,32 +2666,16 @@ mod tests {
   /// One file `f` whose single hunk has unpaired rows. By hunk line: `1` `2`
   /// `-3` `-4` `+x3` ` 5` `+new` ` 6` and context. By split row (the header
   /// is row 0): 3 is `-3|+x3`, 4 is `-4|` and 6 is `|+new`.
-  fn uneven_repo() -> (tempfile::TempDir, crate::vcs::Git) {
-    use std::process::Command;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let d = tmp.path().to_path_buf();
-    let git = |args: &[&str]| {
-      let status = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .current_dir(&d)
-        .status()
-        .unwrap();
-      assert!(status.success());
-    };
+  fn uneven_repo() -> crate::vcs::Memory {
     let body = |lines: &[&str]| lines.iter().flat_map(|l| [*l, "\n"]).collect::<String>();
     let numbers: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
     let old: Vec<&str> = numbers.iter().map(String::as_str).collect();
     let mut new = old.clone();
     new.insert(5, "new");
     new.splice(2..4, ["x3"]);
-    git(&["init", "-q", "-b", "main"]);
-    std::fs::write(d.join("f"), body(&old)).unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-    std::fs::write(d.join("f"), body(&new)).unwrap();
-    let repo = crate::vcs::Git::new(&d);
-    (tmp, repo)
+    crate::vcs::Memory::default()
+      .commit("f", &body(&old))
+      .edit("f", &body(&new))
   }
 
   /// The index of `uneven_repo` with `edits` applied to its numbered lines.
@@ -2751,7 +2703,7 @@ mod tests {
 
   #[test]
   fn a_split_row_selects_the_lines_on_both_sides() {
-    let (_tmp, git) = uneven_repo();
+    let git = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
     split_cursor_to(&mut app, 3);
@@ -2764,7 +2716,7 @@ mod tests {
 
   #[test]
   fn selected_split_rows_stage_both_sides_of_a_pair() {
-    let (tmp, git) = uneven_repo();
+    let git = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
     split_cursor_to(&mut app, 3);
@@ -2772,57 +2724,45 @@ mod tests {
     run_request(&mut app, &git);
     // `-3` and `+x3` are staged, `-4` is not, so `x3` lands after the old 4.
     let expected = uneven_index(&["3"], false, false).replacen("4\n", "4\nx3\n", 1);
-    assert_eq!(index_of(tmp.path(), "f"), expected);
+    assert_eq!(index_of(&git, "f"), expected);
   }
 
   #[test]
   fn a_split_row_with_only_a_removed_line_stages_the_removal() {
-    let (tmp, git) = uneven_repo();
+    let git = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
     split_cursor_to(&mut app, 4);
     press(&mut app, "va");
     run_request(&mut app, &git);
-    assert_eq!(
-      index_of(tmp.path(), "f"),
-      uneven_index(&["4"], false, false)
-    );
+    assert_eq!(index_of(&git, "f"), uneven_index(&["4"], false, false));
   }
 
   #[test]
   fn a_split_row_with_only_an_added_line_stages_the_addition() {
-    let (tmp, git) = uneven_repo();
+    let git = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
     split_cursor_to(&mut app, 6);
     press(&mut app, "va");
     run_request(&mut app, &git);
-    assert_eq!(index_of(tmp.path(), "f"), uneven_index(&[], false, true));
+    assert_eq!(index_of(&git, "f"), uneven_index(&[], false, true));
   }
 
   #[test]
   fn split_rows_across_a_pair_and_an_unpaired_row_stage_all_their_lines() {
-    let (tmp, git) = uneven_repo();
+    let git = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
     split_cursor_to(&mut app, 3);
     press(&mut app, "vja");
     run_request(&mut app, &git);
-    assert_eq!(
-      index_of(tmp.path(), "f"),
-      uneven_index(&["3", "4"], true, false)
-    );
+    assert_eq!(index_of(&git, "f"), uneven_index(&["3", "4"], true, false));
   }
 
   #[test]
   fn unstaging_split_rows_takes_back_both_sides() {
-    let (tmp, git) = uneven_repo();
-    let d = tmp.path();
-    std::process::Command::new("git")
-      .args(["add", "f"])
-      .current_dir(d)
-      .status()
-      .unwrap();
+    let git = uneven_repo().staged("f");
     let mut app = App::default();
     load(&mut app, &git);
     assert_eq!(selected_name(&app).1, Some(Section::Staged));
@@ -2830,12 +2770,12 @@ mod tests {
     press(&mut app, "va");
     run_request(&mut app, &git);
     // `-3` and `+x3` leave the index, the rest of the change stays.
-    assert_eq!(index_of(d, "f"), uneven_index(&["4"], false, true));
+    assert_eq!(index_of(&git, "f"), uneven_index(&["4"], false, true));
   }
 
   #[test]
   fn toggling_the_layout_keeps_the_selected_lines() {
-    let (_tmp, git) = uneven_repo();
+    let git = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
     cursor_to(&mut app, 3); // unified `-3`
@@ -2853,7 +2793,7 @@ mod tests {
 
   #[test]
   fn toggling_the_layout_keeps_the_direction_of_the_selection() {
-    let (_tmp, git) = uneven_repo();
+    let git = uneven_repo();
     let mut app = App::default();
     load(&mut app, &git);
     split_cursor_to(&mut app, 4);
@@ -2877,7 +2817,7 @@ mod tests {
 
   #[test]
   fn the_cursor_stays_on_a_hunk_that_is_only_partly_staged() {
-    let (_tmp, git) = line_repo();
+    let git = line_repo();
     let mut app = App::default();
     load(&mut app, &git);
     cursor_to(&mut app, 3); // `-3`
@@ -2921,13 +2861,7 @@ mod tests {
 
   #[test]
   fn unstaging_only_the_added_lines_of_a_selection() {
-    let (tmp, git) = line_repo();
-    let d = tmp.path();
-    std::process::Command::new("git")
-      .args(["add", "f"])
-      .current_dir(d)
-      .status()
-      .unwrap();
+    let git = line_repo().staged("f");
     let mut app = App::default();
     load(&mut app, &git);
     cursor_to(&mut app, 4); // `+x3`
@@ -2944,6 +2878,6 @@ mod tests {
         }
       })
       .collect();
-    assert_eq!(index_of(d, "f"), expected);
+    assert_eq!(index_of(&git, "f"), expected);
   }
 }

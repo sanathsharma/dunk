@@ -103,6 +103,11 @@ impl Memory {
     })
   }
 
+  /// What the index holds for `path`, or `None` when it holds no such file.
+  pub fn index_text(&self, path: &str) -> Option<String> {
+    self.lock().get(Path::new(path))?.index.clone()
+  }
+
   fn missing(path: &Path) -> Error {
     Error::Git(format!("no such file: {}", path.display()))
   }
