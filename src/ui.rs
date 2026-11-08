@@ -20,6 +20,7 @@ const HELP_MENU: &[(&str, &str)] = &[
   ("space/PgDn, PgUp", "page down, up"),
   ("ctrl-d/u", "half page down, up"),
   ("g/G, Home/End", "top, bottom"),
+  ("h/l, left/right", "pan the code left, right"),
   ("]/[", "next, previous hunk"),
   ("n/p, }/{, Tab/Shift-Tab", "next, previous file"),
   ("s", "split or unified layout"),
@@ -233,6 +234,15 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     return;
   }
 
+  let widest = file
+    .hunks
+    .iter()
+    .flat_map(|h| &h.lines)
+    .map(|l| Span::raw(sanitize(&l.content)).width())
+    .max()
+    .unwrap_or(0);
+  app.pan = app.pan.min(widest.saturating_sub(1));
+  let pan = app.pan;
   let width = gutter_width(file);
   let current = app.cursor_hunk();
   let cursor = app.cursor.saturating_sub(app.scroll);
@@ -279,7 +289,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|(i, row)| {
           let active = row.active();
           let at_cursor = (i == cursor).then_some(palette.cursor_line);
-          let line = row_line(row, &palette, width, text.width.into(), at_cursor);
+          let line = row_line(row, &palette, width, text.width.into(), pan, at_cursor);
           (active, mark(i, line))
         })
         .collect::<Vec<_>>();
@@ -319,6 +329,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
           ranges,
           gutter,
           usize::from(fill),
+          pan,
           current == Some(hi),
           at_cursor.then_some(palette.cursor_line),
         )
@@ -338,7 +349,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
           match pair {
             None => {
               let header = Row::Header(h, active);
-              let left = row_line(header, &palette, width, left_width.into(), None);
+              let left = row_line(header, &palette, width, left_width.into(), pan, None);
               (active, mark(i, left), mark(i, blank(right_width)))
             }
             Some((l, r)) => (
@@ -425,12 +436,15 @@ fn gutter_width(file: &FileDiff) -> usize {
 }
 
 /// `fill` pads changed lines to the pane width so their background spans it.
-/// `cursor` is the style to lay under the changed words of a diff line.
+/// `pan` is how many columns the code of a diff line shifts left. The header
+/// does not move. `cursor` is the style to lay under the changed words of a
+/// diff line.
 fn row_line(
   row: Row,
   palette: &Palette,
   width: usize,
   fill: usize,
+  pan: usize,
   cursor: Option<Style>,
 ) -> Line<'static> {
   match row {
@@ -455,14 +469,17 @@ fn row_line(
     Row::Line(l, styled, changed, current) => {
       let no = |n: Option<u32>| n.map_or(String::new(), |n| n.to_string());
       let gutter = format!("{:>width$} {:>width$} ", no(l.old_no), no(l.new_no));
-      line_spans(l, palette, styled, changed, gutter, fill, current, cursor)
+      line_spans(
+        l, palette, styled, changed, gutter, fill, pan, current, cursor,
+      )
     }
   }
 }
 
 /// One diff line: gutter, marker, then the code with changed words
 /// emphasized. The `cursor` style covers all but the changed words, which keep
-/// their own background so the cursor line does not flatten them.
+/// their own background so the cursor line does not flatten them. The first
+/// `pan` columns of the code are cut off, and the gutter and marker stay.
 #[allow(clippy::too_many_arguments)]
 fn line_spans(
   l: &DiffLine,
@@ -471,6 +488,7 @@ fn line_spans(
   changed: &[Range<usize>],
   gutter: String,
   fill: usize,
+  pan: usize,
   current: bool,
   cursor: Option<Style>,
 ) -> Line<'static> {
@@ -500,20 +518,49 @@ fn line_spans(
       &plain
     }
   };
-  spans.extend(
-    emphasize(pieces, changed, word_bg, under)
-      .into_iter()
-      .map(|(style, text)| Span::styled(sanitize(text.as_bytes()), style)),
-  );
+  let mut code: Vec<(Style, String)> = emphasize(pieces, changed, word_bg, under)
+    .into_iter()
+    .map(|(style, text)| (style, sanitize(text.as_bytes())))
+    .collect();
   if l.no_newline {
-    spans.push(Span::styled(
-      " [no newline at end of file]",
+    code.push((
       Style::new().fg(Color::DarkGray).patch(under),
+      " [no newline at end of file]".to_string(),
     ));
   }
+  spans.extend(
+    skip_columns(code, pan)
+      .into_iter()
+      .map(|(style, text)| Span::styled(text, style)),
+  );
   let used: usize = spans.iter().map(Span::width).sum();
   spans.push(Span::styled(" ".repeat(fill.saturating_sub(used)), under));
   Line::from(spans).style(style)
+}
+
+/// Drops the first `columns` display columns of `pieces`. A wide character
+/// that straddles the cut is dropped whole.
+fn skip_columns(pieces: Vec<(Style, String)>, columns: usize) -> Vec<(Style, String)> {
+  let mut skipped = 0;
+  let mut out = Vec::with_capacity(pieces.len());
+  for (style, text) in pieces {
+    if skipped >= columns {
+      out.push((style, text));
+      continue;
+    }
+    let mut kept = String::new();
+    for c in text.chars() {
+      if skipped >= columns {
+        kept.push(c);
+      } else {
+        skipped += Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
+      }
+    }
+    if !kept.is_empty() {
+      out.push((style, kept));
+    }
+  }
+  out
 }
 
 /// Splits `pieces` at the edges of `changed` (byte offsets into the joined
@@ -1124,6 +1171,37 @@ diff --git a/a.rs b/a.rs
     let (_, rows) = draw(&mut app, 81, 8);
     let (_, row) = row_with(&rows, "+b");
     assert!(row.contains("+b"));
+  }
+
+  fn pan_app(layout: DiffLayout) -> App {
+    let mut app = app_with(
+      "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-0123456789abcdef\n+ABCDEFGHIJKLMNOP\n",
+    );
+    app.layout = layout;
+    app
+  }
+
+  #[test]
+  fn panning_shifts_the_code_and_keeps_the_gutter_marker_and_header() {
+    for layout in [DiffLayout::Unified, DiffLayout::Split] {
+      let mut app = pan_app(layout);
+      app.pan = 4;
+      let (_, rows) = draw(&mut app, 81, 8);
+      let (_, removed) = row_with(&rows, "456789abcdef");
+      assert!(!removed.contains("0123"), "{removed}");
+      assert!(removed.contains("-456789abcdef"), "{removed}");
+      let (_, header) = row_with(&rows, "@@ -1,1 +1,1 @@");
+      assert!(header.contains("@@ -1,1 +1,1 @@"), "{header}");
+    }
+  }
+
+  #[test]
+  fn the_pan_stops_at_the_widest_line() {
+    let mut app = pan_app(DiffLayout::Unified);
+    app.pan = 500;
+    let (_, rows) = draw(&mut app, 81, 8);
+    assert_eq!(app.pan, 15);
+    row_with(&rows, "P");
   }
 
   #[test]

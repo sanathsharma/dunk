@@ -118,6 +118,9 @@ pub struct Rehighlight {
 /// Lines of context a key press adds to or takes from each side of a hunk.
 const CONTEXT_STEP: u32 = 3;
 
+/// Columns one `h` or `l` press pans the code.
+const PAN_STEP: isize = 8;
+
 /// What a context key does to the hunk under the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -193,6 +196,9 @@ pub struct App {
   /// Row of the line cursor in the selected file's diff, in the current
   /// layout. The viewport follows it.
   pub cursor: usize,
+  /// Columns the code in the diff is shifted left. The render clamps it to
+  /// the widest line.
+  pub pan: usize,
   /// Row where the selection started, in visual mode.
   visual_anchor: usize,
   /// Height of the diff pane in rows, as of the last render.
@@ -228,6 +234,7 @@ impl Default for App {
       list_state: ListState::default(),
       scroll: 0,
       cursor: 0,
+      pan: 0,
       visual_anchor: 0,
       viewport: 0,
       quit: false,
@@ -616,6 +623,8 @@ impl App {
       KeyCode::Esc | KeyCode::Char('v') => self.mode = Mode::Normal,
       KeyCode::Char('j') | KeyCode::Down => self.extend_selection(1),
       KeyCode::Char('k') | KeyCode::Up => self.extend_selection(-1),
+      KeyCode::Char('h') | KeyCode::Left => self.pan_by(-PAN_STEP),
+      KeyCode::Char('l') | KeyCode::Right => self.pan_by(PAN_STEP),
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('a') => self.stage_selection(),
       KeyCode::Char('?') => self.help = true,
@@ -661,6 +670,8 @@ impl App {
       KeyCode::Char('c') if ctrl => self.quit = true,
       KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
       KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
+      KeyCode::Char('h') | KeyCode::Left => self.pan_by(-PAN_STEP),
+      KeyCode::Char('l') | KeyCode::Right => self.pan_by(PAN_STEP),
       KeyCode::Char('d') if ctrl => self.scroll_by(page as isize / 2),
       KeyCode::Char('u') if ctrl => self.scroll_by(-(page as isize / 2)),
       KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(page as isize),
@@ -1004,8 +1015,13 @@ impl App {
     rows
   }
 
+  fn pan_by(&mut self, delta: isize) {
+    self.pan = self.pan.saturating_add_signed(delta);
+  }
+
   fn select(&mut self, index: usize) {
     self.selected = index;
+    self.pan = 0;
     self.scroll = 0;
     self.cursor = 0;
     let row = self
@@ -1478,6 +1494,25 @@ mod tests {
     let mut app = App::default();
     app.on_loaded(Err(vcs::Error::Git("boom".into())));
     assert!(matches!(app.load, Load::Failed(ref m) if m == "boom"));
+  }
+
+  #[test]
+  fn h_and_l_pan_in_steps_and_a_new_file_resets_the_pan() {
+    let mut app = ready(parse(EDIT_DIFF.as_bytes()).unwrap(), 20);
+    app.on_key(key(KeyCode::Char('h')));
+    assert_eq!(app.pan, 0);
+    app.on_key(key(KeyCode::Char('l')));
+    app.on_key(key(KeyCode::Right));
+    assert_eq!(app.pan, 2 * PAN_STEP as usize);
+    app.on_key(key(KeyCode::Left));
+    assert_eq!(app.pan, PAN_STEP as usize);
+    app.on_key(key(KeyCode::Char('v')));
+    app.on_key(key(KeyCode::Char('l')));
+    assert_eq!((app.pan, app.mode), (2 * PAN_STEP as usize, Mode::Visual));
+    app.on_key(key(KeyCode::Char('h')));
+    app.on_key(key(KeyCode::Esc));
+    app.select(0);
+    assert_eq!(app.pan, 0);
   }
 
   #[test]

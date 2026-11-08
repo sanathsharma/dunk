@@ -65,6 +65,7 @@ Press `?` in dunk for the same list.
 | `Space` / `PgDn`, `PgUp` | Page down, up |
 | `Ctrl-d` / `Ctrl-u` | Half page down, up |
 | `g` / `G`, `Home` / `End` | Jump to the top, bottom |
+| `h` / `l`, `←` / `→` | Pan the code left, right by 8 columns. The line numbers, markers and hunk headers stay put. |
 | `]` / `[` | Next, previous hunk |
 | `n` / `p`, `}` / `{`, `Tab` / `Shift-Tab` | Next, previous file |
 | `s` | Switch between split and unified layout |
