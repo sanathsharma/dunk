@@ -248,6 +248,11 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   let cursor = app.cursor.saturating_sub(app.scroll);
   let selection = app.selection();
   let palette = app.palette;
+  let bar_style = if file.section == Some(Section::Unstaged) {
+    palette.diff_hunk_bar
+  } else {
+    palette.diff_hunk_bar_staged
+  };
   // `line_spans` lays the cursor style under the changed words itself, and
   // blank split cells take it in `side`, so only the selection goes on here.
   let mark = |i: usize, line: Line<'static>| {
@@ -294,7 +299,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect::<Vec<_>>();
       let (active, rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-      frame.render_widget(Paragraph::new(bar(&active, &palette)), bar_area);
+      frame.render_widget(Paragraph::new(bar(&active, bar_style)), bar_area);
       frame.render_widget(Paragraph::new(rows), text);
     }
     DiffLayout::Split => {
@@ -363,26 +368,28 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
       let active: Vec<bool> = rows.iter().map(|(a, _, _)| *a).collect();
       let left: Vec<Line> = rows.iter().map(|(_, l, _)| l.clone()).collect();
       let right: Vec<Line> = rows.into_iter().map(|(_, _, r)| r).collect();
-      frame.render_widget(Paragraph::new(bar(&active, &palette)), edge_area);
-      frame.render_widget(Paragraph::new(bar(&active, &palette)), gap_area);
+      frame.render_widget(Paragraph::new(bar(&active, bar_style)), edge_area);
+      frame.render_widget(Paragraph::new(bar(&active, bar_style)), gap_area);
       frame.render_widget(Paragraph::new(left), left_area);
       frame.render_widget(Paragraph::new(right), right_area);
     }
   }
 }
 
-/// The left half of a cell, which `DiffHunkBar` colors with its foreground.
+/// The left half of a cell, which `DiffHunkBar` or `DiffHunkBarStaged` colors
+/// with its foreground.
 const BAR: &str = "\u{258C}";
 
-/// A one cell wide column beside the diff. It holds the `DiffHunkBar` half
-/// block on the rows of the hunk under the cursor and is transparent on the
-/// others.
-fn bar(active: &[bool], palette: &Palette) -> Vec<Line<'static>> {
+/// A one cell wide column beside the diff. It holds a half block
+/// in `style` on the rows of the hunk under the cursor and is transparent on
+/// the others. `DiffHunkBar` styles an unstaged hunk, `DiffHunkBarStaged` a
+/// staged one or one in a revision.
+fn bar(active: &[bool], style: Style) -> Vec<Line<'static>> {
   active
     .iter()
     .map(|&on| {
       if on {
-        Line::styled(BAR, palette.diff_hunk_bar)
+        Line::styled(BAR, style)
       } else {
         Line::raw(" ")
       }
@@ -1036,7 +1043,7 @@ new file mode 100644
   fn the_current_hunk_fills_a_bar_beside_the_diff_and_between_split_columns() {
     let mut app =
       app_with("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d\n");
-    let bar = Palette::default().diff_hunk_bar.fg.unwrap();
+    let bar = Palette::default().diff_hunk_bar_staged.fg.unwrap();
     // The list is 20 wide at this size, so the diff text starts at column 21.
     let (edge, gap) = (21, 21 + 1 + (38 - 2) / 2);
     // The bar is a half block, so its color is the foreground of the cell,
@@ -1069,6 +1076,29 @@ new file mode 100644
     }
     assert_eq!(bg_at(&mut app, "@@ -9,1", gap), bar);
     assert_ne!(bg_at(&mut app, "@@ -1,1", gap), bar);
+  }
+
+  #[test]
+  fn the_hunk_bar_is_white_when_unstaged_and_blue_when_staged() {
+    let palette = Palette::default();
+    let bar_color = |section: Section| {
+      let mut app = sectioned_app(&[section]);
+      let (terminal, rows) = draw(&mut app, 60, 12);
+      let (y, _) = row_with(&rows, "@@");
+      let cell = &terminal.backend().buffer()[(21, y as u16)];
+      assert_eq!(cell.symbol(), BAR);
+      cell.fg
+    };
+
+    assert_eq!(
+      bar_color(Section::Unstaged),
+      palette.diff_hunk_bar.fg.unwrap()
+    );
+    assert_eq!(
+      bar_color(Section::Staged),
+      palette.diff_hunk_bar_staged.fg.unwrap()
+    );
+    assert_ne!(bar_color(Section::Unstaged), bar_color(Section::Staged));
   }
 
   #[test]

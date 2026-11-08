@@ -122,7 +122,8 @@ The `[highlights]` table restyles parts of the screen. Group names are CamelCase
 | `DiffAddText`, `DiffDeleteText` | Changed words inside an added or removed line |
 | `DiffHunkHeader` | The row that opens a hunk |
 | `DiffCurrentHunk` | Added to `DiffHunkHeader` on the hunk under the cursor |
-| `DiffHunkBar` | The bar beside a hunk |
+| `DiffHunkBar` | The bar beside an unstaged hunk, white by default |
+| `DiffHunkBarStaged` | The bar beside a staged hunk or a hunk in a revision, blue by default |
 | `Visual` | Selected lines in visual mode |
 
 Each group takes `fg`, `bg`, `bold`, `italic`, `underline` and `reverse`. A color is an ANSI name such as `"bright-red"`, a palette index such as `42`, or `"#rrggbb"`.
@@ -151,7 +152,8 @@ CursorLine = { bg = "#313244" }
 SectionLabel = { fg = "#cba6f7", bold = true }
 ModeNormal = { fg = "#1e1e2e", bg = "#89b4fa", bold = true }
 ModeVisual = { fg = "#1e1e2e", bg = "#cba6f7", bold = true }
-DiffHunkBar = { fg = "#89b4fa" }
+DiffHunkBar = { fg = "#cdd6f4" }
+DiffHunkBarStaged = { fg = "#89b4fa" }
 
 DiffAdd = { bg = "#394545" }
 DiffDelete = { bg = "#493446" }

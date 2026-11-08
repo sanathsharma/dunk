@@ -61,3 +61,6 @@ The row that opens a hunk. It is drawn but never holds the cursor or a selection
 **Cursor**:
 The row key actions apply to in the diff. It is always on a line, never on a hunk header.
 _Avoid_: selected row (selection and section already use "select")
+
+**Hunk bar**:
+The one-cell bar beside the hunk under the cursor. It is white for an unstaged hunk and blue for a staged one. A hunk in a revision's diff is already committed, so its bar is blue.
