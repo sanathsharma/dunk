@@ -357,6 +357,12 @@ impl App {
     }
   }
 
+  /// Reads the changeset again after a terminal editor exits, since it may
+  /// have saved the file.
+  pub fn on_editor_closed(&mut self) {
+    self.reload();
+  }
+
   /// Takes the result of a background job, unless a newer load made it stale.
   pub fn on_job(&mut self, done: Done) {
     let Some(done) = self.jobs.as_mut().and_then(|jobs| jobs.accept(done)) else {
@@ -1180,7 +1186,7 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
       match &editor {
         None => app.notice = Some("Set $VISUAL or $EDITOR to open files".into()),
         Some(editor) => match open_editor(terminal, &gate, editor, root, &edit)? {
-          Ok(true) => app.reload(),
+          Ok(true) => app.on_editor_closed(),
           Ok(false) => {}
           Err(message) => app.notice = Some(message),
         },
@@ -2149,6 +2155,20 @@ mod tests {
     app.reload();
     settle(app, &rig.rx);
     !Arc::ptr_eq(&before, &app.loaded)
+  }
+
+  #[test]
+  fn closing_the_editor_after_a_save_reloads_once_through_the_runner() {
+    let mut app = App::default();
+    let git = rig(&mut app, crate::vcs::Memory::default().commit("a", "1\n"));
+    load(&mut app, &git);
+    assert!(app.files.is_empty());
+
+    git.save("a", "2\n");
+    app.on_editor_closed();
+    settle(&mut app, &git.rx);
+    assert_eq!(app.files.len(), 1);
+    assert!(quiet(&git.rx));
   }
 
   /// Takes the index write a key press started and the reload after it.

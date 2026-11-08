@@ -71,6 +71,12 @@ impl Memory {
     self
   }
 
+  /// Changes the working tree contents of `path` on a repository already in
+  /// use, as an editor saving the file does.
+  pub fn save(&self, path: &str, text: &str) {
+    self.lock().entry(PathBuf::from(path)).or_default().work = Some(text.to_string());
+  }
+
   /// Puts the working tree contents of `path` in the index.
   #[must_use]
   pub fn staged(self, path: &str) -> Self {
