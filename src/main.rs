@@ -38,7 +38,7 @@ fn run() -> Result<(), Box<dyn Error>> {
   let root = git.root()?;
 
   let mut terminal = ratatui::try_init()?;
-  let result = app::run(&mut terminal, git, request, settings, &root);
+  let result = app::run(&mut terminal, git, &request, settings, &root);
   ratatui::try_restore()?;
   Ok(result?)
 }

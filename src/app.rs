@@ -258,10 +258,15 @@ pub enum ListRow {
 /// Rows a hunk occupies: its header plus one row per line (unified) or per
 /// split pair.
 fn hunk_rows(hunk: &Hunk, layout: Layout) -> usize {
-  1 + match layout {
+  let body = match layout {
     Layout::Unified => hunk.lines.len(),
     Layout::Split => split::pairs(hunk).len(),
-  }
+  };
+  body.saturating_add(1)
+}
+
+fn signed(n: usize) -> isize {
+  isize::try_from(n).unwrap_or(isize::MAX)
 }
 
 /// Rows a file's diff occupies in `layout`.
@@ -274,7 +279,7 @@ fn locate(file: &FileDiff, layout: Layout, mut row: usize) -> Option<(usize, Opt
   for (hi, hunk) in file.hunks.iter().enumerate() {
     let rows = hunk_rows(hunk, layout);
     if row >= rows {
-      row -= rows;
+      row = row.saturating_sub(rows);
       continue;
     }
     let Some(offset) = row.checked_sub(1) else {
@@ -283,8 +288,8 @@ fn locate(file: &FileDiff, layout: Layout, mut row: usize) -> Option<(usize, Opt
     let line = match layout {
       Layout::Unified => offset,
       Layout::Split => {
-        let (left, right) = split::pairs(hunk)[offset];
-        left.or(right).expect("a pair has at least one side")
+        let (left, right) = split::pairs(hunk).get(offset).copied()?;
+        left.or(right)?
       }
     };
     return Some((hi, Some(line)));
@@ -301,8 +306,13 @@ fn row_lines(file: &FileDiff, layout: Layout, row: usize) -> Vec<usize> {
   match layout {
     Layout::Unified => vec![line],
     Layout::Split => {
-      let (left, right) =
-        split::pairs(&file.hunks[hunk])[row - row_of(file, layout, hunk, None) - 1];
+      let offset = row
+        .saturating_sub(row_of(file, layout, hunk, None))
+        .saturating_sub(1);
+      let pairs = file.hunks.get(hunk).map(split::pairs).unwrap_or_default();
+      let Some(&(left, right)) = pairs.get(offset) else {
+        return Vec::new();
+      };
       let mut lines: Vec<usize> = left.into_iter().chain(right).collect();
       lines.dedup();
       lines
@@ -312,19 +322,25 @@ fn row_lines(file: &FileDiff, layout: Layout, row: usize) -> Vec<usize> {
 
 /// The row where a hunk, or a line within it, is drawn in `layout`.
 fn row_of(file: &FileDiff, layout: Layout, hunk: usize, line: Option<usize>) -> usize {
-  let before: usize = file.hunks[..hunk]
+  let before: usize = file
+    .hunks
     .iter()
+    .take(hunk)
     .map(|h| hunk_rows(h, layout))
     .sum();
   let Some(line) = line else { return before };
   let offset = match layout {
     Layout::Unified => line,
-    Layout::Split => split::pairs(&file.hunks[hunk])
+    Layout::Split => file
+      .hunks
+      .get(hunk)
+      .map(split::pairs)
+      .unwrap_or_default()
       .iter()
       .position(|&(l, r)| l == Some(line) || r == Some(line))
       .unwrap_or(0),
   };
-  before + 1 + offset
+  before.saturating_add(1).saturating_add(offset)
 }
 
 impl App {
@@ -374,18 +390,18 @@ impl App {
     self.pending_widen = None;
     let index = followed
       .or(kept)
-      .unwrap_or(self.selected.min(files.len().saturating_sub(1)));
-    let hunk = followed.and(follow.and_then(|target| target.hunk));
+      .unwrap_or_else(|| self.selected.min(files.len().saturating_sub(1)));
+    let hunk = followed.and_then(|_| follow.and_then(|target| target.hunk));
     self.loaded = Arc::new(files);
     self.files = self.loaded.clone();
     self.select(index);
     self.scroll = scroll;
     self.cursor = cursor;
-    if let Some(hunk) = hunk {
-      let file = &self.files[index];
-      if let Some(last) = file.hunks.len().checked_sub(1) {
-        self.cursor = row_of(file, self.layout, hunk.min(last), None);
-      }
+    if let Some(hunk) = hunk
+      && let Some(file) = self.files.get(index)
+      && let Some(last) = file.hunks.len().checked_sub(1)
+    {
+      self.cursor = row_of(file, self.layout, hunk.min(last), None);
     }
     self.clamp_scroll();
     true
@@ -427,12 +443,15 @@ impl App {
     };
     if sides.new.is_none() {
       // Leave the slot empty so the next key press tries the read again.
-      self.sides_requested[index] = false;
+      if let Some(requested) = self.sides_requested.get_mut(index) {
+        *requested = false;
+      }
       self.pending_widen = None;
-      self.notice = Some(format!(
-        "Cannot read {}",
-        self.files[index].path().display()
-      ));
+      let path = self
+        .files
+        .get(index)
+        .map_or_else(String::new, |file| file.path().display().to_string());
+      self.notice = Some(format!("Cannot read {path}"));
       return;
     }
     *slot = Some(sides);
@@ -555,7 +574,10 @@ impl App {
       self.notice = Some("No hunk under the cursor".into());
       return false;
     };
-    let changed = file.hunks[hunk].changed();
+    let Some(changed) = file.hunks.get(hunk).map(Hunk::changed) else {
+      self.notice = Some("No hunk under the cursor".into());
+      return false;
+    };
     if let Some(lines) = &lines
       && !changed.clone().any(|i| lines.contains(&i))
     {
@@ -572,17 +594,14 @@ impl App {
     };
     // A hunk that goes leaves the entry, so the next one takes its index.
     // One that is left only in part is still there at that index.
-    let follow = if !leaves || hunk + 1 < file.hunks.len() {
+    let follow = if !leaves || hunk.saturating_add(1) < file.hunks.len() {
       Some(in_entry(hunk))
     } else {
       self
         .neighbour()
         .or_else(|| hunk.checked_sub(1).map(in_entry))
     };
-    let target = match lines {
-      Some(lines) => Target::Lines(hunk, lines),
-      None => Target::Hunk(hunk),
-    };
+    let target = lines.map_or(Target::Hunk(hunk), |lines| Target::Lines(hunk, lines));
     self.index_request = Some(IndexRequest {
       file: file.clone(),
       target,
@@ -656,8 +675,14 @@ impl App {
     let Some((hunk, _)) = locate(file, self.layout, self.visual_anchor) else {
       return;
     };
-    let first = row_of(file, self.layout, hunk, None) + 1;
-    let last = first - 1 + hunk_rows(&file.hunks[hunk], self.layout) - 1;
+    let Some(rows) = file.hunks.get(hunk).map(|h| hunk_rows(h, self.layout)) else {
+      return;
+    };
+    let first = row_of(file, self.layout, hunk, None).saturating_add(1);
+    let last = first
+      .saturating_sub(1)
+      .saturating_add(rows)
+      .saturating_sub(1);
     self.cursor = self.cursor.saturating_add_signed(delta).clamp(first, last);
     self.clamp_scroll();
   }
@@ -683,12 +708,17 @@ impl App {
   /// when the selected entry is the last.
   fn neighbour(&self) -> Option<Follow> {
     let section = self.files.get(self.selected)?.section?;
-    let in_section = |i: &usize| self.files[*i].section == Some(section);
-    let next = (self.selected + 1..self.files.len()).find(in_section);
+    let in_section = |i: &usize| {
+      self
+        .files
+        .get(*i)
+        .is_some_and(|f| f.section == Some(section))
+    };
+    let next = (self.selected.saturating_add(1)..self.files.len()).find(in_section);
     let previous = (0..self.selected).rev().find(in_section);
     let at = next.or(previous)?;
     Some(Follow {
-      path: self.files[at].path().to_path_buf(),
+      path: self.files.get(at)?.path().to_path_buf(),
       section,
       hunk: None,
     })
@@ -711,7 +741,7 @@ impl App {
       return self.on_visual_key(key);
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let page = self.viewport.max(1);
+    let page = signed(self.viewport.max(1));
     match key.code {
       KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
       KeyCode::Char('c') if ctrl => self.quit = true,
@@ -719,10 +749,10 @@ impl App {
       KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
       KeyCode::Char('h') | KeyCode::Left => self.pan_by(-PAN_STEP),
       KeyCode::Char('l') | KeyCode::Right => self.pan_by(PAN_STEP),
-      KeyCode::Char('d') if ctrl => self.scroll_by(page as isize / 2),
-      KeyCode::Char('u') if ctrl => self.scroll_by(-(page as isize / 2)),
-      KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(page as isize),
-      KeyCode::PageUp => self.scroll_by(-(page as isize)),
+      KeyCode::Char('d') if ctrl => self.scroll_by(page / 2),
+      KeyCode::Char('u') if ctrl => self.scroll_by((page / 2).saturating_neg()),
+      KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(page),
+      KeyCode::PageUp => self.scroll_by(page.saturating_neg()),
       KeyCode::Char('g') | KeyCode::Home => {
         self.scroll = 0;
         self.cursor = 0;
@@ -774,8 +804,8 @@ impl App {
     self.snap_cursor(false);
     if self.cursor < self.scroll {
       self.scroll = self.cursor;
-    } else if self.viewport > 0 && self.cursor >= self.scroll + self.viewport {
-      self.scroll = self.cursor + 1 - self.viewport;
+    } else if self.viewport > 0 && self.cursor >= self.scroll.saturating_add(self.viewport) {
+      self.scroll = self.cursor.saturating_add(1).saturating_sub(self.viewport);
     }
   }
 
@@ -789,9 +819,9 @@ impl App {
       return;
     };
     self.cursor = if backward && hunk > 0 {
-      self.cursor - 1
+      self.cursor.saturating_sub(1)
     } else {
-      self.cursor + 1
+      self.cursor.saturating_add(1)
     };
   }
 
@@ -802,11 +832,12 @@ impl App {
     // Moving up onto a hunk's first line keeps its header in view.
     if delta < 0 && self.scroll >= self.cursor {
       let on_first_line = self.files.get(self.selected).is_some_and(|file| {
-        locate(file, self.layout, self.cursor)
-          .is_some_and(|(hunk, _)| row_of(file, self.layout, hunk, None) + 1 == self.cursor)
+        locate(file, self.layout, self.cursor).is_some_and(|(hunk, _)| {
+          row_of(file, self.layout, hunk, None).saturating_add(1) == self.cursor
+        })
       });
       if on_first_line {
-        self.scroll = self.cursor - 1;
+        self.scroll = self.cursor.saturating_sub(1);
       }
     }
     self.clamp_scroll();
@@ -826,8 +857,8 @@ impl App {
     };
     let header = row_of(file, self.layout, hunk, None);
     let target = if delta > 0 {
-      hunk + 1
-    } else if self.cursor > header + 1 {
+      hunk.saturating_add(1)
+    } else if self.cursor > header.saturating_add(1) {
       hunk
     } else if let Some(previous) = hunk.checked_sub(1) {
       previous
@@ -838,7 +869,7 @@ impl App {
       return;
     }
     self.scroll = row_of(file, self.layout, target, None);
-    self.cursor = self.scroll + 1;
+    self.cursor = self.scroll.saturating_add(1);
     self.clamp_scroll();
   }
 
@@ -856,12 +887,15 @@ impl App {
     let Some((hunk, Some(index))) = locate(file, self.layout, self.cursor) else {
       return;
     };
-    let lines = &file.hunks[hunk].lines;
+    let Some(lines) = file.hunks.get(hunk).map(|h| h.lines.as_slice()) else {
+      return;
+    };
     let new_no = |l: &crate::diff::Line| l.new_no;
-    let line = lines[index..]
+    let (before, after) = lines.split_at_checked(index).unwrap_or((lines, &[]));
+    let line = after
       .iter()
       .find_map(new_no)
-      .or_else(|| lines[..index].iter().rev().find_map(new_no));
+      .or_else(|| before.iter().rev().find_map(new_no));
     let Some(line) = line else {
       self.notice = Some("No line of the file to open".into());
       return;
@@ -928,13 +962,18 @@ impl App {
     let Some((hunk, _)) = locate(file, self.layout, self.cursor) else {
       return;
     };
-    let owners = &self.owners[self.selected];
+    let Some(owners) = self.owners.get(self.selected) else {
+      return;
+    };
+    let Some(&start) = owners.get(hunk) else {
+      return;
+    };
     let end = owners
-      .get(hunk + 1)
+      .get(hunk.saturating_add(1))
       .copied()
-      .unwrap_or(self.loaded[self.selected].hunks.len());
-    let hunks = owners[hunk]..end;
-    if step == Step::More && self.sides[self.selected].is_none() {
+      .unwrap_or_else(|| self.loaded.get(self.selected).map_or(0, |f| f.hunks.len()));
+    let hunks = start..end;
+    if step == Step::More && self.sides.get(self.selected).is_some_and(Option::is_none) {
       self.pending_widen = Some((self.selected, hunks));
     } else {
       self.set_context(self.selected, hunks, step);
@@ -944,11 +983,13 @@ impl App {
   /// Gives hunks `hunks` of file `index` more or less context, or none.
   /// Says so when that changes nothing.
   fn set_context(&mut self, index: usize, hunks: Range<usize>, step: Step) {
-    let before = &self.context[index];
+    let Some(before) = self.context.get(index) else {
+      return;
+    };
     let mut context = before.clone();
-    for extra in &mut context[hunks.clone()] {
+    for extra in context.iter_mut().skip(hunks.start).take(hunks.len()) {
       *extra = match step {
-        Step::More => *extra + CONTEXT_STEP,
+        Step::More => extra.saturating_add(CONTEXT_STEP),
         Step::Less => extra.saturating_sub(CONTEXT_STEP),
         Step::Reset => 0,
       };
@@ -957,17 +998,27 @@ impl App {
       self.notice = Some("Already at the default context".into());
       return;
     }
-    let loaded = &self.loaded[index];
+    let Some(loaded) = self.loaded.get(index) else {
+      return;
+    };
     let (file, owners) = if context.iter().all(|&extra| extra == 0) {
       (loaded.clone(), (0..loaded.hunks.len()).collect())
     } else {
-      let Some(text) = self.sides[index].as_ref().and_then(|s| s.new.as_deref()) else {
+      let Some(text) = self
+        .sides
+        .get(index)
+        .and_then(Option::as_ref)
+        .and_then(|s| s.new.as_deref())
+      else {
         return;
       };
       loaded.widened(&context, text)
     };
     let lines = |f: &FileDiff| f.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
-    if step == Step::More && lines(&file) == lines(&self.files[index]) {
+    let Some(current) = self.files.get(index) else {
+      return;
+    };
+    if step == Step::More && lines(&file) == lines(current) {
       self.notice = Some("No more unchanged lines to show here".into());
       return;
     }
@@ -976,27 +1027,42 @@ impl App {
       .iter()
       .rposition(|&first| first <= hunks.start)
       .unwrap_or(0);
-    Arc::make_mut(&mut self.files)[index] = file;
-    self.context[index] = context;
-    self.owners[index] = owners;
-    self.expansions[index] += 1;
-    self.words[index] = None;
-    self.highlights[index] = None;
-    if let Some(sides) = self.sides[index].clone() {
+    if let Some(slot) = Arc::make_mut(&mut self.files).get_mut(index) {
+      *slot = file;
+    }
+    if let Some(slot) = self.context.get_mut(index) {
+      *slot = context;
+    }
+    if let Some(slot) = self.owners.get_mut(index) {
+      *slot = owners;
+    }
+    let generation = self.expansions.get_mut(index).map_or(0, |n| {
+      *n = n.saturating_add(1);
+      *n
+    });
+    if let Some(slot) = self.words.get_mut(index) {
+      *slot = None;
+    }
+    if let Some(slot) = self.highlights.get_mut(index) {
+      *slot = None;
+    }
+    if let (Some(sides), Some(file)) = (
+      self.sides.get(index).cloned().flatten(),
+      self.files.get(index).cloned(),
+    ) {
       self.rehighlight = Some(Rehighlight {
         index,
-        generation: self.expansions[index],
-        file: self.files[index].clone(),
+        generation,
+        file,
         sides,
       });
     }
     self.scroll = self.scroll.min(self.max_scroll());
     if let Some(row) = anchor.and_then(|numbers| self.row_with_numbers(numbers)) {
-      self.cursor = row
-    } else {
+      self.cursor = row;
+    } else if let Some(file) = self.files.get(index) {
       // The line under the cursor is hidden now. Go to the hunk that held it.
-      let file = &self.files[index];
-      let first = file.hunks[shown].changed().next();
+      let first = file.hunks.get(shown).and_then(|h| h.changed().next());
       self.cursor = row_of(file, self.layout, shown, first);
     }
     self.clamp_scroll();
@@ -1007,7 +1073,7 @@ impl App {
   fn cursor_line_numbers(&self) -> Option<(Option<u32>, Option<u32>)> {
     let file = self.files.get(self.selected)?;
     let (hunk, line) = locate(file, self.layout, self.cursor)?;
-    let l = &file.hunks[hunk].lines[line?];
+    let l = file.hunks.get(hunk)?.lines.get(line?)?;
     Some((l.old_no, l.new_no))
   }
 
@@ -1026,9 +1092,10 @@ impl App {
   /// Moves the cursor into the viewport without scrolling.
   fn clamp_cursor_to_view(&mut self) {
     if self.viewport > 0 {
-      self.cursor = self
-        .cursor
-        .clamp(self.scroll, self.scroll + self.viewport - 1);
+      self.cursor = self.cursor.clamp(
+        self.scroll,
+        self.scroll.saturating_add(self.viewport).saturating_sub(1),
+      );
     }
     self.cursor = self.cursor.min(self.rows().saturating_sub(1));
   }
@@ -1084,7 +1151,7 @@ impl App {
     if self.files.is_empty() {
       return;
     }
-    let last = self.files.len() - 1;
+    let last = self.files.len().saturating_sub(1);
     self.select(self.selected.saturating_add_signed(delta).min(last));
   }
 }
@@ -1124,7 +1191,10 @@ fn spawn_sides(
   tx: Sender<Event>,
 ) {
   thread::spawn(move || {
-    let sides = vcs.sides(&request, &files[index]);
+    let Some(file) = files.get(index) else {
+      return;
+    };
+    let sides = vcs.sides(&request, file);
     let _ = tx.send(Event::Sides(id, index, Arc::new(sides)));
   });
 }
@@ -1235,12 +1305,60 @@ fn open_editor(
   Ok(status.map(|_| true).map_err(failed))
 }
 
+/// Registering watches on a big work tree takes hundreds of milliseconds, so
+/// it happens off the main thread. Dropping the returned sender ends that
+/// thread and with it the watcher.
+fn spawn_watch(root: &Path, tx: &Sender<Event>) -> Sender<()> {
+  let (stop, stopped) = mpsc::channel::<()>();
+  let (root, tx) = (root.to_path_buf(), tx.clone());
+  thread::spawn(move || {
+    let sender = tx.clone();
+    if let Ok(_watch) = Watch::start(&root, move || sender.send(Event::Changed).is_ok()) {
+      // Reload once, to catch edits made while the watches were registering.
+      let _ = tx.send(Event::Changed);
+      let _ = stopped.recv();
+    }
+  });
+  stop
+}
+
+/// Starts the index write and the file read that `app` asked for, if any.
+fn dispatch_requests<V: Vcs + Send + Sync + 'static>(
+  app: &mut App,
+  vcs: &Arc<V>,
+  request: &DiffRequest,
+  id: u64,
+  tx: &Sender<Event>,
+) {
+  if let Some(index_request) = app.take_index_request() {
+    spawn_index(vcs.clone(), index_request, tx.clone());
+  }
+  if let Some(index) = app.take_sides_request() {
+    spawn_sides(
+      vcs.clone(),
+      request.clone(),
+      app.loaded.clone(),
+      index,
+      id,
+      tx.clone(),
+    );
+  }
+}
+
+/// Colors a file again off the UI thread after its context changed.
+fn spawn_rehighlight(highlighter: Arc<Highlighter>, r: Rehighlight, id: u64, tx: Sender<Event>) {
+  thread::spawn(move || {
+    let highlight = highlighter.diff(&r.file, &r.sides);
+    let _ = tx.send(Event::Rehighlighted(id, r.index, r.generation, highlight));
+  });
+}
+
 /// A `theme` in `settings` turns syntax highlighting on; `None` leaves diffs
 /// uncolored.
 pub fn run<V: Vcs + Send + Sync + 'static>(
   terminal: &mut DefaultTerminal,
   vcs: V,
-  request: DiffRequest,
+  request: &DiffRequest,
   settings: Settings,
   root: &Path,
 ) -> io::Result<()> {
@@ -1250,24 +1368,9 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   spawn_input(tx.clone(), gate.clone());
   let editor = Editor::from_env();
   spawn_load(vcs.clone(), request.clone(), 0, tx.clone());
-  // Registering watches on a big work tree takes hundreds of milliseconds, so
-  // it happens off the main thread. Dropping `_watch_stop` ends that thread
-  // and with it the watcher.
-  let _watch_stop = settings.watch.then(|| {
-    let (stop, stopped) = mpsc::channel::<()>();
-    let (root, tx) = (root.to_path_buf(), tx.clone());
-    thread::spawn(move || {
-      let sender = tx.clone();
-      if let Ok(_watch) = Watch::start(&root, move || sender.send(Event::Changed).is_ok()) {
-        // Reload once, to catch edits made while the watches were registering.
-        let _ = tx.send(Event::Changed);
-        let _ = stopped.recv();
-      }
-    });
-    stop
-  });
+  let _watch_stop = settings.watch.then(|| spawn_watch(root, &tx));
   // `latest` numbers the newest load asked for, `applied` the one on screen.
-  let (mut latest, mut applied) = (0, 0);
+  let (mut latest, mut applied) = (0_u64, 0_u64);
 
   let mut app = App {
     layout: settings.layout,
@@ -1284,14 +1387,13 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
     terminal.draw(|frame| ui::render(frame, &mut app))?;
     match rx.recv() {
       Ok(Event::Key(key)) => app.on_key(key),
-      Ok(Event::Resize) => {}
       Ok(Event::Changed) => {
-        latest += 1;
+        latest = latest.saturating_add(1);
         spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
       }
       Ok(Event::Indexed(follow, result)) => {
         if app.on_indexed(follow, result) {
-          latest += 1;
+          latest = latest.saturating_add(1);
           spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
         }
       }
@@ -1314,18 +1416,21 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
             });
         }
       }
-      Ok(Event::Loaded(..)) => {}
       Ok(Event::Highlighted(id, index, highlight)) if id == applied => {
         app.on_highlighted(index, highlight);
       }
-      Ok(Event::Highlighted(..)) => {}
       Ok(Event::Sides(id, index, sides)) if id == applied => app.on_sides(index, sides),
-      Ok(Event::Sides(..)) => {}
       Ok(Event::Rehighlighted(id, index, generation, highlight)) if id == applied => {
         app.on_rehighlighted(index, generation, highlight);
       }
-      Ok(Event::Rehighlighted(..)) => {}
       Ok(Event::InputFailed(e)) => return Err(e),
+      Ok(
+        Event::Resize
+        | Event::Loaded(..)
+        | Event::Highlighted(..)
+        | Event::Sides(..)
+        | Event::Rehighlighted(..),
+      ) => {}
       Err(_) => break,
     }
     if let Some(edit) = app.take_edit() {
@@ -1333,7 +1438,7 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
         None => app.notice = Some("Set $VISUAL or $EDITOR to open files".into()),
         Some(editor) => match open_editor(terminal, &gate, editor, root, &edit)? {
           Ok(true) => {
-            latest += 1;
+            latest = latest.saturating_add(1);
             spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
           }
           Ok(false) => {}
@@ -1344,25 +1449,9 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
     if let Some(r) = app.take_rehighlight()
       && let Some(highlighter) = highlighter.clone()
     {
-      let (tx, id) = (tx.clone(), applied);
-      thread::spawn(move || {
-        let highlight = highlighter.diff(&r.file, &r.sides);
-        let _ = tx.send(Event::Rehighlighted(id, r.index, r.generation, highlight));
-      });
+      spawn_rehighlight(highlighter, r, applied, tx.clone());
     }
-    if let Some(index_request) = app.take_index_request() {
-      spawn_index(vcs.clone(), index_request, tx.clone());
-    }
-    if let Some(index) = app.take_sides_request() {
-      spawn_sides(
-        vcs.clone(),
-        request.clone(),
-        app.loaded.clone(),
-        index,
-        applied,
-        tx.clone(),
-      );
-    }
+    dispatch_requests(&mut app, &vcs, request, applied, &tx);
     if let Some(worker) = &worker {
       worker.focus(app.selected);
     }
