@@ -2381,41 +2381,24 @@ mod tests {
     }
   }
 
-  /// A real repository with `a` and `b` unstaged and `c` staged.
-  fn stage_repo() -> (tempfile::TempDir, crate::vcs::Git) {
-    use std::process::Command;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let d = tmp.path().to_path_buf();
-    let d = d.as_path();
-    let git = |args: &[&str]| {
-      let status = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .current_dir(d)
-        .status()
-        .unwrap();
-      assert!(status.success());
-    };
-    git(&["init", "-q", "-b", "main"]);
-    for f in ["a", "b", "c"] {
-      std::fs::write(d.join(f), "1\n").unwrap();
-    }
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-    for f in ["a", "b", "c"] {
-      std::fs::write(d.join(f), "2\n").unwrap();
-    }
-    git(&["add", "c"]);
-    let repo = crate::vcs::Git::new(d);
-    (tmp, repo)
+  /// `a` and `b` unstaged and `c` staged.
+  fn stage_memory() -> crate::vcs::Memory {
+    crate::vcs::Memory::default()
+      .commit("a", "1\n")
+      .commit("b", "1\n")
+      .commit("c", "1\n")
+      .edit("a", "2\n")
+      .edit("b", "2\n")
+      .edit("c", "2\n")
+      .staged("c")
   }
 
-  fn load(app: &mut App, git: &crate::vcs::Git) -> bool {
+  fn load(app: &mut App, git: &impl Vcs) -> bool {
     app.on_loaded(git.changeset(&DiffRequest::default()))
   }
 
   /// Presses `A` and runs what it asked for, as the event loop does.
-  fn press_capital_a(app: &mut App, git: &crate::vcs::Git) {
+  fn press_capital_a(app: &mut App, git: &impl Vcs) {
     app.on_key(key(KeyCode::Char('A')));
     let request = app.take_index_request().expect("a stage all request");
     let result = request.run(git);
@@ -2425,7 +2408,7 @@ mod tests {
 
   #[test]
   fn capital_a_stages_every_file_then_unstages_every_file() {
-    let (_tmp, git) = stage_repo();
+    let git = stage_memory();
     let mut app = App::default();
     load(&mut app, &git);
     assert_eq!(app.files.len(), 3);
@@ -2446,7 +2429,7 @@ mod tests {
 
   #[test]
   fn capital_a_keeps_the_selected_file() {
-    let (_tmp, git) = stage_repo();
+    let git = stage_memory();
     let mut app = App::default();
     load(&mut app, &git);
     app.on_key(key(KeyCode::Char('n')));
@@ -2457,7 +2440,7 @@ mod tests {
 
   #[test]
   fn comma_and_period_select_the_first_and_last_file() {
-    let (_tmp, git) = stage_repo();
+    let git = stage_memory();
     let mut app = App::default();
     load(&mut app, &git);
     app.on_key(key(KeyCode::Char('.')));
@@ -2467,7 +2450,7 @@ mod tests {
   }
 
   /// Presses `f` and runs what it asked for, as the event loop does.
-  fn press_minus(app: &mut App, git: &crate::vcs::Git) {
+  fn press_minus(app: &mut App, git: &impl Vcs) {
     app.on_key(key(KeyCode::Char('f')));
     let request = app.take_index_request().expect("a stage request");
     let result = request.run(git);
@@ -2482,7 +2465,7 @@ mod tests {
 
   #[test]
   fn minus_moves_a_file_between_sections_and_selects_the_next_one() {
-    let (_tmp, git) = stage_repo();
+    let git = stage_memory();
     let mut app = App::default();
     load(&mut app, &git);
     let (u, s) = (Some(Section::Unstaged), Some(Section::Staged));
@@ -2514,7 +2497,7 @@ mod tests {
 
   #[test]
   fn a_watch_refresh_after_a_stage_keeps_the_selection() {
-    let (_tmp, git) = stage_repo();
+    let git = stage_memory();
     let mut app = App::default();
     load(&mut app, &git);
     press_minus(&mut app, &git);
@@ -2540,7 +2523,7 @@ mod tests {
 
   #[test]
   fn indexing_runs_off_the_calling_thread() {
-    let (_tmp, git) = stage_repo();
+    let git = stage_memory();
     let mut app = App::default();
     load(&mut app, &git);
     app.on_key(key(KeyCode::Char('f')));

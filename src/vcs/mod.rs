@@ -1,4 +1,6 @@
 mod git;
+#[cfg(test)]
+mod memory;
 
 use crate::args::Scope;
 use crate::diff::{FileDiff, ParseError, Section};
@@ -9,6 +11,8 @@ use std::hash::{Hash, Hasher};
 use std::io;
 
 pub use git::Git;
+#[cfg(test)]
+pub use memory::Memory;
 
 #[derive(Debug)]
 pub enum Error {
