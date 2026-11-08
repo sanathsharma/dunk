@@ -2,7 +2,7 @@
 //! goes once the changeset is read again. The app sends a request and applies
 //! the result.
 
-use crate::diff::{FileDiff, Section};
+use crate::diff::{FileDiff, FileStatus, Hunk, Section};
 use crate::vcs::{self, Vcs};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -61,6 +61,14 @@ pub enum Refusal {
   NothingSelected,
   /// The changeset is a revision, which is read-only.
   ReadOnly,
+  /// A conflicted file has no hunks to stage on their own.
+  Conflicted,
+  /// A renamed or copied file has no hunks to stage on their own.
+  RenamedOrCopied,
+  /// The cursor is not on a hunk.
+  NoHunk,
+  /// A selection holds no added or removed line.
+  NoChangedLines,
 }
 
 impl Refusal {
@@ -69,6 +77,12 @@ impl Refusal {
     match self {
       Self::NothingSelected => None,
       Self::ReadOnly => Some("read-only: revision"),
+      Self::Conflicted => Some("Cannot stage hunks of a conflicted file, use f instead"),
+      Self::RenamedOrCopied => {
+        Some("Cannot stage hunks of a renamed or copied file, use f instead")
+      }
+      Self::NoHunk => Some("No hunk under the cursor"),
+      Self::NoChangedLines => Some("no changed lines selected"),
     }
   }
 }
@@ -132,6 +146,57 @@ pub fn toggle_all(files: &[FileDiff], selected: usize) -> Result<IndexRequest, R
       section: to,
       hunk: Some(0),
     }),
+  })
+}
+
+/// Stages hunk `hunk` of the selected entry, or unstages it when the entry is
+/// in the staged section. With `lines`, only those lines of the hunk go.
+///
+/// When the whole hunk goes, it leaves the entry, so the next hunk takes its
+/// index. After the last hunk the selection moves to the next file in the
+/// section, or the previous hunk if there is none. When part of the hunk is
+/// left, the cursor stays on it.
+pub fn toggle_hunk(
+  files: &[FileDiff],
+  selected: usize,
+  hunk: Option<usize>,
+  lines: Option<BTreeSet<usize>>,
+) -> Result<IndexRequest, Refusal> {
+  let (file, section) = entry(files, selected)?;
+  match file.status {
+    FileStatus::Conflicted => return Err(Refusal::Conflicted),
+    FileStatus::Renamed | FileStatus::Copied => return Err(Refusal::RenamedOrCopied),
+    _ => {}
+  }
+  let hunk = hunk.ok_or(Refusal::NoHunk)?;
+  let changed = file
+    .hunks
+    .get(hunk)
+    .map(Hunk::changed)
+    .ok_or(Refusal::NoHunk)?;
+  if let Some(lines) = &lines
+    && !changed.clone().any(|i| lines.contains(&i))
+  {
+    return Err(Refusal::NoChangedLines);
+  }
+  let leaves = lines
+    .as_ref()
+    .is_none_or(|lines| changed.clone().all(|i| lines.contains(&i)));
+  let in_entry = |hunk| Follow {
+    path: file.path().to_path_buf(),
+    section,
+    hunk: Some(hunk),
+  };
+  let follow = if !leaves || hunk.saturating_add(1) < file.hunks.len() {
+    Some(in_entry(hunk))
+  } else {
+    neighbour(files, selected).or_else(|| hunk.checked_sub(1).map(in_entry))
+  };
+  Ok(IndexRequest {
+    file: file.clone(),
+    target: lines.map_or(Target::Hunk(hunk), |lines| Target::Lines(hunk, lines)),
+    stage: section == Section::Unstaged,
+    follow,
   })
 }
 
@@ -273,5 +338,164 @@ mod tests {
       assert_eq!(refusal, Refusal::NothingSelected);
       assert_eq!(refusal.notice(), None);
     }
+  }
+
+  /// `f` has hunks at lines 2 and 19, `g` one at line 2.
+  fn hunk_repo() -> Memory {
+    let text = |a: &str, b: &str| {
+      (1..=20)
+        .map(|n| match n {
+          2 => format!("{a}\n"),
+          19 => format!("{b}\n"),
+          _ => format!("{n}\n"),
+        })
+        .collect::<String>()
+    };
+    Memory::default()
+      .commit("f", &text("2", "19"))
+      .commit("g", &text("2", "19"))
+      .edit("f", &text("TWO", "NINETEEN"))
+      .edit("g", &text("TWO", "19"))
+  }
+
+  fn hunk_follow(request: &IndexRequest) -> Option<(String, Section, Option<usize>)> {
+    request
+      .follow
+      .as_ref()
+      .map(|f| (f.path.display().to_string(), f.section, f.hunk))
+  }
+
+  #[test]
+  fn a_hunk_that_goes_hands_its_index_to_the_next_one() {
+    let files = load(&hunk_repo());
+    let request = toggle_hunk(&files, 0, Some(0), None).unwrap();
+    assert_eq!(request.target, Target::Hunk(0));
+    assert!(request.stage);
+    assert_eq!(
+      hunk_follow(&request),
+      Some(("f".into(), Section::Unstaged, Some(0)))
+    );
+  }
+
+  #[test]
+  fn the_last_hunk_hands_the_cursor_to_the_next_file_in_the_section() {
+    let files = load(&hunk_repo());
+    let request = toggle_hunk(&files, 0, Some(1), None).unwrap();
+    assert_eq!(
+      hunk_follow(&request),
+      Some(("g".into(), Section::Unstaged, None))
+    );
+  }
+
+  #[test]
+  fn the_last_hunk_of_an_only_file_falls_back_to_the_hunk_before() {
+    let vcs = hunk_repo();
+    let files: Vec<_> = load(&vcs).into_iter().take(1).collect();
+    let request = toggle_hunk(&files, 0, Some(1), None).unwrap();
+    assert_eq!(
+      hunk_follow(&request),
+      Some(("f".into(), Section::Unstaged, Some(0)))
+    );
+  }
+
+  #[test]
+  fn part_of_a_hunk_leaves_the_cursor_on_it() {
+    let files = load(&hunk_repo());
+    let changed: Vec<usize> = files[0].hunks[1].changed().collect();
+    let some = BTreeSet::from([changed[0]]);
+    let request = toggle_hunk(&files, 0, Some(1), Some(some.clone())).unwrap();
+    assert_eq!(request.target, Target::Lines(1, some));
+    assert_eq!(
+      hunk_follow(&request),
+      Some(("f".into(), Section::Unstaged, Some(1)))
+    );
+    let all = changed.into_iter().collect();
+    let request = toggle_hunk(&files, 0, Some(1), Some(all)).unwrap();
+    assert_eq!(
+      hunk_follow(&request),
+      Some(("g".into(), Section::Unstaged, None))
+    );
+  }
+
+  #[test]
+  fn a_staged_entry_unstages_its_hunk() {
+    let vcs = hunk_repo().staged("f");
+    let files = load(&vcs);
+    let staged = position_of(&files, "f", Section::Staged);
+    let request = toggle_hunk(&files, staged, Some(0), None).unwrap();
+    assert!(!request.stage);
+    request.run(&vcs).unwrap();
+    let after = load(&vcs);
+    assert_eq!(
+      after[position_of(&after, "f", Section::Staged)].hunks.len(),
+      1
+    );
+    assert_eq!(
+      after[position_of(&after, "f", Section::Unstaged)]
+        .hunks
+        .len(),
+      1
+    );
+  }
+
+  #[test]
+  fn staging_a_hunk_writes_only_that_hunk() {
+    let vcs = hunk_repo();
+    let files = load(&vcs);
+    toggle_hunk(&files, 0, Some(1), None)
+      .unwrap()
+      .run(&vcs)
+      .unwrap();
+    let after = load(&vcs);
+    let staged = after
+      .iter()
+      .find(|f| f.section == Some(Section::Staged))
+      .unwrap();
+    assert_eq!(staged.hunks.len(), 1);
+    let rest = after
+      .iter()
+      .find(|f| f.path().to_str() == Some("f") && f.section == Some(Section::Unstaged))
+      .unwrap();
+    assert_eq!(rest.hunks.len(), 1);
+  }
+
+  #[test]
+  fn hunks_are_refused_for_conflicted_renamed_and_copied_files() {
+    for (status, refusal) in [
+      (FileStatus::Conflicted, Refusal::Conflicted),
+      (FileStatus::Renamed, Refusal::RenamedOrCopied),
+      (FileStatus::Copied, Refusal::RenamedOrCopied),
+    ] {
+      let mut files = load(&hunk_repo());
+      files[0].status = status;
+      assert_eq!(toggle_hunk(&files, 0, Some(0), None).err(), Some(refusal));
+    }
+  }
+
+  #[test]
+  fn hunks_are_refused_without_a_hunk_or_changed_lines_or_in_a_revision() {
+    let mut files = load(&hunk_repo());
+    assert_eq!(
+      toggle_hunk(&files, 0, None, None).err(),
+      Some(Refusal::NoHunk)
+    );
+    assert_eq!(
+      toggle_hunk(&files, 0, Some(9), None).err(),
+      Some(Refusal::NoHunk)
+    );
+    let context_only = BTreeSet::from([0]);
+    assert_eq!(
+      toggle_hunk(&files, 0, Some(0), Some(context_only)).err(),
+      Some(Refusal::NoChangedLines)
+    );
+    assert_eq!(
+      toggle_hunk(&[], 0, Some(0), None).err(),
+      Some(Refusal::NothingSelected)
+    );
+    files[0].section = None;
+    assert_eq!(
+      toggle_hunk(&files, 0, Some(0), None).err(),
+      Some(Refusal::ReadOnly)
+    );
   }
 }

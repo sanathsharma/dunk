@@ -1,12 +1,11 @@
 //! A `Vcs` that keeps the commit, the index and the working tree in memory, so
 //! a test can stage and unstage without a repository or a subprocess.
 //!
-//! It supports whole-file staging. Hunk and line staging report an error until
-//! the staging module needs them.
+//! It supports whole-file, hunk and line staging. Revisions are not supported.
 
 use super::{DiffRequest, Error, Sides, Vcs, VersionId};
 use crate::args::Scope;
-use crate::diff::{self, FileDiff, Section};
+use crate::diff::{self, FileDiff, Hunk, LineKind, Section};
 use similar::TextDiff;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -78,6 +77,32 @@ impl Memory {
     self
   }
 
+  /// Stages or unstages the changed lines of hunk `hunk` of `file` that are in
+  /// `lines`, or all of them when `lines` is `None`.
+  fn rewrite(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: Option<&BTreeSet<usize>>,
+    stage: bool,
+  ) -> Result<(), Error> {
+    let hunk = file
+      .hunks
+      .get(hunk)
+      .ok_or_else(|| Error::Git(format!("no hunk {hunk} in {}", file.path().display())))?;
+    let with = rewritten(hunk, stage, |i| lines.is_none_or(|l| l.contains(&i)));
+    let (start, len) = if stage {
+      (hunk.old_start, hunk.old_len)
+    } else {
+      (hunk.new_start, hunk.new_len)
+    };
+    self.update([file], |v| {
+      let text = splice(v.index.as_deref().unwrap_or(""), start, len, &with);
+      let absent = if stage { &v.work } else { &v.head };
+      v.index = (!text.is_empty() || absent.is_some()).then_some(text);
+    })
+  }
+
   fn missing(path: &Path) -> Error {
     Error::Git(format!("no such file: {}", path.display()))
   }
@@ -100,6 +125,55 @@ impl Memory {
         .ok_or_else(|| Self::missing(file.path()))
     })
   }
+}
+
+/// Replaces `len` lines of `text` from the 1-based line `start` with `with`.
+/// A hunk that covers no lines on its side starts at the line before the gap.
+fn splice(text: &str, start: u32, len: u32, with: &[String]) -> String {
+  let lines: Vec<&str> = text.split_inclusive('\n').collect();
+  let from = if len == 0 {
+    start
+  } else {
+    start.saturating_sub(1)
+  };
+  let from = usize::try_from(from).unwrap_or(usize::MAX).min(lines.len());
+  let to = from.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+  let to = to.min(lines.len());
+  let mut out: String = lines[..from].concat();
+  for line in with {
+    out.push_str(line);
+    out.push('\n');
+  }
+  out.push_str(&lines[to..].concat());
+  out
+}
+
+/// What the lines of `hunk` become on the side a stage or unstage rewrites.
+/// Staging rewrites the index side, the old one, so the picked added lines come
+/// in and the picked removed ones go. Unstaging rewrites the new side of a
+/// staged diff, so the picked added lines go and the picked removed ones come
+/// back. Lines that are not picked stay as they are in the index.
+fn rewritten(hunk: &Hunk, stage: bool, picked: impl Fn(usize) -> bool) -> Vec<String> {
+  let (taken, left) = if stage {
+    (LineKind::Added, LineKind::Removed)
+  } else {
+    (LineKind::Removed, LineKind::Added)
+  };
+  hunk
+    .lines
+    .iter()
+    .enumerate()
+    .filter(|(i, l)| {
+      if l.kind == taken {
+        picked(*i)
+      } else if l.kind == left {
+        !picked(*i)
+      } else {
+        true
+      }
+    })
+    .map(|(_, l)| String::from_utf8_lossy(&l.content).into_owned())
+    .collect()
 }
 
 /// The text of `git diff` for one path, or nothing when the sides match.
@@ -159,20 +233,30 @@ impl Vcs for Memory {
     self.update(files, |v| v.index.clone_from(&v.head))
   }
 
-  fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
-    Err(Self::unsupported())
+  fn stage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {
+    self.rewrite(file, hunk, None, true)
   }
 
-  fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
-    Err(Self::unsupported())
+  fn unstage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {
+    self.rewrite(file, hunk, None, false)
   }
 
-  fn stage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), Error> {
-    Err(Self::unsupported())
+  fn stage_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: &BTreeSet<usize>,
+  ) -> Result<(), Error> {
+    self.rewrite(file, hunk, Some(lines), true)
   }
 
-  fn unstage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), Error> {
-    Err(Self::unsupported())
+  fn unstage_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: &BTreeSet<usize>,
+  ) -> Result<(), Error> {
+    self.rewrite(file, hunk, Some(lines), false)
   }
 
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides {
@@ -269,6 +353,111 @@ mod tests {
     assert_eq!(sides.old.as_deref(), Some(b"1\n".as_slice()));
     assert_eq!(sides.new.as_deref(), Some(b"2\n".as_slice()));
     assert_eq!(sides.new_id, Some(VersionId::of(b"2\n")));
+  }
+
+  /// `f` with lines 1 to 20 and changes at lines 2 and 19, so two hunks.
+  fn two_hunks() -> Memory {
+    let text = |a: &str, b: &str| {
+      (1..=20)
+        .map(|n| match n {
+          2 => format!("{a}\n"),
+          19 => format!("{b}\n"),
+          _ => format!("{n}\n"),
+        })
+        .collect::<String>()
+    };
+    Memory::default()
+      .commit("f", &text("2", "19"))
+      .edit("f", &text("TWO", "NINETEEN"))
+  }
+
+  fn entry(vcs: &Memory, section: Section) -> FileDiff {
+    vcs
+      .changeset(&DiffRequest::default())
+      .unwrap()
+      .into_iter()
+      .find(|f| f.section == Some(section))
+      .unwrap()
+  }
+
+  #[test]
+  fn staging_a_hunk_leaves_the_other_unstaged() {
+    let vcs = two_hunks();
+    vcs.stage_hunk(&entry(&vcs, Section::Unstaged), 1).unwrap();
+    assert_eq!(entry(&vcs, Section::Staged).hunks.len(), 1);
+    let rest = entry(&vcs, Section::Unstaged);
+    assert_eq!(rest.hunks.len(), 1);
+    assert_eq!(rest.hunks[0].lines[2].content, b"TWO");
+  }
+
+  #[test]
+  fn unstaging_a_hunk_puts_it_back_in_the_unstaged_section() {
+    let vcs = two_hunks().staged("f");
+    vcs.unstage_hunk(&entry(&vcs, Section::Staged), 0).unwrap();
+    assert_eq!(entry(&vcs, Section::Staged).hunks.len(), 1);
+    assert_eq!(entry(&vcs, Section::Unstaged).hunks.len(), 1);
+  }
+
+  #[test]
+  fn staging_every_hunk_leaves_nothing_unstaged() {
+    let vcs = two_hunks();
+    vcs.stage_hunk(&entry(&vcs, Section::Unstaged), 0).unwrap();
+    vcs.stage_hunk(&entry(&vcs, Section::Unstaged), 0).unwrap();
+    assert!(
+      vcs
+        .changeset(&DiffRequest::default())
+        .unwrap()
+        .iter()
+        .all(|f| f.section == Some(Section::Staged))
+    );
+  }
+
+  #[test]
+  fn staging_one_line_of_a_replacement_keeps_the_other_half_unstaged() {
+    let vcs = two_hunks();
+    let file = entry(&vcs, Section::Unstaged);
+    // Hunk 0 holds the removed line, then the added one.
+    let removed = file.hunks[0]
+      .lines
+      .iter()
+      .position(|l| l.kind == LineKind::Removed)
+      .unwrap();
+    vcs
+      .stage_lines(&file, 0, &BTreeSet::from([removed]))
+      .unwrap();
+    let staged = entry(&vcs, Section::Staged);
+    assert_eq!(staged.hunks.len(), 1);
+    assert!(
+      staged.hunks[0]
+        .lines
+        .iter()
+        .all(|l| l.kind != LineKind::Added)
+    );
+    vcs
+      .unstage_lines(&staged, 0, &BTreeSet::from([removed]))
+      .unwrap();
+    assert!(
+      vcs
+        .changeset(&DiffRequest::default())
+        .unwrap()
+        .iter()
+        .all(|f| f.section == Some(Section::Unstaged))
+    );
+  }
+
+  #[test]
+  fn staging_an_untracked_file_by_hunk_and_back_removes_it_from_the_index() {
+    let vcs = Memory::default().edit("n", "x\ny\n");
+    vcs.stage_hunk(&entry(&vcs, Section::Unstaged), 0).unwrap();
+    let staged = entry(&vcs, Section::Staged);
+    vcs.unstage_hunk(&staged, 0).unwrap();
+    assert!(
+      vcs
+        .changeset(&DiffRequest::default())
+        .unwrap()
+        .iter()
+        .all(|f| f.section == Some(Section::Unstaged))
+    );
   }
 
   #[test]

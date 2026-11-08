@@ -6,7 +6,7 @@ use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
 use crate::palette::Palette;
 use crate::split;
-use crate::staging::{self, Follow, IndexRequest, Refusal, Target};
+use crate::staging::{self, Follow, IndexRequest, Refusal};
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Sides, Vcs};
 use crate::watch::Watch;
@@ -471,61 +471,10 @@ impl App {
   /// part of the hunk is left, the cursor stays on it. Returns whether a
   /// request was made.
   fn toggle_stage_hunk(&mut self, lines: Option<BTreeSet<usize>>) -> bool {
-    let Some(file) = self.files.get(self.selected) else {
-      return false;
-    };
-    let Some(section) = file.section else {
-      self.notice = Some("read-only: revision".into());
-      return false;
-    };
-    if matches!(
-      file.status,
-      FileStatus::Conflicted | FileStatus::Renamed | FileStatus::Copied
-    ) {
-      let what = match file.status {
-        FileStatus::Conflicted => "a conflicted",
-        _ => "a renamed or copied",
-      };
-      self.notice = Some(format!("Cannot stage hunks of {what} file, use f instead"));
-      return false;
-    }
-    let Some(hunk) = self.cursor_hunk() else {
-      self.notice = Some("No hunk under the cursor".into());
-      return false;
-    };
-    let Some(changed) = file.hunks.get(hunk).map(Hunk::changed) else {
-      self.notice = Some("No hunk under the cursor".into());
-      return false;
-    };
-    if let Some(lines) = &lines
-      && !changed.clone().any(|i| lines.contains(&i))
-    {
-      self.notice = Some("no changed lines selected".into());
-      return false;
-    }
-    let leaves = lines
-      .as_ref()
-      .is_none_or(|lines| changed.clone().all(|i| lines.contains(&i)));
-    let in_entry = |hunk| Follow {
-      path: file.path().to_path_buf(),
-      section,
-      hunk: Some(hunk),
-    };
-    // A hunk that goes leaves the entry, so the next one takes its index.
-    // One that is left only in part is still there at that index.
-    let follow = if !leaves || hunk.saturating_add(1) < file.hunks.len() {
-      Some(in_entry(hunk))
-    } else {
-      staging::neighbour(&self.files, self.selected).or_else(|| hunk.checked_sub(1).map(in_entry))
-    };
-    let target = lines.map_or(Target::Hunk(hunk), |lines| Target::Lines(hunk, lines));
-    self.index_request = Some(IndexRequest {
-      file: file.clone(),
-      target,
-      stage: section == Section::Unstaged,
-      follow,
-    });
-    true
+    let request = staging::toggle_hunk(&self.files, self.selected, self.cursor_hunk(), lines);
+    let made = request.is_ok();
+    self.request_index(request);
+    made
   }
 
   /// Starts a selection at the cursor.
@@ -2433,19 +2382,7 @@ mod tests {
   }
 
   /// `one` and `two` each have two unstaged hunks.
-  fn hunk_repo() -> (tempfile::TempDir, crate::vcs::Git) {
-    use std::process::Command;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let d = tmp.path().to_path_buf();
-    let git = |args: &[&str]| {
-      let status = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        .args(args)
-        .current_dir(&d)
-        .status()
-        .unwrap();
-      assert!(status.success());
-    };
+  fn hunk_repo() -> crate::vcs::Memory {
     let body = |top: &str, bottom: &str| {
       (1..=20)
         .map(|n| match n {
@@ -2455,24 +2392,18 @@ mod tests {
         })
         .collect::<String>()
     };
-    git(&["init", "-q", "-b", "main"]);
-    for f in ["one", "two"] {
-      std::fs::write(d.join(f), body("2", "19")).unwrap();
-    }
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-    for f in ["one", "two"] {
-      std::fs::write(d.join(f), body("TOP", "BOTTOM")).unwrap();
-    }
-    let repo = crate::vcs::Git::new(&d);
-    (tmp, repo)
+    crate::vcs::Memory::default()
+      .commit("one", &body("2", "19"))
+      .commit("two", &body("2", "19"))
+      .edit("one", &body("TOP", "BOTTOM"))
+      .edit("two", &body("TOP", "BOTTOM"))
   }
 
   /// Presses `a` and runs what it asked for, as the event loop does.
-  fn press_a(app: &mut App, git: &crate::vcs::Git) {
+  fn press_a(app: &mut App, git: &impl Vcs) {
     app.on_key(key(KeyCode::Char('a')));
     let request = app.take_index_request().expect("a hunk request");
-    assert!(matches!(request.target, Target::Hunk(_)));
+    assert!(matches!(request.target, crate::staging::Target::Hunk(_)));
     let result = request.run(git);
     assert!(app.on_indexed(request.follow, result));
     load(app, git);
@@ -2480,7 +2411,7 @@ mod tests {
 
   #[test]
   fn a_stages_the_hunk_under_the_cursor_and_the_cursor_moves_to_the_next_hunk() {
-    let (_tmp, git) = hunk_repo();
+    let git = hunk_repo();
     let mut app = App::default();
     load(&mut app, &git);
     let u = Some(Section::Unstaged);
@@ -2502,7 +2433,7 @@ mod tests {
 
   #[test]
   fn a_on_the_last_hunk_moves_to_the_next_file_in_the_section() {
-    let (_tmp, git) = hunk_repo();
+    let git = hunk_repo();
     let mut app = App::default();
     load(&mut app, &git);
     let u = Some(Section::Unstaged);
@@ -2515,7 +2446,7 @@ mod tests {
 
   #[test]
   fn a_in_the_staged_section_unstages_that_hunk_only() {
-    let (_tmp, git) = hunk_repo();
+    let git = hunk_repo();
     let mut app = App::default();
     load(&mut app, &git);
     press_a(&mut app, &git);
@@ -2609,7 +2540,7 @@ mod tests {
 
   /// Runs the stage or unstage the last key press asked for, as the event
   /// loop does, and reloads.
-  fn run_request(app: &mut App, git: &crate::vcs::Git) {
+  fn run_request(app: &mut App, git: &impl Vcs) {
     let request = app.take_index_request().expect("an index request");
     let result = request.run(git);
     assert!(app.on_indexed(request.follow, result));
@@ -2746,7 +2677,7 @@ mod tests {
 
   #[test]
   fn the_selection_stays_inside_its_hunk() {
-    let (_tmp, git) = hunk_repo();
+    let git = hunk_repo();
     let mut app = App::default();
     load(&mut app, &git);
     let first = app.files[0].hunks[0].lines.len();
@@ -2961,7 +2892,7 @@ mod tests {
 
   #[test]
   fn the_cursor_moves_on_when_the_selection_takes_the_whole_hunk() {
-    let (_tmp, git) = hunk_repo();
+    let git = hunk_repo();
     let mut app = App::default();
     load(&mut app, &git);
     let first = app.files[0].hunks[0].clone();
