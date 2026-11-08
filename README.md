@@ -2,6 +2,8 @@
 
 A terminal tool for reviewing git changes before you commit them. It shows a file list and a diff side by side, and lets you stage or unstage whole files, hunks or single lines as you read.
 
+![dunk in split layout, showing the file list and a diff](docs/screenshot.png)
+
 ## Requirements
 
 - git, on your `PATH`. dunk runs it for every diff and every stage or unstage.
