@@ -118,6 +118,14 @@ mod tests {
       unreachable!()
     }
 
+    fn stage_all(&self, _: &[FileDiff]) -> Result<(), Error> {
+      unreachable!()
+    }
+
+    fn unstage_all(&self, _: &[FileDiff]) -> Result<(), Error> {
+      unreachable!()
+    }
+
     fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
       unreachable!()
     }

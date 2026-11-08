@@ -68,12 +68,14 @@ Press `?` in dunk for the same list.
 | `h` / `l`, `←` / `→` | Pan the code left, right by 8 columns. The line numbers, markers and hunk headers stay put. |
 | `]` / `[` | Next, previous hunk |
 | `n` / `p`, `}` / `{`, `Tab` / `Shift-Tab` | Next, previous file |
+| `,` / `.` | First, last file |
 | `s` | Switch between split and unified layout |
 | `+` / `-` | Show 3 more or 3 fewer unchanged lines around the hunk under the cursor |
 | `=` | Return to the default context |
 | `v` | Enter visual mode to select lines. `Esc` or `v` leaves it. |
 | `a` | Stage or unstage the hunk under the cursor, or the selection in visual mode |
 | `f` | Stage or unstage the whole file |
+| `A` | Stage every unstaged file, or unstage every staged file when none is left to stage |
 | `e` | Open the cursor's line in `$VISUAL` or `$EDITOR` |
 | `?` | Open the help menu |
 | `q`, `Esc`, `Ctrl-c` | Quit |

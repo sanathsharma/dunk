@@ -111,10 +111,21 @@ impl Git {
   /// literally. It runs at the repository root because the paths of a
   /// `FileDiff` are relative to it.
   fn write_index(&self, args: &[&str], file: &FileDiff) -> Result<(), Error> {
+    self.write_index_all(args, std::slice::from_ref(file))
+  }
+
+  /// Like `write_index`, for every file of `files` in one git call.
+  fn write_index_all(&self, args: &[&str], files: &[FileDiff]) -> Result<(), Error> {
+    if files.is_empty() {
+      return Ok(());
+    }
     let root = self.root()?;
-    let mut paths = vec![file.path()];
-    if file.status == FileStatus::Renamed {
-      paths.extend(file.old_path.as_deref());
+    let mut paths = Vec::new();
+    for file in files {
+      paths.push(file.path());
+      if file.status == FileStatus::Renamed {
+        paths.extend(file.old_path.as_deref());
+      }
     }
     let mut full: Vec<&OsStr> = vec!["--literal-pathspecs".as_ref()];
     full.extend(args.iter().map(OsStr::new));
@@ -340,6 +351,14 @@ impl Vcs for Git {
 
   fn unstage(&self, file: &FileDiff) -> Result<(), Error> {
     self.write_index(&["reset", "-q"], file)
+  }
+
+  fn stage_all(&self, files: &[FileDiff]) -> Result<(), Error> {
+    self.write_index_all(&["add", "-A"], files)
+  }
+
+  fn unstage_all(&self, files: &[FileDiff]) -> Result<(), Error> {
+    self.write_index_all(&["reset", "-q"], files)
   }
 
   fn stage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {

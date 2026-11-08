@@ -30,6 +30,11 @@ const HELP_MENU: &[(&str, &str)] = &[
   ("e", "open the cursor's line in $VISUAL or $EDITOR"),
   ("a", "stage or unstage hunk or selection"),
   ("f", "stage or unstage file"),
+  (
+    "A",
+    "stage all files, or unstage all when none is left to stage",
+  ),
+  (",/.", "first, last file"),
   ("?", "open this help"),
   ("q, esc", "quit"),
 ];

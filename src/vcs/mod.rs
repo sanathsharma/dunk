@@ -118,6 +118,13 @@ pub trait Vcs {
   /// Resets `file` in the index to the commit, keeping the working tree.
   fn unstage(&self, file: &FileDiff) -> Result<(), Error>;
 
+  /// Adds all working tree changes of `files` to the index in one git call.
+  fn stage_all(&self, files: &[FileDiff]) -> Result<(), Error>;
+
+  /// Resets `files` in the index to the commit in one git call, keeping the
+  /// working tree.
+  fn unstage_all(&self, files: &[FileDiff]) -> Result<(), Error>;
+
   /// Adds only hunk `hunk` of `file` to the index. An untracked file is first
   /// marked intent-to-add so the hunk applies like a tracked change.
   fn stage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error>;

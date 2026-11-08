@@ -68,6 +68,8 @@ pub enum Target {
   Hunk(usize),
   /// The lines of a hunk at these indexes into the hunk's lines.
   Lines(usize, BTreeSet<usize>),
+  /// Every file of the list that is in the section the request moves out of.
+  All(Vec<FileDiff>),
 }
 
 /// A stage or unstage of a file, a hunk or some of its lines waiting to run.
@@ -86,6 +88,8 @@ impl IndexRequest {
     match (&self.target, self.stage) {
       (Target::File, true) => vcs.stage(file),
       (Target::File, false) => vcs.unstage(file),
+      (Target::All(files), true) => vcs.stage_all(files),
+      (Target::All(files), false) => vcs.unstage_all(files),
       (Target::Hunk(hunk), true) => vcs.stage_hunk(file, *hunk),
       (Target::Hunk(hunk), false) => vcs.unstage_hunk(file, *hunk),
       (Target::Lines(hunk, lines), true) => vcs.stage_lines(file, *hunk, lines),
@@ -479,6 +483,49 @@ impl App {
     });
   }
 
+  /// Asks to stage every unstaged entry, or to unstage every staged entry
+  /// when none is left to stage. The selection follows its file into the
+  /// section the file moves to.
+  fn toggle_stage_all(&mut self) {
+    let Some(file) = self.files.get(self.selected) else {
+      return;
+    };
+    if file.section.is_none() {
+      self.notice = Some("read-only: revision".into());
+      return;
+    }
+    let stage = self
+      .files
+      .iter()
+      .any(|f| f.section == Some(Section::Unstaged));
+    let from = if stage {
+      Section::Unstaged
+    } else {
+      Section::Staged
+    };
+    let files: Vec<FileDiff> = self
+      .files
+      .iter()
+      .filter(|f| f.section == Some(from))
+      .cloned()
+      .collect();
+    let to = if stage {
+      Section::Staged
+    } else {
+      Section::Unstaged
+    };
+    self.index_request = Some(IndexRequest {
+      file: file.clone(),
+      target: Target::All(files),
+      stage,
+      follow: Some(Follow {
+        path: file.path().to_path_buf(),
+        section: to,
+        hunk: Some(0),
+      }),
+    });
+  }
+
   /// Asks to stage the hunk under the cursor, or to unstage it when the
   /// selected entry is in the staged section, or only the lines `lines` of
   /// that hunk. When the whole hunk goes, the cursor moves to the next hunk of
@@ -690,6 +737,9 @@ impl App {
       KeyCode::Char('-') => self.change_context(Step::Less),
       KeyCode::Char('=') => self.change_context(Step::Reset),
       KeyCode::Char('f') => self.toggle_stage(),
+      KeyCode::Char('A') => self.toggle_stage_all(),
+      KeyCode::Char(',') => self.select(0),
+      KeyCode::Char('.') => self.select(self.files.len().saturating_sub(1)),
       KeyCode::Char('a') => {
         self.toggle_stage_hunk(None);
       }
@@ -2171,6 +2221,14 @@ mod tests {
       unreachable!()
     }
 
+    fn stage_all(&self, _: &[FileDiff]) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
+
+    fn unstage_all(&self, _: &[FileDiff]) -> Result<(), vcs::Error> {
+      unreachable!()
+    }
+
     fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
       unreachable!()
     }
@@ -2247,6 +2305,58 @@ mod tests {
 
   fn load(app: &mut App, git: &crate::vcs::Git) -> bool {
     app.on_loaded(git.changeset(&DiffRequest::default()))
+  }
+
+  /// Presses `A` and runs what it asked for, as the event loop does.
+  fn press_capital_a(app: &mut App, git: &crate::vcs::Git) {
+    app.on_key(key(KeyCode::Char('A')));
+    let request = app.take_index_request().expect("a stage all request");
+    let result = request.run(git);
+    assert!(app.on_indexed(request.follow, result));
+    load(app, git);
+  }
+
+  #[test]
+  fn capital_a_stages_every_file_then_unstages_every_file() {
+    let (_tmp, git) = stage_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    assert_eq!(app.files.len(), 3);
+
+    press_capital_a(&mut app, &git);
+    assert!(app.files.iter().all(|f| f.section == Some(Section::Staged)));
+    assert_eq!(app.files.len(), 3);
+
+    press_capital_a(&mut app, &git);
+    assert!(
+      app
+        .files
+        .iter()
+        .all(|f| f.section == Some(Section::Unstaged))
+    );
+    assert_eq!(app.files.len(), 3);
+  }
+
+  #[test]
+  fn capital_a_keeps_the_selected_file() {
+    let (_tmp, git) = stage_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('n')));
+    let name = selected_name(&app).0;
+    press_capital_a(&mut app, &git);
+    assert_eq!(selected_name(&app), (name, Some(Section::Staged)));
+  }
+
+  #[test]
+  fn comma_and_period_select_the_first_and_last_file() {
+    let (_tmp, git) = stage_repo();
+    let mut app = App::default();
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('.')));
+    assert_eq!(app.selected, app.files.len() - 1);
+    app.on_key(key(KeyCode::Char(',')));
+    assert_eq!(app.selected, 0);
   }
 
   /// Presses `f` and runs what it asked for, as the event loop does.
