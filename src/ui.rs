@@ -85,7 +85,9 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     .collect();
   let widest = lines.iter().map(Line::width).max().unwrap_or(0);
   // The widest line, a space after it and the two borders.
-  let width = (widest + 3).max(" Help (esc or q closes) ".len() + 2).min(area.width as usize) as u16;
+  let width = (widest + 3)
+    .max(" Help (esc or q closes) ".len() + 2)
+    .min(area.width as usize) as u16;
   let height = (lines.len() as u16 + 2).min(area.height);
   let [_, row, _] = Layout::vertical([
     Constraint::Fill(1),
@@ -236,17 +238,14 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   let cursor = app.cursor.saturating_sub(app.scroll);
   let selection = app.selection();
   let palette = app.palette;
+  // `line_spans` lays the cursor style under the changed words itself, and
+  // blank split cells take it in `side`, so only the selection goes on here.
   let mark = |i: usize, line: Line<'static>| {
     let selected = selection
       .as_ref()
       .is_some_and(|rows| rows.contains(&(app.scroll + i)));
-    let line = if selected {
+    if selected {
       overlay(line, palette.visual)
-    } else {
-      line
-    };
-    if i == cursor {
-      overlay(line, palette.cursor_line)
     } else {
       line
     }
@@ -276,12 +275,13 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .skip(app.scroll)
         .take(app.viewport)
-        .map(|row| {
-          let active = row.active();
-          (active, row_line(row, &palette, width, text.width.into()))
-        })
         .enumerate()
-        .map(|(i, (active, line))| (active, mark(i, line)))
+        .map(|(i, row)| {
+          let active = row.active();
+          let at_cursor = (i == cursor).then_some(palette.cursor_line);
+          let line = row_line(row, &palette, width, text.width.into(), at_cursor);
+          (active, mark(i, line))
+        })
         .collect::<Vec<_>>();
       let (active, rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
       frame.render_widget(Paragraph::new(bar(&active, &palette)), bar_area);
@@ -297,48 +297,57 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(right_width),
       ])
       .areas(inner);
-      let side = |index: Option<usize>, hi: usize, new: bool, fill: u16| match index {
-        Some(li) => {
-          let (l, styled, ranges) = line_of(hi, li);
-          let number = if new { l.new_no } else { l.old_no };
-          let gutter = format!(
-            "{:>width$} ",
-            number.map_or(String::new(), |n| n.to_string())
-          );
-          line_spans(
-            l,
-            &palette,
-            styled,
-            ranges,
-            gutter,
-            usize::from(fill),
-            current == Some(hi),
-          )
-        }
-        None => blank(fill),
+      let side = |index: Option<usize>, hi: usize, new: bool, fill: u16, at_cursor: bool| {
+        let Some(li) = index else {
+          let cell = blank(fill);
+          return if at_cursor {
+            overlay(cell, palette.cursor_line)
+          } else {
+            cell
+          };
+        };
+        let (l, styled, ranges) = line_of(hi, li);
+        let number = if new { l.new_no } else { l.old_no };
+        let gutter = format!(
+          "{:>width$} ",
+          number.map_or(String::new(), |n| n.to_string())
+        );
+        line_spans(
+          l,
+          &palette,
+          styled,
+          ranges,
+          gutter,
+          usize::from(fill),
+          current == Some(hi),
+          at_cursor.then_some(palette.cursor_line),
+        )
       };
       let rows: Vec<(bool, Line, Line)> = hunks
         .flat_map(|(hi, h)| {
-          let active = current == Some(hi);
-          let header = Row::Header(h, active);
-          let header = (
-            active,
-            row_line(header, &palette, width, left_width.into()),
-            blank(right_width),
-          );
-          let pairs = pairs(h).into_iter().map(move |(l, r)| {
-            (
-              active,
-              side(l, hi, false, left_width),
-              side(r, hi, true, right_width),
-            )
-          });
-          std::iter::once(header).chain(pairs)
+          let header = std::iter::once((hi, h, None));
+          let pairs = pairs(h).into_iter().map(move |p| (hi, h, Some(p)));
+          header.chain(pairs)
         })
         .skip(app.scroll)
         .take(app.viewport)
         .enumerate()
-        .map(|(i, (active, l, r))| (active, mark(i, l), mark(i, r)))
+        .map(|(i, (hi, h, pair))| {
+          let active = current == Some(hi);
+          let on = i == cursor;
+          match pair {
+            None => {
+              let header = Row::Header(h, active);
+              let left = row_line(header, &palette, width, left_width.into(), None);
+              (active, mark(i, left), mark(i, blank(right_width)))
+            }
+            Some((l, r)) => (
+              active,
+              mark(i, side(l, hi, false, left_width, on)),
+              mark(i, side(r, hi, true, right_width, on)),
+            ),
+          }
+        })
         .collect();
       let active: Vec<bool> = rows.iter().map(|(a, _, _)| *a).collect();
       let left: Vec<Line> = rows.iter().map(|(_, l, _)| l.clone()).collect();
@@ -416,7 +425,14 @@ fn gutter_width(file: &FileDiff) -> usize {
 }
 
 /// `fill` pads changed lines to the pane width so their background spans it.
-fn row_line(row: Row, palette: &Palette, width: usize, fill: usize) -> Line<'static> {
+/// `cursor` is the style to lay under the changed words of a diff line.
+fn row_line(
+  row: Row,
+  palette: &Palette,
+  width: usize,
+  fill: usize,
+  cursor: Option<Style>,
+) -> Line<'static> {
   match row {
     Row::Header(h, current) => Line::styled(
       format!(
@@ -439,13 +455,15 @@ fn row_line(row: Row, palette: &Palette, width: usize, fill: usize) -> Line<'sta
     Row::Line(l, styled, changed, current) => {
       let no = |n: Option<u32>| n.map_or(String::new(), |n| n.to_string());
       let gutter = format!("{:>width$} {:>width$} ", no(l.old_no), no(l.new_no));
-      line_spans(l, palette, styled, changed, gutter, fill, current)
+      line_spans(l, palette, styled, changed, gutter, fill, current, cursor)
     }
   }
 }
 
 /// One diff line: gutter, marker, then the code with changed words
-/// emphasized.
+/// emphasized. The `cursor` style covers all but the changed words, which keep
+/// their own background so the cursor line does not flatten them.
+#[allow(clippy::too_many_arguments)]
 fn line_spans(
   l: &DiffLine,
   palette: &Palette,
@@ -454,6 +472,7 @@ fn line_spans(
   gutter: String,
   fill: usize,
   current: bool,
+  cursor: Option<Style>,
 ) -> Line<'static> {
   let (marker, style, word_bg) = match l.kind {
     LineKind::Context => (' ', Style::new(), None),
@@ -465,9 +484,10 @@ fn line_spans(
   } else {
     Color::DarkGray
   };
+  let under = cursor.unwrap_or_default();
   let mut spans = vec![
-    Span::styled(gutter, Style::new().fg(gutter_color)),
-    Span::raw(marker.to_string()),
+    Span::styled(gutter, Style::new().fg(gutter_color).patch(under)),
+    Span::styled(marker.to_string(), under),
   ];
   let plain;
   let pieces = match styled {
@@ -481,30 +501,35 @@ fn line_spans(
     }
   };
   spans.extend(
-    emphasize(pieces, changed, word_bg)
+    emphasize(pieces, changed, word_bg, under)
       .into_iter()
       .map(|(style, text)| Span::styled(sanitize(text.as_bytes()), style)),
   );
   if l.no_newline {
     spans.push(Span::styled(
       " [no newline at end of file]",
-      Style::new().fg(Color::DarkGray),
+      Style::new().fg(Color::DarkGray).patch(under),
     ));
   }
   let used: usize = spans.iter().map(Span::width).sum();
-  spans.push(Span::raw(" ".repeat(fill.saturating_sub(used))));
+  spans.push(Span::styled(" ".repeat(fill.saturating_sub(used)), under));
   Line::from(spans).style(style)
 }
 
 /// Splits `pieces` at the edges of `changed` (byte offsets into the joined
-/// text) and lays the `emphasis` style over the changed parts.
+/// text), lays the `emphasis` style over the changed parts and the `rest`
+/// style over everything else.
 fn emphasize(
   pieces: &[(Style, String)],
   changed: &[Range<usize>],
   emphasis: Option<Style>,
+  rest: Style,
 ) -> Vec<(Style, String)> {
   let Some(emphasis) = emphasis.filter(|_| !changed.is_empty()) else {
-    return pieces.to_vec();
+    return pieces
+      .iter()
+      .map(|(s, t)| (s.patch(rest), t.clone()))
+      .collect();
   };
   let mut out = Vec::new();
   let mut at = 0;
@@ -523,7 +548,11 @@ fn emphasize(
     for w in cut.windows(2) {
       let (from, to) = (at + w[0], at + w[1]);
       let hit = changed.iter().any(|r| r.start <= from && to <= r.end);
-      let style = if hit { style.patch(emphasis) } else { *style };
+      let style = if hit {
+        style.patch(emphasis)
+      } else {
+        style.patch(rest)
+      };
       out.push((style, text[w[0]..w[1]].to_string()));
     }
     at = end;
@@ -850,11 +879,36 @@ new file mode 100644
   }
 
   #[test]
+  fn changed_words_keep_their_background_under_the_cursor_in_both_layouts() {
+    let p = Palette::default();
+    for split in [false, true] {
+      let mut app = app_with(DIFF);
+      if split {
+        app.layout = DiffLayout::Split;
+      }
+      app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+      let (terminal, rows) = draw(&mut app, 80, 14);
+      let buffer = terminal.backend().buffer();
+      let (y, row) = row_with(&rows, "old");
+      let x = row[..row.find("old").unwrap()].chars().count() as u16;
+      let (word, rest) = (&buffer[(x, y as u16)], &buffer[(x + 10, y as u16)]);
+      assert_eq!(word.bg, p.diff_delete_text.bg.unwrap(), "split={split}");
+      assert!(!word.modifier.contains(Modifier::REVERSED), "split={split}");
+      assert!(rest.modifier.contains(Modifier::REVERSED), "split={split}");
+    }
+  }
+
+  #[test]
   #[allow(clippy::single_range_in_vec_init)]
   fn emphasis_keeps_syntax_colors_and_splits_pieces() {
     let red = Style::new().fg(Color::Red);
     let pieces = vec![(red, "ab".to_string()), (Style::new(), "cd".to_string())];
-    let out = emphasize(&pieces, &[1..3], Some(Style::new().bg(Color::Blue)));
+    let out = emphasize(
+      &pieces,
+      &[1..3],
+      Some(Style::new().bg(Color::Blue)),
+      Style::new(),
+    );
     let texts: Vec<_> = out.iter().map(|(_, t)| t.as_str()).collect();
     assert_eq!(texts, ["a", "b", "c", "d"]);
     assert_eq!(out[0].0, red);

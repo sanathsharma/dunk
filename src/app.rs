@@ -1740,7 +1740,11 @@ mod tests {
       app.layout = Layout::Unified;
       app.scroll = unified;
       // The cursor sits on the line below a header.
-      app.cursor = if unified % 6 == 0 { unified + 1 } else { unified };
+      app.cursor = if unified % 6 == 0 {
+        unified + 1
+      } else {
+        unified
+      };
       app.on_key(key(KeyCode::Char('s')));
       assert_eq!(app.layout, Layout::Split);
       assert_eq!(app.scroll, split, "unified row {unified}");
