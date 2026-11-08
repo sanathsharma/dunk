@@ -128,6 +128,7 @@ The `[highlights]` table restyles parts of the screen. Group names are CamelCase
 | `DiffCurrentHunk` | Added to `DiffHunkHeader` on the hunk under the cursor |
 | `DiffHunkBar` | The bar beside an unstaged hunk, white by default |
 | `DiffHunkBarStaged` | The bar beside a staged hunk or a hunk in a revision, blue by default |
+| `DiffHunkSeparator` | The rule between two hunks, dark gray by default |
 | `Visual` | Selected lines in visual mode |
 
 Each group takes `fg`, `bg`, `bold`, `italic`, `underline` and `reverse`. A color is an ANSI name such as `"bright-red"`, a palette index such as `42`, or `"#rrggbb"`.

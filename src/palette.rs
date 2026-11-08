@@ -20,6 +20,7 @@ pub struct Palette {
   pub diff_current_hunk: Style,
   pub diff_hunk_bar: Style,
   pub diff_hunk_bar_staged: Style,
+  pub diff_hunk_separator: Style,
   pub visual: Style,
 }
 
@@ -44,6 +45,7 @@ impl Default for Palette {
         .add_modifier(Modifier::BOLD),
       diff_hunk_bar: Style::new().fg(Color::White),
       diff_hunk_bar_staged: Style::new().fg(Color::Blue),
+      diff_hunk_separator: Style::new().fg(Color::DarkGray),
       visual: Style::new().bg(Color::Blue),
     }
   }
@@ -84,6 +86,8 @@ pub struct Highlights {
   diff_hunk_bar: Option<Spec>,
   #[serde(rename = "DiffHunkBarStaged")]
   diff_hunk_bar_staged: Option<Spec>,
+  #[serde(rename = "DiffHunkSeparator")]
+  diff_hunk_separator: Option<Spec>,
   #[serde(rename = "Visual")]
   visual: Option<Spec>,
 }
@@ -241,6 +245,11 @@ impl Highlights {
         &self.diff_hunk_bar_staged,
         &mut palette.diff_hunk_bar_staged,
       ),
+      (
+        "DiffHunkSeparator",
+        &self.diff_hunk_separator,
+        &mut palette.diff_hunk_separator,
+      ),
       ("Visual", &self.visual, &mut palette.visual),
     ];
     for (name, spec, slot) in groups {
@@ -333,6 +342,7 @@ mod tests {
       "DiffCurrentHunk",
       "DiffHunkBar",
       "DiffHunkBarStaged",
+      "DiffHunkSeparator",
       "Visual",
     ] {
       assert!(err.contains(group), "{group} missing from {err}");

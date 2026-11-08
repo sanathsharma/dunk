@@ -186,14 +186,20 @@ pub enum ListRow {
   Entry(usize),
 }
 
-/// Rows a hunk occupies: its header plus one row per line (unified) or per
-/// split pair.
-fn hunk_rows(hunk: &Hunk, layout: Layout) -> usize {
+/// Rows before the first line of hunk `hunk`: its header, and above that a
+/// separator for every hunk but the first.
+pub const fn lead(hunk: usize) -> usize {
+  if hunk == 0 { 1 } else { 2 }
+}
+
+/// Rows a hunk occupies: its separator and header plus one row per line
+/// (unified) or per split pair.
+fn hunk_rows(hunk: &Hunk, index: usize, layout: Layout) -> usize {
   let body = match layout {
     Layout::Unified => hunk.lines.len(),
     Layout::Split => split::pairs(hunk).len(),
   };
-  body.saturating_add(1)
+  body.saturating_add(lead(index))
 }
 
 fn signed(n: usize) -> isize {
@@ -202,18 +208,23 @@ fn signed(n: usize) -> isize {
 
 /// Rows a file's diff occupies in `layout`.
 pub fn row_count(file: &FileDiff, layout: Layout) -> usize {
-  file.hunks.iter().map(|h| hunk_rows(h, layout)).sum()
+  file
+    .hunks
+    .iter()
+    .enumerate()
+    .map(|(i, h)| hunk_rows(h, i, layout))
+    .sum()
 }
 
 /// Finds the hunk and line shown at `row`. The line is `None` on a header.
 fn locate(file: &FileDiff, layout: Layout, mut row: usize) -> Option<(usize, Option<usize>)> {
   for (hi, hunk) in file.hunks.iter().enumerate() {
-    let rows = hunk_rows(hunk, layout);
+    let rows = hunk_rows(hunk, hi, layout);
     if row >= rows {
       row = row.saturating_sub(rows);
       continue;
     }
-    let Some(offset) = row.checked_sub(1) else {
+    let Some(offset) = row.checked_sub(lead(hi)) else {
       return Some((hi, None));
     };
     let line = match layout {
@@ -239,7 +250,7 @@ fn row_lines(file: &FileDiff, layout: Layout, row: usize) -> Vec<usize> {
     Layout::Split => {
       let offset = row
         .saturating_sub(row_of(file, layout, hunk, None))
-        .saturating_sub(1);
+        .saturating_sub(lead(hunk));
       let pairs = file.hunks.get(hunk).map(split::pairs).unwrap_or_default();
       let Some(&(left, right)) = pairs.get(offset) else {
         return Vec::new();
@@ -256,8 +267,9 @@ fn row_of(file: &FileDiff, layout: Layout, hunk: usize, line: Option<usize>) -> 
   let before: usize = file
     .hunks
     .iter()
+    .enumerate()
     .take(hunk)
-    .map(|h| hunk_rows(h, layout))
+    .map(|(i, h)| hunk_rows(h, i, layout))
     .sum();
   let Some(line) = line else { return before };
   let offset = match layout {
@@ -271,7 +283,7 @@ fn row_of(file: &FileDiff, layout: Layout, hunk: usize, line: Option<usize>) -> 
       .position(|&(l, r)| l == Some(line) || r == Some(line))
       .unwrap_or(0),
   };
-  before.saturating_add(1).saturating_add(offset)
+  before.saturating_add(lead(hunk)).saturating_add(offset)
 }
 
 impl App {
@@ -549,14 +561,16 @@ impl App {
     let Some((hunk, _)) = locate(file, self.layout, self.visual_anchor) else {
       return;
     };
-    let Some(rows) = file.hunks.get(hunk).map(|h| hunk_rows(h, self.layout)) else {
+    let Some(rows) = file
+      .hunks
+      .get(hunk)
+      .map(|h| hunk_rows(h, hunk, self.layout))
+    else {
       return;
     };
-    let first = row_of(file, self.layout, hunk, None).saturating_add(1);
-    let last = first
-      .saturating_sub(1)
-      .saturating_add(rows)
-      .saturating_sub(1);
+    let top = row_of(file, self.layout, hunk, None);
+    let first = top.saturating_add(lead(hunk));
+    let last = top.saturating_add(rows).saturating_sub(1);
     self.cursor = self.cursor.saturating_add_signed(delta).clamp(first, last);
     self.clamp_scroll();
   }
@@ -672,10 +686,11 @@ impl App {
     let Some((hunk, None)) = locate(file, self.layout, self.cursor) else {
       return;
     };
+    let top = row_of(file, self.layout, hunk, None);
     self.cursor = if backward && hunk > 0 {
-      self.cursor.saturating_sub(1)
+      top.saturating_sub(1)
     } else {
-      self.cursor.saturating_add(1)
+      top.saturating_add(lead(hunk))
     };
   }
 
@@ -687,7 +702,7 @@ impl App {
     if delta < 0 && self.scroll >= self.cursor {
       let on_first_line = self.files.get(self.selected).is_some_and(|file| {
         locate(file, self.layout, self.cursor).is_some_and(|(hunk, _)| {
-          row_of(file, self.layout, hunk, None).saturating_add(1) == self.cursor
+          row_of(file, self.layout, hunk, None).saturating_add(lead(hunk)) == self.cursor
         })
       });
       if on_first_line {
@@ -709,10 +724,10 @@ impl App {
     let Some((hunk, _)) = locate(file, self.layout, self.cursor) else {
       return;
     };
-    let header = row_of(file, self.layout, hunk, None);
+    let first = row_of(file, self.layout, hunk, None).saturating_add(lead(hunk));
     let target = if delta > 0 {
       hunk.saturating_add(1)
-    } else if self.cursor > header.saturating_add(1) {
+    } else if self.cursor > first {
       hunk
     } else if let Some(previous) = hunk.checked_sub(1) {
       previous
@@ -722,7 +737,9 @@ impl App {
     if target >= file.hunks.len() {
       return;
     }
-    self.scroll = row_of(file, self.layout, target, None);
+    self.scroll = row_of(file, self.layout, target, None)
+      .saturating_add(lead(target))
+      .saturating_sub(1);
     self.cursor = self.scroll.saturating_add(1);
     self.clamp_scroll();
   }
@@ -1354,12 +1371,12 @@ mod tests {
     let mut app = ready(parse(diff.as_bytes()).unwrap(), 20);
     app.on_key(key(KeyCode::Char(']')));
     assert_eq!(app.cursor_hunk(), Some(1));
-    assert_eq!(app.cursor, 6);
+    assert_eq!(app.cursor, 7);
     app.on_key(key(KeyCode::Char(']')));
-    assert_eq!(app.cursor, 6);
+    assert_eq!(app.cursor, 7);
     app.on_key(key(KeyCode::Char('j')));
     app.on_key(key(KeyCode::Char('[')));
-    assert_eq!(app.cursor, 6);
+    assert_eq!(app.cursor, 7);
     app.on_key(key(KeyCode::Char('[')));
     assert_eq!(app.cursor, 1);
     app.on_key(key(KeyCode::Char('[')));
@@ -1371,12 +1388,12 @@ mod tests {
     let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -8,2 +8,2 @@\n h\n-i\n+I\n@@ -20,2 +20,2 @@\n x\n-y\n+Y\n";
     let mut app = ready(parse(diff.as_bytes()).unwrap(), 4);
     app.on_key(key(KeyCode::Char(']')));
-    assert_eq!((app.cursor, app.scroll), (6, 5));
+    assert_eq!((app.cursor, app.scroll), (7, 6));
     app.on_key(key(KeyCode::Char(']')));
-    assert_eq!(app.cursor, 10);
+    assert_eq!(app.cursor, 12);
     assert_eq!(app.scroll, app.max_scroll());
     app.on_key(key(KeyCode::Char('[')));
-    assert_eq!((app.cursor, app.scroll), (6, 5));
+    assert_eq!((app.cursor, app.scroll), (7, 6));
   }
 
   #[test]
@@ -1505,21 +1522,22 @@ mod tests {
   fn the_cursor_moves_by_row_in_the_split_layout() {
     let mut app = ready(vec![mixed_file()], 20);
     app.layout = Layout::Split;
-    // Split rows: 0 header, 1 keep, 2 r1|a1, 3 r2, 4 r3, 5 header, 6 x, 7 y.
+    // Split rows: 0 header, 1 keep, 2 r1|a1, 3 r2, 4 r3, 5 separator,
+    // 6 header, 7 x, 8 y.
     for _ in 0..20 {
       app.on_key(key(KeyCode::Char('j')));
     }
-    assert_eq!(app.cursor, 7);
+    assert_eq!(app.cursor, 8);
   }
 
   #[test]
   fn the_cursor_stays_on_its_line_when_the_layout_changes() {
     let mut app = ready(vec![mixed_file()], 20);
-    app.cursor = 7; // unified: line "x" of the second hunk
-    app.on_key(key(KeyCode::Char('s')));
-    assert_eq!(app.cursor, 6);
+    app.cursor = 8; // unified: line "x" of the second hunk
     app.on_key(key(KeyCode::Char('s')));
     assert_eq!(app.cursor, 7);
+    app.on_key(key(KeyCode::Char('s')));
+    assert_eq!(app.cursor, 8);
   }
 
   #[test]
@@ -1557,7 +1575,7 @@ mod tests {
     }
     assert_eq!(app.cursor, 4);
     app.on_key(key(KeyCode::Char('j')));
-    assert_eq!(app.cursor, 6);
+    assert_eq!(app.cursor, 7);
     app.on_key(key(KeyCode::Char('k')));
     assert_eq!(app.cursor, 4);
     for _ in 0..10 {
@@ -1573,12 +1591,13 @@ mod tests {
     app.on_key(key(KeyCode::Char('G')));
     app.on_key(key(KeyCode::Char('g')));
     assert_eq!((app.cursor, app.scroll), (1, 0));
-    // Row 5 is the second header. Scrolling its row to the top of the pane
-    // pulls the cursor into view, onto the hunk's first line.
+    // Row 5 is the separator and row 6 the second header. Scrolling the
+    // header to the top of the pane pulls the cursor into view, onto the
+    // hunk's first line.
     app.viewport = 4;
     app.on_key(key(KeyCode::PageDown));
     app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-    assert_eq!((app.scroll, app.cursor), (5, 6));
+    assert_eq!((app.scroll, app.cursor), (6, 7));
   }
 
   #[test]
@@ -1699,16 +1718,19 @@ mod tests {
   #[test]
   fn split_layout_row_counts_merge_removed_and_added_lines() {
     let f = mixed_file();
-    assert_eq!(row_count(&f, Layout::Unified), 2 + 5 + 2);
-    // header + keep + 3 shared rows, header + 2 rows
-    assert_eq!(row_count(&f, Layout::Split), 5 + 3);
+    assert_eq!(row_count(&f, Layout::Unified), 2 + 5 + 3);
+    // header + keep + 3 shared rows, separator + header + 2 rows
+    assert_eq!(row_count(&f, Layout::Split), 5 + 4);
   }
 
   #[test]
   fn toggling_layout_keeps_the_hunk_and_line_at_the_top() {
     let mut app = ready(vec![mixed_file()], 2);
-    // Unified rows: 0 header, 1 keep, 2-4 r1-r3, 5 a1, 6 header, 7 x, 8 y.
-    // Split rows: 0 header, 1 keep, 2 r1|a1, 3 r2, 4 r3, 5 header, 6 x, 7 y.
+    // Unified rows: 0 header, 1 keep, 2-4 r1-r3, 5 a1, 6 separator,
+    // 7 header, 8 x, 9 y.
+    // Split rows: 0 header, 1 keep, 2 r1|a1, 3 r2, 4 r3, 5 separator,
+    // 6 header, 7 x, 8 y. The separator and header of a hunk both map to the
+    // separator row.
     for (unified, split) in [
       (0, 0),
       (1, 1),
@@ -1717,25 +1739,29 @@ mod tests {
       (4, 4),
       (5, 2),
       (6, 5),
-      (7, 6),
+      (7, 5),
+      (8, 7),
     ] {
       app.layout = Layout::Unified;
       app.scroll = unified;
       // The cursor sits on the line below a header.
-      app.cursor = if unified % 6 == 0 {
-        unified + 1
-      } else {
-        unified
+      app.cursor = match unified {
+        0 => 1,
+        6 | 7 => 8,
+        _ => unified,
       };
       app.on_key(key(KeyCode::Char('s')));
       assert_eq!(app.layout, Layout::Split);
+      // A pane of two rows cannot hold the separator and a line, so the
+      // cursor pulls the scroll down to the header.
+      let split = if matches!(unified, 6 | 7) { 6 } else { split };
       assert_eq!(app.scroll, split, "unified row {unified}");
     }
-    app.scroll = 6;
-    app.cursor = 6;
+    app.scroll = 7;
+    app.cursor = 7;
     app.on_key(key(KeyCode::Char('s')));
     assert_eq!(app.layout, Layout::Unified);
-    assert_eq!(app.scroll, 7);
+    assert_eq!(app.scroll, 8);
   }
 
   #[test]

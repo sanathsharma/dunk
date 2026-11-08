@@ -58,6 +58,9 @@ _Avoid_: horizontal scroll (scroll is vertical)
 **Hunk header**:
 The row that opens a hunk. It is drawn but never holds the cursor or a selection.
 
+**Hunk separator**:
+The thin rule drawn across the pane between two hunks, styled by the `DiffHunkSeparator` highlight group. There is none before the first hunk or after the last. Like the hunk header it never holds the cursor or a selection, and it does not pan.
+
 **Cursor**:
 The row key actions apply to in the diff. It is always on a line, never on a hunk header.
 _Avoid_: selected row (selection and section already use "select")

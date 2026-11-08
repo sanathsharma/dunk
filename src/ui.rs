@@ -45,14 +45,24 @@ impl Row<'_> {
   const fn active(&self) -> bool {
     match self {
       Row::Header(_, active) | Row::Line(_, _, _, active) => *active,
+      Row::Separator => false,
     }
   }
+}
+
+/// What a row of the split layout holds.
+enum Slot {
+  Separator,
+  Header,
+  Pair((Option<usize>, Option<usize>)),
 }
 
 #[derive(Clone, Copy)]
 enum Row<'a> {
   /// A hunk header, and whether the cursor is in that hunk.
   Header(&'a Hunk, bool),
+  /// The rule between two hunks.
+  Separator,
   Line(&'a DiffLine, Option<&'a Styled>, &'a [Range<usize>], bool),
 }
 
@@ -268,7 +278,11 @@ impl<'a> DiffView<'a> {
           let (styled, ranges) = self.extras(hi, li);
           Row::Line(l, styled, ranges, self.current == Some(hi))
         });
-        std::iter::once(Row::Header(h, self.current == Some(hi))).chain(lines)
+        let separator = (hi > 0).then_some(Row::Separator);
+        separator
+          .into_iter()
+          .chain(std::iter::once(Row::Header(h, self.current == Some(hi))))
+          .chain(lines)
       })
       .skip(self.scroll)
       .take(self.viewport)
@@ -338,24 +352,60 @@ impl<'a> DiffView<'a> {
       Constraint::Length(right_width),
     ])
     .areas(inner);
+    let mut gap = Vec::new();
     let (active, (left, right)): (Vec<bool>, (Vec<Line>, Vec<Line>)) = self
       .file
       .hunks
       .iter()
       .enumerate()
       .flat_map(|(hi, h)| {
-        let header = std::iter::once((hi, h, None));
-        let pairs = pairs(h).into_iter().map(move |p| (hi, h, Some(p)));
-        header.chain(pairs)
+        let separator = (hi > 0).then_some((hi, h, Slot::Separator));
+        let header = std::iter::once((hi, h, Slot::Header));
+        let pairs = pairs(h).into_iter().map(move |p| (hi, h, Slot::Pair(p)));
+        separator.into_iter().chain(header).chain(pairs)
       })
       .skip(self.scroll)
       .take(self.viewport)
       .enumerate()
-      .map(|(i, (hi, h, pair))| {
+      .map(|(i, (hi, h, slot))| {
         let active = self.current == Some(hi);
         let on = i == self.cursor;
-        match pair {
-          None => {
+        gap.push(if matches!(slot, Slot::Separator) {
+          Line::styled(RULE, self.palette.diff_hunk_separator)
+        } else if active {
+          Line::styled(BAR, self.bar_style)
+        } else {
+          Line::raw(" ")
+        });
+        match slot {
+          Slot::Separator => (
+            false,
+            (
+              self.mark(
+                i,
+                row_line(
+                  Row::Separator,
+                  &self.palette,
+                  self.gutter,
+                  left_width.into(),
+                  self.pan,
+                  None,
+                ),
+              ),
+              self.mark(
+                i,
+                row_line(
+                  Row::Separator,
+                  &self.palette,
+                  self.gutter,
+                  right_width.into(),
+                  self.pan,
+                  None,
+                ),
+              ),
+            ),
+          ),
+          Slot::Header => {
             let header = Row::Header(h, active);
             let left = row_line(
               header,
@@ -370,7 +420,7 @@ impl<'a> DiffView<'a> {
               (self.mark(i, left), self.mark(i, blank(right_width))),
             )
           }
-          Some((l, r)) => (
+          Slot::Pair((l, r)) => (
             active,
             (
               self.mark(i, self.side((hi, h), l, false, left_width, on)),
@@ -381,7 +431,7 @@ impl<'a> DiffView<'a> {
       })
       .unzip();
     frame.render_widget(Paragraph::new(bar(&active, self.bar_style)), edge_area);
-    frame.render_widget(Paragraph::new(bar(&active, self.bar_style)), gap_area);
+    frame.render_widget(Paragraph::new(gap), gap_area);
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(right), right_area);
   }
@@ -467,6 +517,9 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
   }
 }
 
+/// One cell of the rule between hunks.
+const RULE: &str = "\u{2500}";
+
 /// The left half of a cell, which `DiffHunkBar` or `DiffHunkBarStaged` colors
 /// with its foreground.
 const BAR: &str = "\u{258C}";
@@ -550,6 +603,7 @@ fn row_line(
   cursor: Option<Style>,
 ) -> Line<'static> {
   match row {
+    Row::Separator => Line::styled(RULE.repeat(fill), palette.diff_hunk_separator),
     Row::Header(h, current) => Line::styled(
       format!(
         "{:<fill$}",
