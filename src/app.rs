@@ -4,6 +4,7 @@ use crate::diff::{FileDiff, FileStatus, Hunk, Section};
 use crate::editor::Editor;
 use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
+use crate::jobs::{Loaded, Loader};
 use crate::palette::Palette;
 use crate::split;
 use crate::staging::{self, Follow, IndexRequest, Refusal};
@@ -33,9 +34,8 @@ const INPUT_POLL: Duration = Duration::from_millis(50);
 pub enum Event {
   Key(KeyEvent),
   Resize,
-  /// A load finished. The number says which load, so a slow older one cannot
-  /// overwrite a newer result.
-  Loaded(u64, Result<Vec<FileDiff>, vcs::Error>),
+  /// A load finished. The loader drops it when a newer load has started.
+  Loaded(Loaded),
   /// The watcher saw the repository change.
   Changed,
   /// A highlight for a file of the load with this number.
@@ -1002,15 +1002,16 @@ impl App {
   }
 }
 
-/// Runs git off the UI thread and reports the result over the channel.
-fn spawn_load(
-  vcs: Arc<impl Vcs + Send + Sync + 'static>,
-  request: DiffRequest,
-  id: u64,
-  tx: Sender<Event>,
+/// Starts a load that reports over the channel.
+fn start_load<V: Vcs + Send + Sync + 'static>(
+  loader: &mut Loader,
+  vcs: &Arc<V>,
+  request: &DiffRequest,
+  tx: &Sender<Event>,
 ) {
-  thread::spawn(move || {
-    let _ = tx.send(Event::Loaded(id, vcs.changeset(&request)));
+  let tx = tx.clone();
+  loader.start(vcs.clone(), request.clone(), move |load| {
+    let _ = tx.send(Event::Loaded(load));
   });
 }
 
@@ -1213,10 +1214,11 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   let gate = Arc::new(InputGate::default());
   spawn_input(tx.clone(), gate.clone());
   let editor = Editor::from_env();
-  spawn_load(vcs.clone(), request.clone(), 0, tx.clone());
+  let mut loader = Loader::default();
+  start_load(&mut loader, &vcs, request, &tx);
   let _watch_stop = settings.watch.then(|| spawn_watch(root, &tx));
-  // `latest` numbers the newest load asked for, `applied` the one on screen.
-  let (mut latest, mut applied) = (0_u64, 0_u64);
+  // The number of the load on screen.
+  let mut applied = 0_u64;
 
   let mut app = App {
     layout: settings.layout,
@@ -1233,18 +1235,16 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
     terminal.draw(|frame| ui::render(frame, &mut app))?;
     match rx.recv() {
       Ok(Event::Key(key)) => app.on_key(key),
-      Ok(Event::Changed) => {
-        latest = latest.saturating_add(1);
-        spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
-      }
+      Ok(Event::Changed) => start_load(&mut loader, &vcs, request, &tx),
       Ok(Event::Indexed(follow, result)) => {
         if app.on_indexed(follow, result) {
-          latest = latest.saturating_add(1);
-          spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
+          start_load(&mut loader, &vcs, request, &tx);
         }
       }
-      Ok(Event::Loaded(id, result)) if id == latest => {
-        if app.on_loaded(result) {
+      Ok(Event::Loaded(load)) => {
+        if let Some((id, result)) = loader.accept(load)
+          && app.on_loaded(result)
+        {
           applied = id;
           worker = highlighter
             .clone()
@@ -1270,23 +1270,14 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
         app.on_rehighlighted(index, generation, highlight);
       }
       Ok(Event::InputFailed(e)) => return Err(e),
-      Ok(
-        Event::Resize
-        | Event::Loaded(..)
-        | Event::Highlighted(..)
-        | Event::Sides(..)
-        | Event::Rehighlighted(..),
-      ) => {}
+      Ok(Event::Resize | Event::Highlighted(..) | Event::Sides(..) | Event::Rehighlighted(..)) => {}
       Err(_) => break,
     }
     if let Some(edit) = app.take_edit() {
       match &editor {
         None => app.notice = Some("Set $VISUAL or $EDITOR to open files".into()),
         Some(editor) => match open_editor(terminal, &gate, editor, root, &edit)? {
-          Ok(true) => {
-            latest = latest.saturating_add(1);
-            spawn_load(vcs.clone(), request.clone(), latest, tx.clone());
-          }
+          Ok(true) => start_load(&mut loader, &vcs, request, &tx),
           Ok(false) => {}
           Err(message) => app.notice = Some(message),
         },
@@ -2169,15 +2160,45 @@ mod tests {
     let (release, gate) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
     // Returns at once even though the backend blocks until released.
-    spawn_load(Arc::new(slow_memory(gate)), DiffRequest::default(), 7, tx);
+    let mut loader = Loader::default();
+    start_load(
+      &mut loader,
+      &Arc::new(slow_memory(gate)),
+      &DiffRequest::default(),
+      &tx,
+    );
     assert!(rx.try_recv().is_err());
     // One release per section of the default working tree request.
     release.send(()).unwrap();
     release.send(()).unwrap();
     match rx.recv().unwrap() {
-      Event::Loaded(7, Ok(files)) => assert_eq!(files.len(), 2),
+      Event::Loaded(load) => {
+        let (_, result) = loader.accept(load).expect("the latest load");
+        assert_eq!(result.unwrap().len(), 2);
+      }
       _ => panic!("expected a loaded diff"),
     }
+  }
+
+  #[test]
+  fn a_reload_with_an_identical_changeset_changes_nothing() {
+    let git = std::sync::Arc::new(stage_memory());
+    let mut loader = Loader::default();
+    let (tx, rx) = mpsc::channel();
+    let mut app = App::default();
+    let mut reload = |app: &mut App| {
+      start_load(&mut loader, &git, &DiffRequest::default(), &tx);
+      let Ok(Event::Loaded(load)) = rx.recv() else {
+        panic!("expected a loaded changeset");
+      };
+      let (_, result) = loader.accept(load).expect("the latest load");
+      app.on_loaded(result)
+    };
+    assert!(reload(&mut app));
+    app.on_key(key(KeyCode::Char('j')));
+    let (selected, scroll) = (app.selected, app.scroll);
+    assert!(!reload(&mut app));
+    assert_eq!((app.selected, app.scroll), (selected, scroll));
   }
 
   fn file_in(name: &str, section: Option<Section>) -> FileDiff {

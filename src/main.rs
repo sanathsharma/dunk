@@ -4,6 +4,7 @@ mod config;
 mod diff;
 mod editor;
 mod highlight;
+mod jobs;
 mod palette;
 mod split;
 mod staging;
