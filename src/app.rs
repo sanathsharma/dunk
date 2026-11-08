@@ -4,7 +4,7 @@ use crate::diff::{FileDiff, FileStatus, Hunk, Section};
 use crate::editor::Editor;
 use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
-use crate::jobs::{Loaded, Loader};
+use crate::jobs::{Deliver, Done, Rehighlight, Runner};
 use crate::palette::Palette;
 use crate::split;
 use crate::staging::{self, Follow, IndexRequest, Refusal};
@@ -12,7 +12,6 @@ use crate::ui;
 use crate::vcs::{self, DiffRequest, Sides, Vcs};
 use crate::watch::Watch;
 use crate::words::FileWords;
-use crate::worker::Worker;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -34,21 +33,10 @@ const INPUT_POLL: Duration = Duration::from_millis(50);
 pub enum Event {
   Key(KeyEvent),
   Resize,
-  /// A load finished. The loader drops it when a newer load has started.
-  Loaded(Loaded),
+  /// A background job finished.
+  Job(Done),
   /// The watcher saw the repository change.
   Changed,
-  /// A highlight for a file of the load with this number.
-  Highlighted(u64, usize, FileHighlight),
-  /// The full contents of a file of the load with this number, read for an
-  /// expansion.
-  Sides(u64, usize, Arc<Sides>),
-  /// The colors of a file shown with other context than it was loaded with:
-  /// the load, the file and which of its context changes they were made for.
-  Rehighlighted(u64, usize, u32, FileHighlight),
-  /// A stage or unstage finished. Carries the entry the selection moves to
-  /// once the changeset is read again.
-  Indexed(Option<Follow>, Result<(), vcs::Error>),
   InputFailed(io::Error),
 }
 
@@ -63,14 +51,6 @@ pub enum Load {
   Loading,
   Ready,
   Failed(String),
-}
-
-/// A file whose context changed, waiting to be colored again.
-pub struct Rehighlight {
-  pub index: usize,
-  pub generation: u32,
-  pub file: FileDiff,
-  pub sides: Arc<Sides>,
 }
 
 /// Lines of context a key press adds to or takes from each side of a hunk.
@@ -117,8 +97,6 @@ pub struct App {
   /// Full file contents per file, parallel to `files`. `None` until the
   /// first widening of that file asks for them.
   sides: Vec<Option<Arc<Sides>>>,
-  /// Which files `take_sides_request` already handed out.
-  sides_requested: Vec<bool>,
   /// A widening waiting for its file contents: the file and the hunks of
   /// `loaded` to widen.
   pending_widen: Option<(usize, Range<usize>)>,
@@ -131,8 +109,9 @@ pub struct App {
   /// How many times each file's context changed. Colors made for an earlier
   /// count do not fit its lines.
   expansions: Vec<u32>,
-  rehighlight: Option<Rehighlight>,
-  index_request: Option<IndexRequest>,
+  /// Runs the reads, writes and coloring the keys ask for. Nothing runs
+  /// without it.
+  pub jobs: Option<Runner>,
   /// Where the selection goes when the entry it is on has left the list.
   follow: Option<Follow>,
   /// A short message for the footer, cleared by the next key press.
@@ -173,13 +152,11 @@ impl Default for App {
       files: Arc::new(Vec::new()),
       loaded: Arc::new(Vec::new()),
       sides: Vec::new(),
-      sides_requested: Vec::new(),
       pending_widen: None,
       context: Vec::new(),
       owners: Vec::new(),
       expansions: Vec::new(),
-      rehighlight: None,
-      index_request: None,
+      jobs: None,
       follow: None,
       notice: None,
       edit: None,
@@ -336,11 +313,9 @@ impl App {
     self.highlights = files.iter().map(|_| None).collect();
     self.words = files.iter().map(|_| None).collect();
     self.sides = files.iter().map(|_| None).collect();
-    self.sides_requested = vec![false; files.len()];
     self.expansions = vec![0; files.len()];
     self.context = files.iter().map(|f| vec![0; f.hunks.len()]).collect();
     self.owners = files.iter().map(|f| (0..f.hunks.len()).collect()).collect();
-    self.rehighlight = None;
     self.pending_widen = None;
     let index = followed
       .or(kept)
@@ -375,18 +350,49 @@ impl App {
     }
   }
 
-  /// Takes the file whose context changed and that needs new colors.
-  pub const fn take_rehighlight(&mut self) -> Option<Rehighlight> {
-    self.rehighlight.take()
+  /// Starts reading the changeset again.
+  pub fn reload(&mut self) {
+    if let Some(jobs) = &mut self.jobs {
+      jobs.load();
+    }
   }
 
-  /// Takes the file whose full contents a widening is waiting for. Each
-  /// file is handed out once, until a reload replaces it.
-  pub fn take_sides_request(&mut self) -> Option<usize> {
-    let (index, _) = self.pending_widen.as_ref()?;
-    let index = *index;
-    let requested = self.sides_requested.get_mut(index)?;
-    (!std::mem::replace(requested, true)).then_some(index)
+  /// Takes the result of a background job, unless a newer load made it stale.
+  pub fn on_job(&mut self, done: Done) {
+    let Some(done) = self.jobs.as_mut().and_then(|jobs| jobs.accept(done)) else {
+      return;
+    };
+    match done {
+      Done::Loaded(load) => {
+        if self.on_loaded(load.result)
+          && let Some(jobs) = &mut self.jobs
+        {
+          jobs.apply(load.id, &self.loaded, self.selected);
+        }
+      }
+      Done::Indexed(follow, result) => {
+        if self.on_indexed(follow, result) {
+          self.reload();
+        }
+      }
+      Done::Highlighted {
+        index, highlight, ..
+      } => self.on_highlighted(index, highlight),
+      Done::Sides { index, sides, .. } => self.on_sides(index, sides),
+      Done::Rehighlighted {
+        index,
+        generation,
+        highlight,
+        ..
+      } => self.on_rehighlighted(index, generation, highlight),
+    }
+  }
+
+  /// Moves the coloring to the selected file.
+  pub fn follow_selection(&self) {
+    if let Some(jobs) = &self.jobs {
+      jobs.focus(self.selected);
+    }
   }
 
   /// Takes the full contents of a file and finishes the widening waiting for
@@ -397,9 +403,6 @@ impl App {
     };
     if sides.new.is_none() {
       // Leave the slot empty so the next key press tries the read again.
-      if let Some(requested) = self.sides_requested.get_mut(index) {
-        *requested = false;
-      }
       self.pending_widen = None;
       let path = self
         .files
@@ -418,14 +421,9 @@ impl App {
     }
   }
 
-  /// Takes the stage or unstage the last key press asked for.
-  pub const fn take_index_request(&mut self) -> Option<IndexRequest> {
-    self.index_request.take()
-  }
-
   /// Takes the result of a stage or unstage. Returns true when the changeset
   /// needs reading again.
-  pub fn on_indexed(&mut self, follow: Option<Follow>, result: Result<(), vcs::Error>) -> bool {
+  fn on_indexed(&mut self, follow: Option<Follow>, result: Result<(), vcs::Error>) -> bool {
     match result {
       Ok(()) => {
         self.follow = follow;
@@ -452,10 +450,14 @@ impl App {
     self.request_index(request);
   }
 
-  /// Keeps a request for the event loop to run, or shows why there is none.
+  /// Runs the request, or shows why there is none.
   fn request_index(&mut self, request: Result<IndexRequest, Refusal>) {
     match request {
-      Ok(request) => self.index_request = Some(request),
+      Ok(request) => {
+        if let Some(jobs) = &self.jobs {
+          jobs.index(request);
+        }
+      }
       Err(refusal) => {
         if let Some(notice) = refusal.notice() {
           self.notice = Some(notice.into());
@@ -821,6 +823,9 @@ impl App {
     let hunks = start..end;
     if step == Step::More && self.sides.get(self.selected).is_some_and(Option::is_none) {
       self.pending_widen = Some((self.selected, hunks));
+      if let Some(jobs) = &mut self.jobs {
+        jobs.sides(&self.loaded, self.selected);
+      }
     } else {
       self.set_context(self.selected, hunks, step);
     }
@@ -895,8 +900,9 @@ impl App {
     if let (Some(sides), Some(file)) = (
       self.sides.get(index).cloned().flatten(),
       self.files.get(index).cloned(),
-    ) {
-      self.rehighlight = Some(Rehighlight {
+    ) && let Some(jobs) = &self.jobs
+    {
+      jobs.rehighlight(Rehighlight {
         index,
         generation,
         file,
@@ -1000,50 +1006,6 @@ impl App {
     let last = self.files.len().saturating_sub(1);
     self.select(self.selected.saturating_add_signed(delta).min(last));
   }
-}
-
-/// Starts a load that reports over the channel.
-fn start_load<V: Vcs + Send + Sync + 'static>(
-  loader: &mut Loader,
-  vcs: &Arc<V>,
-  request: &DiffRequest,
-  tx: &Sender<Event>,
-) {
-  let tx = tx.clone();
-  loader.start(vcs.clone(), request.clone(), move |load| {
-    let _ = tx.send(Event::Loaded(load));
-  });
-}
-
-/// Writes the index off the UI thread and reports the result over the
-/// channel.
-fn spawn_index(
-  vcs: Arc<impl Vcs + Send + Sync + 'static>,
-  request: IndexRequest,
-  tx: Sender<Event>,
-) {
-  thread::spawn(move || {
-    let result = request.run(&*vcs);
-    let _ = tx.send(Event::Indexed(request.follow, result));
-  });
-}
-
-/// Reads both versions of a file off the UI thread for an expansion.
-fn spawn_sides(
-  vcs: Arc<impl Vcs + Send + Sync + 'static>,
-  request: DiffRequest,
-  files: Arc<Vec<FileDiff>>,
-  index: usize,
-  id: u64,
-  tx: Sender<Event>,
-) {
-  thread::spawn(move || {
-    let Some(file) = files.get(index) else {
-      return;
-    };
-    let sides = vcs.sides(&request, file);
-    let _ = tx.send(Event::Sides(id, index, Arc::new(sides)));
-  });
 }
 
 /// Lets the run loop take the keyboard from the input thread while an editor
@@ -1169,37 +1131,6 @@ fn spawn_watch(root: &Path, tx: &Sender<Event>) -> Sender<()> {
   stop
 }
 
-/// Starts the index write and the file read that `app` asked for, if any.
-fn dispatch_requests<V: Vcs + Send + Sync + 'static>(
-  app: &mut App,
-  vcs: &Arc<V>,
-  request: &DiffRequest,
-  id: u64,
-  tx: &Sender<Event>,
-) {
-  if let Some(index_request) = app.take_index_request() {
-    spawn_index(vcs.clone(), index_request, tx.clone());
-  }
-  if let Some(index) = app.take_sides_request() {
-    spawn_sides(
-      vcs.clone(),
-      request.clone(),
-      app.loaded.clone(),
-      index,
-      id,
-      tx.clone(),
-    );
-  }
-}
-
-/// Colors a file again off the UI thread after its context changed.
-fn spawn_rehighlight(highlighter: Arc<Highlighter>, r: Rehighlight, id: u64, tx: Sender<Event>) {
-  thread::spawn(move || {
-    let highlight = highlighter.diff(&r.file, &r.sides);
-    let _ = tx.send(Event::Rehighlighted(id, r.index, r.generation, highlight));
-  });
-}
-
 /// A `theme` in `settings` turns syntax highlighting on; `None` leaves diffs
 /// uncolored.
 pub fn run<V: Vcs + Send + Sync + 'static>(
@@ -1209,89 +1140,53 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   settings: Settings,
   root: &Path,
 ) -> io::Result<()> {
-  let vcs = Arc::new(vcs);
   let (tx, rx) = mpsc::channel();
   let gate = Arc::new(InputGate::default());
   spawn_input(tx.clone(), gate.clone());
   let editor = Editor::from_env();
-  let mut loader = Loader::default();
-  start_load(&mut loader, &vcs, request, &tx);
-  let _watch_stop = settings.watch.then(|| spawn_watch(root, &tx));
-  // The number of the load on screen.
-  let mut applied = 0_u64;
-
-  let mut app = App {
-    layout: settings.layout,
-    palette: settings.palette,
-    border: settings.border,
-    ..App::default()
-  };
   let highlighter = settings
     .theme
     .and_then(|theme| Highlighter::new(&theme).ok())
     .map(Arc::new);
-  let mut worker: Option<Worker> = None;
+  let deliver: Deliver = {
+    let tx = tx.clone();
+    Arc::new(move |done| tx.send(Event::Job(done)).is_ok())
+  };
+  let mut app = App {
+    layout: settings.layout,
+    palette: settings.palette,
+    border: settings.border,
+    jobs: Some(Runner::new(
+      Arc::new(vcs),
+      request.clone(),
+      highlighter,
+      deliver,
+    )),
+    ..App::default()
+  };
+  app.reload();
+  let _watch_stop = settings.watch.then(|| spawn_watch(root, &tx));
   while !app.quit {
     terminal.draw(|frame| ui::render(frame, &mut app))?;
     match rx.recv() {
       Ok(Event::Key(key)) => app.on_key(key),
-      Ok(Event::Changed) => start_load(&mut loader, &vcs, request, &tx),
-      Ok(Event::Indexed(follow, result)) => {
-        if app.on_indexed(follow, result) {
-          start_load(&mut loader, &vcs, request, &tx);
-        }
-      }
-      Ok(Event::Loaded(load)) => {
-        if let Some((id, result)) = loader.accept(load)
-          && app.on_loaded(result)
-        {
-          applied = id;
-          worker = highlighter
-            .clone()
-            .filter(|_| !app.files.is_empty())
-            .map(|highlighter| {
-              let tx = tx.clone();
-              Worker::spawn(
-                vcs.clone(),
-                request.clone(),
-                app.loaded.clone(),
-                highlighter,
-                app.selected,
-                move |i, h| tx.send(Event::Highlighted(id, i, h)).is_ok(),
-              )
-            });
-        }
-      }
-      Ok(Event::Highlighted(id, index, highlight)) if id == applied => {
-        app.on_highlighted(index, highlight);
-      }
-      Ok(Event::Sides(id, index, sides)) if id == applied => app.on_sides(index, sides),
-      Ok(Event::Rehighlighted(id, index, generation, highlight)) if id == applied => {
-        app.on_rehighlighted(index, generation, highlight);
-      }
+      Ok(Event::Changed) => app.reload(),
+      Ok(Event::Job(done)) => app.on_job(done),
       Ok(Event::InputFailed(e)) => return Err(e),
-      Ok(Event::Resize | Event::Highlighted(..) | Event::Sides(..) | Event::Rehighlighted(..)) => {}
+      Ok(Event::Resize) => {}
       Err(_) => break,
     }
     if let Some(edit) = app.take_edit() {
       match &editor {
         None => app.notice = Some("Set $VISUAL or $EDITOR to open files".into()),
         Some(editor) => match open_editor(terminal, &gate, editor, root, &edit)? {
-          Ok(true) => start_load(&mut loader, &vcs, request, &tx),
+          Ok(true) => app.reload(),
           Ok(false) => {}
           Err(message) => app.notice = Some(message),
         },
       }
     }
-    if let Some(r) = app.take_rehighlight()
-      && let Some(highlighter) = highlighter.clone()
-    {
-      spawn_rehighlight(highlighter, r, applied, tx.clone());
-    }
-    dispatch_requests(&mut app, &vcs, request, applied, &tx);
-    if let Some(worker) = &worker {
-      worker.focus(app.selected);
-    }
+    app.follow_selection();
   }
   Ok(())
 }
@@ -1331,6 +1226,58 @@ mod tests {
 
   fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+  }
+
+  /// Runs `app`'s jobs on `vcs`, with syntax coloring when `themed`, and gives
+  /// the channel their results arrive on.
+  fn wire_with(app: &mut App, vcs: Arc<crate::vcs::Memory>, themed: bool) -> mpsc::Receiver<Done> {
+    let (tx, rx) = mpsc::channel();
+    let highlighter =
+      themed.then(|| Arc::new(Highlighter::new(crate::highlight::DEFAULT_THEME).unwrap()));
+    let deliver: Deliver = Arc::new(move |done| tx.send(done).is_ok());
+    app.jobs = Some(Runner::new(
+      vcs,
+      DiffRequest::default(),
+      highlighter,
+      deliver,
+    ));
+    rx
+  }
+
+  fn wire(app: &mut App, vcs: crate::vcs::Memory) -> mpsc::Receiver<Done> {
+    wire_with(app, Arc::new(vcs), false)
+  }
+
+  /// Takes the next finished job, as the event loop does.
+  fn settle(app: &mut App, rx: &mpsc::Receiver<Done>) {
+    let done = rx
+      .recv_timeout(Duration::from_secs(5))
+      .expect("a job to finish");
+    app.on_job(done);
+  }
+
+  /// True when no job reports back.
+  fn quiet(rx: &mpsc::Receiver<Done>) -> bool {
+    rx.recv_timeout(Duration::from_millis(50)).is_err()
+  }
+
+  /// An app whose jobs run on a repository, and what it ran on.
+  struct Rig {
+    git: Arc<crate::vcs::Memory>,
+    rx: mpsc::Receiver<Done>,
+  }
+
+  impl std::ops::Deref for Rig {
+    type Target = crate::vcs::Memory;
+    fn deref(&self) -> &Self::Target {
+      &self.git
+    }
+  }
+
+  fn rig(app: &mut App, vcs: crate::vcs::Memory) -> Rig {
+    let git = Arc::new(vcs);
+    let rx = wire_with(app, git.clone(), false);
+    Rig { git, rx }
   }
 
   fn ready(files: Vec<FileDiff>, viewport: usize) -> App {
@@ -1952,18 +1899,32 @@ mod tests {
     })
   }
 
+  /// An app on a repository with no files, so every read of file contents
+  /// fails, and the channel its jobs report on.
+  fn ready_wired(files: Vec<FileDiff>, viewport: usize) -> (App, mpsc::Receiver<Done>) {
+    let mut app = ready(files, viewport);
+    let rx = wire(&mut app, crate::vcs::Memory::default());
+    (app, rx)
+  }
+
+  /// True when a job reports back. Takes its result without applying it.
+  fn asked(rx: &mpsc::Receiver<Done>) -> bool {
+    rx.recv_timeout(Duration::from_secs(5)).is_ok()
+  }
+
   fn plus(app: &mut App) {
     app.on_key(key(KeyCode::Char('+')));
   }
 
   #[test]
   fn the_plus_key_asks_for_the_file_then_widens_the_hunk_under_the_cursor() {
-    let mut app = ready(vec![gapped_file()], 5);
+    let (mut app, rx) = ready_wired(vec![gapped_file()], 5);
     app.scroll = 2;
     app.cursor = 2;
     plus(&mut app);
-    assert_eq!(app.take_sides_request(), Some(0));
-    assert_eq!(app.take_sides_request(), None);
+    assert!(asked(&rx));
+    plus(&mut app);
+    assert!(quiet(&rx), "the file is read once");
     assert_eq!(app.files[0].hunks.len(), 2);
 
     app.on_sides(0, gapped_sides());
@@ -2002,8 +1963,9 @@ mod tests {
 
   #[test]
   fn the_minus_key_takes_a_step_of_context_back_and_splits_merged_hunks() {
-    let mut app = ready(vec![gapped_file()], 20);
+    let (mut app, rx) = ready_wired(vec![gapped_file()], 20);
     plus(&mut app);
+    assert!(asked(&rx));
     app.on_sides(0, gapped_sides());
     plus(&mut app);
     assert_eq!(app.files[0].hunks.len(), 1);
@@ -2013,7 +1975,7 @@ mod tests {
     app.on_key(key(KeyCode::Char('-')));
     assert_eq!(app.files[0], gapped_file());
     assert_eq!(app.notice, None);
-    assert_eq!(app.take_sides_request(), None);
+    assert!(quiet(&rx));
   }
 
   #[test]
@@ -2029,7 +1991,7 @@ mod tests {
 
   #[test]
   fn narrowing_at_the_loaded_context_says_so() {
-    let mut app = ready(vec![gapped_file()], 20);
+    let (mut app, rx) = ready_wired(vec![gapped_file()], 20);
     app.on_key(key(KeyCode::Char('-')));
     assert_eq!(
       app.notice.as_deref(),
@@ -2040,70 +2002,76 @@ mod tests {
       app.notice.as_deref(),
       Some("Already at the default context")
     );
-    assert_eq!(app.take_sides_request(), None);
+    assert!(quiet(&rx));
   }
 
   #[test]
   fn the_old_expand_key_does_nothing() {
-    let mut app = ready(vec![gapped_file()], 20);
+    let (mut app, rx) = ready_wired(vec![gapped_file()], 20);
     app.on_key(key(KeyCode::Char('e')));
-    assert_eq!(app.take_sides_request(), None);
+    assert!(quiet(&rx));
   }
 
   #[test]
   fn an_identical_reload_keeps_the_context_and_the_file_contents() {
-    let mut app = ready(vec![gapped_file()], 20);
+    let (mut app, rx) = ready_wired(vec![gapped_file()], 20);
     plus(&mut app);
+    assert!(asked(&rx));
     app.on_sides(0, gapped_sides());
     plus(&mut app);
     assert!(!app.on_loaded(Ok(vec![gapped_file()])));
     assert_eq!(app.files[0].hunks.len(), 1);
     plus(&mut app);
-    assert_eq!(app.take_sides_request(), None);
+    assert!(quiet(&rx));
   }
 
   #[test]
   fn a_changed_reload_drops_the_context_and_reads_the_file_again() {
-    let mut app = ready(vec![gapped_file()], 20);
+    let (mut app, rx) = ready_wired(vec![gapped_file()], 20);
     plus(&mut app);
+    assert!(asked(&rx));
     app.on_sides(0, gapped_sides());
     let mut other = gapped_file();
     other.hunks.pop();
     assert!(app.on_loaded(Ok(vec![other])));
+    // The load on screen changed, as `on_job` tells the runner.
+    app.jobs.as_mut().unwrap().apply(1, &app.loaded, 0);
     assert_eq!(app.files[0].hunks[0].lines.len(), 4);
     plus(&mut app);
-    assert_eq!(app.take_sides_request(), Some(0));
+    assert!(asked(&rx));
   }
 
   #[test]
   fn a_file_with_changed_context_is_recolored_and_stale_colors_are_dropped() {
     let mut app = ready(vec![gapped_file()], 20);
+    let rx = wire_with(&mut app, Arc::new(crate::vcs::Memory::default()), true);
     app.on_highlighted(0, FileHighlight::default());
     plus(&mut app);
-    assert!(app.take_rehighlight().is_none());
+    assert!(asked(&rx));
+    assert!(
+      quiet(&rx),
+      "nothing is recolored before the contents arrive"
+    );
     app.on_sides(0, gapped_sides());
     assert!(app.highlights[0].is_none());
-    let job = app.take_rehighlight().unwrap();
-    assert_eq!((job.index, job.generation, job.file.hunks.len()), (0, 1, 2));
 
     app.on_highlighted(0, FileHighlight::default());
     assert!(app.highlights[0].is_none());
-    app.on_rehighlighted(0, 1, FileHighlight::default());
+    settle(&mut app, &rx);
     assert!(app.highlights[0].is_some());
   }
 
   #[test]
   fn an_unreadable_file_leaves_the_diff_as_it_was_says_so_and_can_be_retried() {
-    let mut app = ready(vec![gapped_file()], 20);
+    let (mut app, rx) = ready_wired(vec![gapped_file()], 20);
     plus(&mut app);
-    assert_eq!(app.take_sides_request(), Some(0));
-    app.on_sides(0, Arc::new(Sides::default()));
+    settle(&mut app, &rx);
     assert_eq!(app.files[0], gapped_file());
     assert_eq!(app.notice.as_deref(), Some("Cannot read f"));
 
     plus(&mut app);
     assert_eq!(app.notice, None);
-    assert_eq!(app.take_sides_request(), Some(0));
+    assert!(asked(&rx));
   }
 
   #[test]
@@ -2145,59 +2113,14 @@ mod tests {
     assert!(!app.quit);
   }
 
-  /// A file listed in both sections whose diff blocks until released.
-  fn slow_memory(gate: mpsc::Receiver<()>) -> crate::vcs::Memory {
-    crate::vcs::Memory::default()
-      .commit("slow", "1\n")
-      .edit("slow", "2\n")
-      .staged("slow")
-      .edit("slow", "3\n")
-      .gated(gate)
-  }
-
-  #[test]
-  fn git_runs_off_the_calling_thread() {
-    let (release, gate) = mpsc::channel();
-    let (tx, rx) = mpsc::channel();
-    // Returns at once even though the backend blocks until released.
-    let mut loader = Loader::default();
-    start_load(
-      &mut loader,
-      &Arc::new(slow_memory(gate)),
-      &DiffRequest::default(),
-      &tx,
-    );
-    assert!(rx.try_recv().is_err());
-    // One release per section of the default working tree request.
-    release.send(()).unwrap();
-    release.send(()).unwrap();
-    match rx.recv().unwrap() {
-      Event::Loaded(load) => {
-        let (_, result) = loader.accept(load).expect("the latest load");
-        assert_eq!(result.unwrap().len(), 2);
-      }
-      _ => panic!("expected a loaded diff"),
-    }
-  }
-
   #[test]
   fn a_reload_with_an_identical_changeset_changes_nothing() {
-    let git = std::sync::Arc::new(stage_memory());
-    let mut loader = Loader::default();
-    let (tx, rx) = mpsc::channel();
     let mut app = App::default();
-    let mut reload = |app: &mut App| {
-      start_load(&mut loader, &git, &DiffRequest::default(), &tx);
-      let Ok(Event::Loaded(load)) = rx.recv() else {
-        panic!("expected a loaded changeset");
-      };
-      let (_, result) = loader.accept(load).expect("the latest load");
-      app.on_loaded(result)
-    };
-    assert!(reload(&mut app));
+    let git = rig(&mut app, stage_memory());
+    assert!(load(&mut app, &git));
     app.on_key(key(KeyCode::Char('j')));
     let (selected, scroll) = (app.selected, app.scroll);
-    assert!(!reload(&mut app));
+    assert!(!load(&mut app, &git));
     assert_eq!((app.selected, app.scroll), (selected, scroll));
   }
 
@@ -2220,23 +2143,30 @@ mod tests {
       .staged("c")
   }
 
-  fn load(app: &mut App, git: &impl Vcs) -> bool {
-    app.on_loaded(git.changeset(&DiffRequest::default()))
+  /// Reads the changeset again. True when it differs from the one shown.
+  fn load(app: &mut App, rig: &Rig) -> bool {
+    let before = app.loaded.clone();
+    app.reload();
+    settle(app, &rig.rx);
+    !Arc::ptr_eq(&before, &app.loaded)
   }
 
-  /// Presses `A` and runs what it asked for, as the event loop does.
-  fn press_capital_a(app: &mut App, git: &impl Vcs) {
+  /// Takes the index write a key press started and the reload after it.
+  fn finish_index(app: &mut App, rig: &Rig) {
+    settle(app, &rig.rx);
+    settle(app, &rig.rx);
+  }
+
+  /// Presses `A` and runs what it asked for.
+  fn press_capital_a(app: &mut App, rig: &Rig) {
     app.on_key(key(KeyCode::Char('A')));
-    let request = app.take_index_request().expect("a stage all request");
-    let result = request.run(git);
-    assert!(app.on_indexed(request.follow, result));
-    load(app, git);
+    finish_index(app, rig);
   }
 
   #[test]
   fn capital_a_stages_every_file_then_unstages_every_file() {
-    let git = stage_memory();
     let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
     assert_eq!(app.files.len(), 3);
 
@@ -2256,8 +2186,8 @@ mod tests {
 
   #[test]
   fn capital_a_keeps_the_selected_file() {
-    let git = stage_memory();
     let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
     app.on_key(key(KeyCode::Char('n')));
     let name = selected_name(&app).0;
@@ -2267,8 +2197,8 @@ mod tests {
 
   #[test]
   fn comma_and_period_select_the_first_and_last_file() {
-    let git = stage_memory();
     let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
     app.on_key(key(KeyCode::Char('.')));
     assert_eq!(app.selected, app.files.len() - 1);
@@ -2277,12 +2207,9 @@ mod tests {
   }
 
   /// Presses `f` and runs what it asked for, as the event loop does.
-  fn press_minus(app: &mut App, git: &impl Vcs) {
+  fn press_minus(app: &mut App, rig: &Rig) {
     app.on_key(key(KeyCode::Char('f')));
-    let request = app.take_index_request().expect("a stage request");
-    let result = request.run(git);
-    assert!(app.on_indexed(request.follow, result));
-    load(app, git);
+    finish_index(app, rig);
   }
 
   fn selected_name(app: &App) -> (String, Option<Section>) {
@@ -2292,8 +2219,8 @@ mod tests {
 
   #[test]
   fn minus_moves_a_file_between_sections_and_selects_the_next_one() {
-    let git = stage_memory();
     let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
     let (u, s) = (Some(Section::Unstaged), Some(Section::Staged));
     assert_eq!(selected_name(&app), ("a".into(), u));
@@ -2324,8 +2251,8 @@ mod tests {
 
   #[test]
   fn a_watch_refresh_after_a_stage_keeps_the_selection() {
-    let git = stage_memory();
     let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
     press_minus(&mut app, &git);
     let selected = selected_name(&app);
@@ -2336,8 +2263,9 @@ mod tests {
   #[test]
   fn minus_on_a_revision_changeset_only_shows_a_notice() {
     let mut app = ready(vec![file_in("a", None)], 5);
+    let rx = wire(&mut app, crate::vcs::Memory::default());
     app.on_key(key(KeyCode::Char('f')));
-    assert!(app.take_index_request().is_none());
+    assert!(quiet(&rx));
     assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
   }
 
@@ -2346,20 +2274,6 @@ mod tests {
     let mut app = ready(vec![file_in("a", Some(Section::Unstaged))], 5);
     assert!(!app.on_indexed(None, Err(vcs::Error::Git("locked".into()))));
     assert_eq!(app.notice.as_deref(), Some("locked"));
-  }
-
-  #[test]
-  fn indexing_runs_off_the_calling_thread() {
-    let git = stage_memory();
-    let mut app = App::default();
-    load(&mut app, &git);
-    app.on_key(key(KeyCode::Char('f')));
-    let (tx, rx) = mpsc::channel();
-    spawn_index(Arc::new(git), app.take_index_request().unwrap(), tx);
-    assert!(matches!(
-      rx.recv().unwrap(),
-      Event::Indexed(Some(_), Ok(()))
-    ));
   }
 
   /// `one` and `two` each have two unstaged hunks.
@@ -2381,19 +2295,15 @@ mod tests {
   }
 
   /// Presses `a` and runs what it asked for, as the event loop does.
-  fn press_a(app: &mut App, git: &impl Vcs) {
+  fn press_a(app: &mut App, rig: &Rig) {
     app.on_key(key(KeyCode::Char('a')));
-    let request = app.take_index_request().expect("a hunk request");
-    assert!(matches!(request.target, crate::vcs::Target::Hunk(_)));
-    let result = request.run(git);
-    assert!(app.on_indexed(request.follow, result));
-    load(app, git);
+    finish_index(app, rig);
   }
 
   #[test]
   fn a_stages_the_hunk_under_the_cursor_and_the_cursor_moves_to_the_next_hunk() {
-    let git = hunk_repo();
     let mut app = App::default();
+    let git = rig(&mut app, hunk_repo());
     load(&mut app, &git);
     let u = Some(Section::Unstaged);
     assert_eq!(app.files[0].hunks.len(), 2);
@@ -2414,8 +2324,8 @@ mod tests {
 
   #[test]
   fn a_on_the_last_hunk_moves_to_the_next_file_in_the_section() {
-    let git = hunk_repo();
     let mut app = App::default();
+    let git = rig(&mut app, hunk_repo());
     load(&mut app, &git);
     let u = Some(Section::Unstaged);
     press_a(&mut app, &git);
@@ -2427,8 +2337,8 @@ mod tests {
 
   #[test]
   fn a_in_the_staged_section_unstages_that_hunk_only() {
-    let git = hunk_repo();
     let mut app = App::default();
+    let git = rig(&mut app, hunk_repo());
     load(&mut app, &git);
     press_a(&mut app, &git);
     let staged = app
@@ -2471,9 +2381,10 @@ mod tests {
       ..file_in("b", Some(Section::Unstaged))
     };
     let mut app = ready(vec![binary], 5);
+    let rx = wire(&mut app, crate::vcs::Memory::default());
     app.on_key(key(KeyCode::Char('a')));
     assert_eq!(app.notice.as_deref(), Some("No hunk under the cursor"));
-    assert!(app.take_index_request().is_none());
+    assert!(quiet(&rx));
   }
 
   /// One file `f` whose single hunk reads, by hunk line and by unified row
@@ -2498,13 +2409,10 @@ mod tests {
     git.index_text(name).unwrap_or_default()
   }
 
-  /// Runs the stage or unstage the last key press asked for, as the event
-  /// loop does, and reloads.
-  fn run_request(app: &mut App, git: &impl Vcs) {
-    let request = app.take_index_request().expect("an index request");
-    let result = request.run(git);
-    assert!(app.on_indexed(request.follow, result));
-    load(app, git);
+  /// Takes the result of the stage or unstage the last key press started and
+  /// the reload after it.
+  fn run_request(app: &mut App, rig: &Rig) {
+    finish_index(app, rig);
   }
 
   fn press(app: &mut App, keys: &str) {
@@ -2521,8 +2429,8 @@ mod tests {
 
   #[test]
   fn v_then_a_stages_only_the_selected_lines() {
-    let git = line_repo();
     let mut app = App::default();
+    let git = rig(&mut app, line_repo());
     load(&mut app, &git);
     cursor_to(&mut app, 3); // `-3`
     press(&mut app, "vj");
@@ -2561,8 +2469,8 @@ mod tests {
       (4, "kk", numbered(&[(3, "x3")])),
     ];
     for (row, keys, expected) in cases {
-      let git = line_repo();
       let mut app = App::default();
+      let git = rig(&mut app, line_repo());
       load(&mut app, &git);
       cursor_to(&mut app, row);
       press(&mut app, "v");
@@ -2575,8 +2483,8 @@ mod tests {
 
   #[test]
   fn a_in_the_staged_section_unstages_only_the_selected_lines() {
-    let git = line_repo().staged("f");
     let mut app = App::default();
+    let git = rig(&mut app, line_repo().staged("f"));
     load(&mut app, &git);
     assert_eq!(selected_name(&app).1, Some(Section::Staged));
     cursor_to(&mut app, 6); // `-5`
@@ -2594,8 +2502,8 @@ mod tests {
 
   #[test]
   fn esc_and_v_leave_visual_mode_without_quitting() {
-    let git = line_repo();
     let mut app = App::default();
+    let git = rig(&mut app, line_repo());
     load(&mut app, &git);
     press(&mut app, "v");
     app.on_key(key(KeyCode::Esc));
@@ -2606,6 +2514,7 @@ mod tests {
     app.on_key(key(KeyCode::Esc));
     assert!(app.quit);
     let mut app = App::default();
+    let git = rig(&mut app, line_repo());
     load(&mut app, &git);
     press(&mut app, "vq");
     assert!(app.quit);
@@ -2613,21 +2522,21 @@ mod tests {
 
   #[test]
   fn a_selection_without_changed_lines_shows_a_notice_and_changes_nothing() {
-    let git = line_repo();
     let mut app = App::default();
+    let git = rig(&mut app, line_repo());
     load(&mut app, &git);
     // The two context lines above the first change.
     press(&mut app, "vj");
     press(&mut app, "a");
     assert_eq!(app.notice.as_deref(), Some("no changed lines selected"));
-    assert!(app.take_index_request().is_none());
+    assert!(quiet(&git.rx));
     assert_eq!(app.mode, Mode::Visual);
   }
 
   #[test]
   fn the_selection_stays_inside_its_hunk() {
-    let git = hunk_repo();
     let mut app = App::default();
+    let git = rig(&mut app, hunk_repo());
     load(&mut app, &git);
     let first = app.files[0].hunks[0].lines.len();
     press(&mut app, "v");
@@ -2684,8 +2593,8 @@ mod tests {
 
   #[test]
   fn a_split_row_selects_the_lines_on_both_sides() {
-    let git = uneven_repo();
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo());
     load(&mut app, &git);
     split_cursor_to(&mut app, 3);
     press(&mut app, "v");
@@ -2697,8 +2606,8 @@ mod tests {
 
   #[test]
   fn selected_split_rows_stage_both_sides_of_a_pair() {
-    let git = uneven_repo();
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo());
     load(&mut app, &git);
     split_cursor_to(&mut app, 3);
     press(&mut app, "va");
@@ -2710,8 +2619,8 @@ mod tests {
 
   #[test]
   fn a_split_row_with_only_a_removed_line_stages_the_removal() {
-    let git = uneven_repo();
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo());
     load(&mut app, &git);
     split_cursor_to(&mut app, 4);
     press(&mut app, "va");
@@ -2721,8 +2630,8 @@ mod tests {
 
   #[test]
   fn a_split_row_with_only_an_added_line_stages_the_addition() {
-    let git = uneven_repo();
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo());
     load(&mut app, &git);
     split_cursor_to(&mut app, 6);
     press(&mut app, "va");
@@ -2732,8 +2641,8 @@ mod tests {
 
   #[test]
   fn split_rows_across_a_pair_and_an_unpaired_row_stage_all_their_lines() {
-    let git = uneven_repo();
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo());
     load(&mut app, &git);
     split_cursor_to(&mut app, 3);
     press(&mut app, "vja");
@@ -2743,8 +2652,8 @@ mod tests {
 
   #[test]
   fn unstaging_split_rows_takes_back_both_sides() {
-    let git = uneven_repo().staged("f");
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo().staged("f"));
     load(&mut app, &git);
     assert_eq!(selected_name(&app).1, Some(Section::Staged));
     split_cursor_to(&mut app, 3);
@@ -2756,8 +2665,8 @@ mod tests {
 
   #[test]
   fn toggling_the_layout_keeps_the_selected_lines() {
-    let git = uneven_repo();
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo());
     load(&mut app, &git);
     cursor_to(&mut app, 3); // unified `-3`
     press(&mut app, "vjj"); // `-3` `-4` `+x3`
@@ -2774,8 +2683,8 @@ mod tests {
 
   #[test]
   fn toggling_the_layout_keeps_the_direction_of_the_selection() {
-    let git = uneven_repo();
     let mut app = App::default();
+    let git = rig(&mut app, uneven_repo());
     load(&mut app, &git);
     split_cursor_to(&mut app, 4);
     press(&mut app, "vk");
@@ -2790,16 +2699,17 @@ mod tests {
     let mut changed = file_in("a", None);
     changed.hunks[0].lines[0].kind = LineKind::Added;
     let mut app = ready(vec![changed], 5);
+    let rx = wire(&mut app, crate::vcs::Memory::default());
     cursor_to(&mut app, 1);
     press(&mut app, "va");
     assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
-    assert!(app.take_index_request().is_none());
+    assert!(quiet(&rx));
   }
 
   #[test]
   fn the_cursor_stays_on_a_hunk_that_is_only_partly_staged() {
-    let git = line_repo();
     let mut app = App::default();
+    let git = rig(&mut app, line_repo());
     load(&mut app, &git);
     cursor_to(&mut app, 3); // `-3`
     press(&mut app, "vja");
@@ -2813,8 +2723,8 @@ mod tests {
 
   #[test]
   fn the_cursor_moves_on_when_the_selection_takes_the_whole_hunk() {
-    let git = hunk_repo();
     let mut app = App::default();
+    let git = rig(&mut app, hunk_repo());
     load(&mut app, &git);
     let first = app.files[0].hunks[0].clone();
     let last = first.lines.len();
@@ -2842,8 +2752,8 @@ mod tests {
 
   #[test]
   fn unstaging_only_the_added_lines_of_a_selection() {
-    let git = line_repo().staged("f");
     let mut app = App::default();
+    let git = rig(&mut app, line_repo().staged("f"));
     load(&mut app, &git);
     cursor_to(&mut app, 4); // `+x3`
     press(&mut app, "va");

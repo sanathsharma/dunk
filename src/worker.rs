@@ -30,7 +30,7 @@ impl Worker {
     done: F,
   ) -> Self
   where
-    V: Vcs + Send + Sync + 'static,
+    V: Vcs + Send + Sync + ?Sized + 'static,
     F: Fn(usize, FileHighlight) -> bool + Send + 'static,
   {
     let shared = Arc::new(Shared {
