@@ -1,7 +1,7 @@
 use crate::app::{App, ListRow, Load, Mode};
 use crate::args::{Border, Layout as DiffLayout};
 use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind, Section};
-use crate::highlight::Styled;
+use crate::highlight::{FileHighlight, Styled};
 use crate::palette::Palette;
 use crate::split::pairs;
 use crate::words::changed_words;
@@ -10,7 +10,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
-use std::ops::Range;
+use std::borrow::Cow;
+use std::ops::{Range, RangeInclusive};
 
 const HELP: &str = " j/k move · n/p file · [/] hunk · a stage · ? help · q quit";
 
@@ -48,6 +49,7 @@ impl Row<'_> {
   }
 }
 
+#[derive(Clone, Copy)]
 enum Row<'a> {
   /// A hunk header, and whether the cursor is in that hunk.
   Header(&'a Hunk, bool),
@@ -91,10 +93,15 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     .collect();
   let widest = lines.iter().map(Line::width).max().unwrap_or(0);
   // The widest line, a space after it and the two borders.
-  let width = (widest + 3)
-    .max(" Help (esc or q closes) ".len() + 2)
-    .min(area.width as usize) as u16;
-  let height = (lines.len() as u16 + 2).min(area.height);
+  let width = widest
+    .saturating_add(3)
+    .max(" Help (esc or q closes) ".len().saturating_add(2))
+    .min(usize::from(area.width));
+  let width = u16::try_from(width).unwrap_or(u16::MAX);
+  let height = u16::try_from(lines.len())
+    .unwrap_or(u16::MAX)
+    .saturating_add(2)
+    .min(area.height);
   let [_, row, _] = Layout::vertical([
     Constraint::Fill(1),
     Constraint::Length(height),
@@ -126,10 +133,10 @@ fn footer_line(app: &App) -> Line<'static> {
     Mode::Visual => app.palette.mode_visual,
   };
   let mode = Span::styled(format!(" {} ", app.mode_label()), style);
-  let rest = match &app.notice {
-    Some(notice) => Span::styled(format!(" {notice}"), Style::new().fg(Color::Yellow)),
-    None => Span::styled(HELP, Style::new().fg(Color::DarkGray)),
-  };
+  let rest = app.notice.as_ref().map_or_else(
+    || Span::styled(HELP, Style::new().fg(Color::DarkGray)),
+    |notice| Span::styled(format!(" {notice}"), Style::new().fg(Color::Yellow)),
+  );
   Line::from(vec![mode, rest])
 }
 
@@ -146,10 +153,9 @@ fn message(frame: &mut Frame, area: Rect, text: &str) {
 const fn status_color(status: FileStatus) -> Color {
   match status {
     FileStatus::Added => Color::Green,
-    FileStatus::Deleted => Color::Red,
+    FileStatus::Deleted | FileStatus::Conflicted => Color::Red,
     FileStatus::Modified => Color::Yellow,
     FileStatus::Renamed | FileStatus::Copied => Color::Cyan,
-    FileStatus::Conflicted => Color::Red,
   }
 }
 
@@ -177,16 +183,18 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App) {
           palette.section_label,
         ))
       }
-      ListRow::Entry(index) => {
-        let f = &app.files[index];
-        ListItem::new(Line::from(vec![
-          Span::styled(
-            format!("{} ", f.status.letter()),
-            Style::new().fg(status_color(f.status)),
-          ),
-          Span::raw(f.path().display().to_string()),
-        ]))
-      }
+      ListRow::Entry(index) => app.files.get(index).map_or_else(
+        || ListItem::new(""),
+        |f| {
+          ListItem::new(Line::from(vec![
+            Span::styled(
+              format!("{} ", f.status.letter()),
+              Style::new().fg(status_color(f.status)),
+            ),
+            Span::raw(f.path().display().to_string()),
+          ]))
+        },
+      ),
     })
     .collect();
   let list = List::new(items)
@@ -201,8 +209,188 @@ fn render_files(frame: &mut Frame, area: Rect, app: &mut App) {
   frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
+/// What `render_diff` needs to draw the rows of one file, gathered once.
+struct DiffView<'a> {
+  file: &'a FileDiff,
+  words: &'a [Vec<Vec<Range<usize>>>],
+  colors: Option<&'a FileHighlight>,
+  selection: Option<RangeInclusive<usize>>,
+  palette: Palette,
+  bar_style: Style,
+  scroll: usize,
+  viewport: usize,
+  pan: usize,
+  /// Digits of the widest line number.
+  gutter: usize,
+  /// The hunk under the cursor.
+  current: Option<usize>,
+  /// The cursor's row within the viewport.
+  cursor: usize,
+}
+
+impl<'a> DiffView<'a> {
+  /// Lays the selection over `line`, drawn at viewport row `i`. `line_spans`
+  /// lays the cursor style under the changed words itself, and blank split
+  /// cells take it in `side`, so only the selection goes on here.
+  fn mark(&self, i: usize, line: Line<'static>) -> Line<'static> {
+    let selected = self
+      .selection
+      .as_ref()
+      .is_some_and(|rows| rows.contains(&self.scroll.saturating_add(i)));
+    if selected {
+      overlay(line, self.palette.visual)
+    } else {
+      line
+    }
+  }
+
+  /// The colors and the changed word ranges of line `li` of hunk `hi`.
+  fn extras(&self, hi: usize, li: usize) -> (Option<&'a Styled>, &'a [Range<usize>]) {
+    let styled = self.colors.and_then(|c| c.hunks.get(hi)?.get(li)?.as_ref());
+    let ranges = self
+      .words
+      .get(hi)
+      .and_then(|h| h.get(li))
+      .map_or(&[][..], Vec::as_slice);
+    (styled, ranges)
+  }
+
+  fn unified(&self, frame: &mut Frame, inner: Rect) {
+    let [bar_area, text] =
+      Layout::horizontal([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    let (active, rows): (Vec<_>, Vec<_>) = self
+      .file
+      .hunks
+      .iter()
+      .enumerate()
+      .flat_map(|(hi, h)| {
+        let lines = h.lines.iter().enumerate().map(move |(li, l)| {
+          let (styled, ranges) = self.extras(hi, li);
+          Row::Line(l, styled, ranges, self.current == Some(hi))
+        });
+        std::iter::once(Row::Header(h, self.current == Some(hi))).chain(lines)
+      })
+      .skip(self.scroll)
+      .take(self.viewport)
+      .enumerate()
+      .map(|(i, row)| {
+        let active = row.active();
+        let at_cursor = (i == self.cursor).then_some(self.palette.cursor_line);
+        let line = row_line(
+          row,
+          &self.palette,
+          self.gutter,
+          text.width.into(),
+          self.pan,
+          at_cursor,
+        );
+        (active, self.mark(i, line))
+      })
+      .unzip();
+    frame.render_widget(Paragraph::new(bar(&active, self.bar_style)), bar_area);
+    frame.render_widget(Paragraph::new(rows), text);
+  }
+
+  /// One side of a split row: line `index` of hunk `h`, or a blank cell.
+  fn side(
+    &self,
+    (hi, h): (usize, &Hunk),
+    index: Option<usize>,
+    new: bool,
+    fill: u16,
+    at_cursor: bool,
+  ) -> Line<'static> {
+    let Some((li, l)) = index.and_then(|li| Some((li, h.lines.get(li)?))) else {
+      let cell = blank(fill);
+      return if at_cursor {
+        overlay(cell, self.palette.cursor_line)
+      } else {
+        cell
+      };
+    };
+    let (styled, ranges) = self.extras(hi, li);
+    let number = if new { l.new_no } else { l.old_no };
+    let gutter = format!(
+      "{:>width$} ",
+      number.map_or_else(String::new, |n| n.to_string()),
+      width = self.gutter
+    );
+    line_spans(
+      l,
+      &self.palette,
+      styled,
+      ranges,
+      gutter,
+      usize::from(fill),
+      self.pan,
+      self.current == Some(hi),
+      at_cursor.then_some(self.palette.cursor_line),
+    )
+  }
+
+  fn split(&self, frame: &mut Frame, inner: Rect) {
+    let left_width = inner.width.saturating_sub(2) / 2;
+    let right_width = inner.width.saturating_sub(2).saturating_sub(left_width);
+    let [edge_area, left_area, gap_area, right_area] = Layout::horizontal([
+      Constraint::Length(1),
+      Constraint::Length(left_width),
+      Constraint::Length(1),
+      Constraint::Length(right_width),
+    ])
+    .areas(inner);
+    let (active, (left, right)): (Vec<bool>, (Vec<Line>, Vec<Line>)) = self
+      .file
+      .hunks
+      .iter()
+      .enumerate()
+      .flat_map(|(hi, h)| {
+        let header = std::iter::once((hi, h, None));
+        let pairs = pairs(h).into_iter().map(move |p| (hi, h, Some(p)));
+        header.chain(pairs)
+      })
+      .skip(self.scroll)
+      .take(self.viewport)
+      .enumerate()
+      .map(|(i, (hi, h, pair))| {
+        let active = self.current == Some(hi);
+        let on = i == self.cursor;
+        match pair {
+          None => {
+            let header = Row::Header(h, active);
+            let left = row_line(
+              header,
+              &self.palette,
+              self.gutter,
+              left_width.into(),
+              self.pan,
+              None,
+            );
+            (
+              active,
+              (self.mark(i, left), self.mark(i, blank(right_width))),
+            )
+          }
+          Some((l, r)) => (
+            active,
+            (
+              self.mark(i, self.side((hi, h), l, false, left_width, on)),
+              self.mark(i, self.side((hi, h), r, true, right_width, on)),
+            ),
+          ),
+        }
+      })
+      .unzip();
+    frame.render_widget(Paragraph::new(bar(&active, self.bar_style)), edge_area);
+    frame.render_widget(Paragraph::new(bar(&active, self.bar_style)), gap_area);
+    frame.render_widget(Paragraph::new(left), left_area);
+    frame.render_widget(Paragraph::new(right), right_area);
+  }
+}
+
 fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
-  let file = &app.files[app.selected];
+  let Some(file) = app.files.get(app.selected) else {
+    return;
+  };
   let border = app.palette.border.patch(app.palette.diff_border);
   let block = Block::bordered()
     .border_type(border_type(app.border))
@@ -214,16 +402,23 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
 
   app.viewport = usize::from(inner.height);
   app.clamp_scroll();
-  if app.words[app.selected].is_none() {
-    let words = app.files[app.selected]
-      .hunks
-      .iter()
-      .map(changed_words)
-      .collect();
-    app.words[app.selected] = Some(words);
+  if app.words.get(app.selected).is_some_and(Option::is_none) {
+    let words = app
+      .files
+      .get(app.selected)
+      .map(|f| f.hunks.iter().map(changed_words).collect());
+    if let Some(slot) = app.words.get_mut(app.selected) {
+      *slot = words;
+    }
   }
-  let file = &app.files[app.selected];
-  let words = app.words[app.selected].as_deref().unwrap_or_default();
+  let Some(file) = app.files.get(app.selected) else {
+    return;
+  };
+  let words = app
+    .words
+    .get(app.selected)
+    .and_then(|w| w.as_deref())
+    .unwrap_or_default();
   let colors = app.highlights.get(app.selected).and_then(Option::as_ref);
 
   if file.hunks.is_empty() {
@@ -247,137 +442,28 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &mut App) {
     .max()
     .unwrap_or(0);
   app.pan = app.pan.min(widest.saturating_sub(1));
-  let pan = app.pan;
-  let width = gutter_width(file);
-  let current = app.cursor_hunk();
-  let cursor = app.cursor.saturating_sub(app.scroll);
-  let selection = app.selection();
   let palette = app.palette;
-  let bar_style = if file.section == Some(Section::Unstaged) {
-    palette.diff_hunk_bar
-  } else {
-    palette.diff_hunk_bar_staged
-  };
-  // `line_spans` lays the cursor style under the changed words itself, and
-  // blank split cells take it in `side`, so only the selection goes on here.
-  let mark = |i: usize, line: Line<'static>| {
-    let selected = selection
-      .as_ref()
-      .is_some_and(|rows| rows.contains(&(app.scroll + i)));
-    if selected {
-      overlay(line, palette.visual)
+  let view = DiffView {
+    file,
+    words,
+    colors,
+    selection: app.selection(),
+    palette,
+    bar_style: if file.section == Some(Section::Unstaged) {
+      palette.diff_hunk_bar
     } else {
-      line
-    }
+      palette.diff_hunk_bar_staged
+    },
+    scroll: app.scroll,
+    viewport: app.viewport,
+    pan: app.pan,
+    gutter: gutter_width(file),
+    current: app.cursor_hunk(),
+    cursor: app.cursor.saturating_sub(app.scroll),
   };
-  let hunks = file.hunks.iter().enumerate();
-  let line_of = |hi: usize, li: usize| {
-    let h = &file.hunks[hi];
-    let styled = colors.and_then(|c| c.hunks.get(hi)?.get(li)?.as_ref());
-    let ranges = words
-      .get(hi)
-      .and_then(|h| h.get(li))
-      .map_or(&[][..], Vec::as_slice);
-    (&h.lines[li], styled, ranges)
-  };
-
   match app.layout {
-    DiffLayout::Unified => {
-      let [bar_area, text] =
-        Layout::horizontal([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-      let rows = hunks
-        .flat_map(|(hi, h)| {
-          let lines = (0..h.lines.len()).map(move |li| {
-            let (l, styled, ranges) = line_of(hi, li);
-            Row::Line(l, styled, ranges, current == Some(hi))
-          });
-          std::iter::once(Row::Header(h, current == Some(hi))).chain(lines)
-        })
-        .skip(app.scroll)
-        .take(app.viewport)
-        .enumerate()
-        .map(|(i, row)| {
-          let active = row.active();
-          let at_cursor = (i == cursor).then_some(palette.cursor_line);
-          let line = row_line(row, &palette, width, text.width.into(), pan, at_cursor);
-          (active, mark(i, line))
-        })
-        .collect::<Vec<_>>();
-      let (active, rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-      frame.render_widget(Paragraph::new(bar(&active, bar_style)), bar_area);
-      frame.render_widget(Paragraph::new(rows), text);
-    }
-    DiffLayout::Split => {
-      let left_width = inner.width.saturating_sub(2) / 2;
-      let right_width = inner.width.saturating_sub(2 + left_width);
-      let [edge_area, left_area, gap_area, right_area] = Layout::horizontal([
-        Constraint::Length(1),
-        Constraint::Length(left_width),
-        Constraint::Length(1),
-        Constraint::Length(right_width),
-      ])
-      .areas(inner);
-      let side = |index: Option<usize>, hi: usize, new: bool, fill: u16, at_cursor: bool| {
-        let Some(li) = index else {
-          let cell = blank(fill);
-          return if at_cursor {
-            overlay(cell, palette.cursor_line)
-          } else {
-            cell
-          };
-        };
-        let (l, styled, ranges) = line_of(hi, li);
-        let number = if new { l.new_no } else { l.old_no };
-        let gutter = format!(
-          "{:>width$} ",
-          number.map_or(String::new(), |n| n.to_string())
-        );
-        line_spans(
-          l,
-          &palette,
-          styled,
-          ranges,
-          gutter,
-          usize::from(fill),
-          pan,
-          current == Some(hi),
-          at_cursor.then_some(palette.cursor_line),
-        )
-      };
-      let rows: Vec<(bool, Line, Line)> = hunks
-        .flat_map(|(hi, h)| {
-          let header = std::iter::once((hi, h, None));
-          let pairs = pairs(h).into_iter().map(move |p| (hi, h, Some(p)));
-          header.chain(pairs)
-        })
-        .skip(app.scroll)
-        .take(app.viewport)
-        .enumerate()
-        .map(|(i, (hi, h, pair))| {
-          let active = current == Some(hi);
-          let on = i == cursor;
-          match pair {
-            None => {
-              let header = Row::Header(h, active);
-              let left = row_line(header, &palette, width, left_width.into(), pan, None);
-              (active, mark(i, left), mark(i, blank(right_width)))
-            }
-            Some((l, r)) => (
-              active,
-              mark(i, side(l, hi, false, left_width, on)),
-              mark(i, side(r, hi, true, right_width, on)),
-            ),
-          }
-        })
-        .collect();
-      let active: Vec<bool> = rows.iter().map(|(a, _, _)| *a).collect();
-      let left: Vec<Line> = rows.iter().map(|(_, l, _)| l.clone()).collect();
-      let right: Vec<Line> = rows.into_iter().map(|(_, _, r)| r).collect();
-      frame.render_widget(Paragraph::new(bar(&active, bar_style)), edge_area);
-      frame.render_widget(Paragraph::new(bar(&active, bar_style)), gap_area);
-      frame.render_widget(Paragraph::new(left), left_area);
-      frame.render_widget(Paragraph::new(right), right_area);
-    }
+    DiffLayout::Unified => view.unified(frame, inner),
+    DiffLayout::Split => view.split(frame, inner),
   }
 }
 
@@ -441,7 +527,11 @@ fn gutter_width(file: &FileDiff) -> usize {
   let last = file
     .hunks
     .iter()
-    .map(|h| (h.old_start + h.old_len).max(h.new_start + h.new_len))
+    .map(|h| {
+      h.old_start
+        .saturating_add(h.old_len)
+        .max(h.new_start.saturating_add(h.new_len))
+    })
     .max()
     .unwrap_or(0);
   last.to_string().len().max(3)
@@ -519,17 +609,16 @@ fn line_spans(
     Span::styled(gutter, Style::new().fg(gutter_color).patch(under)),
     Span::styled(marker.to_string(), under),
   ];
-  let plain;
-  let pieces = if let Some(pieces) = styled {
-    pieces
-  } else {
-    plain = vec![(
-      Style::new(),
-      String::from_utf8_lossy(&l.content).into_owned(),
-    )];
-    &plain
-  };
-  let mut code: Vec<(Style, String)> = emphasize(pieces, changed, word_bg, under)
+  let pieces: Cow<Styled> = styled.map_or_else(
+    || {
+      Cow::Owned(vec![(
+        Style::new(),
+        String::from_utf8_lossy(&l.content).into_owned(),
+      )])
+    },
+    Cow::Borrowed,
+  );
+  let mut code: Vec<(Style, String)> = emphasize(&pieces, changed, word_bg, under)
     .into_iter()
     .map(|(style, text)| (style, sanitize(text.as_bytes())))
     .collect();
@@ -552,7 +641,7 @@ fn line_spans(
 /// Drops the first `columns` display columns of `pieces`. A wide character
 /// that straddles the cut is dropped whole.
 fn skip_columns(pieces: Vec<(Style, String)>, columns: usize) -> Vec<(Style, String)> {
-  let mut skipped = 0;
+  let mut skipped = 0_usize;
   let mut out = Vec::with_capacity(pieces.len());
   for (style, text) in pieces {
     if skipped >= columns {
@@ -564,7 +653,7 @@ fn skip_columns(pieces: Vec<(Style, String)>, columns: usize) -> Vec<(Style, Str
       if skipped >= columns {
         kept.push(c);
       } else {
-        skipped += Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
+        skipped = skipped.saturating_add(Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width());
       }
     }
     if !kept.is_empty() {
@@ -590,28 +679,31 @@ fn emphasize(
       .collect();
   };
   let mut out = Vec::new();
-  let mut at = 0;
+  let mut at = 0_usize;
   for (style, text) in pieces {
-    let end = at + text.len();
+    let end = at.saturating_add(text.len());
     let mut cut = vec![0, text.len()];
     for r in changed {
       for edge in [r.start, r.end] {
         if edge > at && edge < end {
-          cut.push(edge - at);
+          cut.push(edge.saturating_sub(at));
         }
       }
     }
     cut.sort_unstable();
     cut.dedup();
-    for w in cut.windows(2) {
-      let (from, to) = (at + w[0], at + w[1]);
+    for edges in cut.windows(2) {
+      let &[start, stop] = edges else {
+        continue;
+      };
+      let (from, to) = (at.saturating_add(start), at.saturating_add(stop));
       let hit = changed.iter().any(|r| r.start <= from && to <= r.end);
       let style = if hit {
         style.patch(emphasis)
       } else {
         style.patch(rest)
       };
-      out.push((style, text[w[0]..w[1]].to_string()));
+      out.push((style, text.get(start..stop).unwrap_or_default().to_string()));
     }
     at = end;
   }
