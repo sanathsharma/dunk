@@ -3,7 +3,7 @@
 //! the result.
 
 use crate::diff::{FileDiff, FileStatus, Hunk, Section};
-use crate::vcs::{self, Vcs};
+use crate::vcs::{self, Target, Vcs};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -15,17 +15,6 @@ pub struct Follow {
   pub path: PathBuf,
   pub section: Section,
   pub hunk: Option<usize>,
-}
-
-/// What a stage or unstage moves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-  File,
-  Hunk(usize),
-  /// The lines of a hunk at these indexes into the hunk's lines.
-  Lines(usize, BTreeSet<usize>),
-  /// Every file of the list that is in the section the request moves out of.
-  All(Vec<FileDiff>),
 }
 
 /// A stage or unstage of a file, a hunk or some of its lines waiting to run.
@@ -40,17 +29,7 @@ pub struct IndexRequest {
 impl IndexRequest {
   /// Writes the index as the request asks.
   pub fn run(&self, vcs: &(impl Vcs + ?Sized)) -> Result<(), vcs::Error> {
-    let file = &self.file;
-    match (&self.target, self.stage) {
-      (Target::File, true) => vcs.stage(file),
-      (Target::File, false) => vcs.unstage(file),
-      (Target::All(files), true) => vcs.stage_all(files),
-      (Target::All(files), false) => vcs.unstage_all(files),
-      (Target::Hunk(hunk), true) => vcs.stage_hunk(file, *hunk),
-      (Target::Hunk(hunk), false) => vcs.unstage_hunk(file, *hunk),
-      (Target::Lines(hunk, lines), true) => vcs.stage_lines(file, *hunk, lines),
-      (Target::Lines(hunk, lines), false) => vcs.unstage_lines(file, *hunk, lines),
-    }
+    vcs.update_index(&self.file, &self.target, self.stage)
   }
 }
 

@@ -3,12 +3,13 @@
 //!
 //! It supports whole-file, hunk and line staging. Revisions are not supported.
 
-use super::{DiffRequest, Error, Sides, Vcs, VersionId};
+use super::{DiffRequest, Error, Sides, Target, Vcs, VersionId};
 use crate::args::Scope;
 use crate::diff::{self, FileDiff, Hunk, LineKind, Section};
 use similar::TextDiff;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Context lines around a change when the request sets none, as git does.
@@ -37,6 +38,8 @@ impl Versions {
 #[derive(Debug, Default)]
 pub struct Memory {
   files: Mutex<BTreeMap<PathBuf, Versions>>,
+  /// When set, each `diff` waits for one message before it answers.
+  gate: Mutex<Option<Receiver<()>>>,
 }
 
 impl Memory {
@@ -101,6 +104,14 @@ impl Memory {
       let absent = if stage { &v.work } else { &v.head };
       v.index = (!text.is_empty() || absent.is_some()).then_some(text);
     })
+  }
+
+  /// Makes each `diff` wait for one message on `gate`, so a test can hold a
+  /// load open.
+  #[must_use]
+  pub fn gated(self, gate: Receiver<()>) -> Self {
+    *self.gate.lock().unwrap_or_else(PoisonError::into_inner) = Some(gate);
+    self
   }
 
   /// What the index holds for `path`, or `None` when it holds no such file.
@@ -198,30 +209,7 @@ fn patch(path: &Path, old: Option<&str>, new: Option<&str>, context: u32) -> Str
   out
 }
 
-impl Vcs for Memory {
-  fn diff(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
-    if !request.revisions.is_empty() {
-      return Err(Self::unsupported());
-    }
-    let context = request.context.unwrap_or(DEFAULT_CONTEXT);
-    let mut text = String::new();
-    for (path, versions) in self.lock().iter() {
-      if !request.paths.is_empty() && !request.paths.iter().any(|p| path.starts_with(p)) {
-        continue;
-      }
-      let (old, new) = versions.sides(request.scope);
-      if old != new {
-        text.push_str(&patch(
-          path,
-          old.map(String::as_str),
-          new.map(String::as_str),
-          context,
-        ));
-      }
-    }
-    Ok(diff::parse(text.as_bytes())?)
-  }
-
+impl Memory {
   fn stage(&self, file: &FileDiff) -> Result<(), Error> {
     self.update([file], |v| v.index.clone_from(&v.work))
   }
@@ -262,6 +250,47 @@ impl Vcs for Memory {
     lines: &BTreeSet<usize>,
   ) -> Result<(), Error> {
     self.rewrite(file, hunk, Some(lines), false)
+  }
+}
+
+impl Vcs for Memory {
+  fn diff(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
+    if !request.revisions.is_empty() {
+      return Err(Self::unsupported());
+    }
+    if let Some(gate) = &*self.gate.lock().unwrap_or_else(PoisonError::into_inner) {
+      gate.recv().map_err(|_| Self::unsupported())?;
+    }
+    let context = request.context.unwrap_or(DEFAULT_CONTEXT);
+    let mut text = String::new();
+    for (path, versions) in self.lock().iter() {
+      if !request.paths.is_empty() && !request.paths.iter().any(|p| path.starts_with(p)) {
+        continue;
+      }
+      let (old, new) = versions.sides(request.scope);
+      if old != new {
+        text.push_str(&patch(
+          path,
+          old.map(String::as_str),
+          new.map(String::as_str),
+          context,
+        ));
+      }
+    }
+    Ok(diff::parse(text.as_bytes())?)
+  }
+
+  fn update_index(&self, file: &FileDiff, target: &Target, stage: bool) -> Result<(), Error> {
+    match (target, stage) {
+      (Target::File, true) => self.stage(file),
+      (Target::File, false) => self.unstage(file),
+      (Target::All(files), true) => self.stage_all(files),
+      (Target::All(files), false) => self.unstage_all(files),
+      (Target::Hunk(hunk), true) => self.stage_hunk(file, *hunk),
+      (Target::Hunk(hunk), false) => self.unstage_hunk(file, *hunk),
+      (Target::Lines(hunk, lines), true) => self.stage_lines(file, *hunk, lines),
+      (Target::Lines(hunk, lines), false) => self.unstage_lines(file, *hunk, lines),
+    }
   }
 
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides {

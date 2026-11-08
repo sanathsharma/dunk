@@ -89,6 +89,17 @@ pub struct Sides {
   pub new_id: Option<VersionId>,
 }
 
+/// What a stage or unstage moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+  File,
+  Hunk(usize),
+  /// The lines of a hunk at these indexes into the hunk's lines.
+  Lines(usize, BTreeSet<usize>),
+  /// Every file of the list that is in the section the request moves out of.
+  All(Vec<FileDiff>),
+}
+
 pub trait Vcs {
   fn diff(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error>;
 
@@ -116,40 +127,10 @@ pub trait Vcs {
     Ok(entries)
   }
 
-  /// Adds all of `file`'s working tree changes to the index.
-  fn stage(&self, file: &FileDiff) -> Result<(), Error>;
-
-  /// Resets `file` in the index to the commit, keeping the working tree.
-  fn unstage(&self, file: &FileDiff) -> Result<(), Error>;
-
-  /// Adds all working tree changes of `files` to the index in one git call.
-  fn stage_all(&self, files: &[FileDiff]) -> Result<(), Error>;
-
-  /// Resets `files` in the index to the commit in one git call, keeping the
-  /// working tree.
-  fn unstage_all(&self, files: &[FileDiff]) -> Result<(), Error>;
-
-  /// Adds only hunk `hunk` of `file` to the index. An untracked file is first
-  /// marked intent-to-add so the hunk applies like a tracked change.
-  fn stage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error>;
-
-  /// Takes hunk `hunk` of a staged `file` out of the index, keeping the
-  /// working tree.
-  fn unstage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error>;
-
-  /// Adds only the changed lines of hunk `hunk` of `file` that fall in
-  /// `lines`, a set of indexes into the hunk's lines.
-  fn stage_lines(&self, file: &FileDiff, hunk: usize, lines: &BTreeSet<usize>)
-  -> Result<(), Error>;
-
-  /// Takes only the changed lines of hunk `hunk` of a staged `file` that fall
-  /// in `lines` out of the index, keeping the working tree.
-  fn unstage_lines(
-    &self,
-    file: &FileDiff,
-    hunk: usize,
-    lines: &BTreeSet<usize>,
-  ) -> Result<(), Error>;
+  /// Writes the index as `target` of `file` says: staging it when `stage`
+  /// is true, otherwise unstaging it and keeping the working tree. An
+  /// untracked file can be staged by hunk or by line.
+  fn update_index(&self, file: &FileDiff, target: &Target, stage: bool) -> Result<(), Error>;
 
   /// Reads both versions of `file` as `request` compared them.
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;

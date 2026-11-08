@@ -1,4 +1,4 @@
-use super::{DiffRequest, Error, Sides, Vcs, VersionId};
+use super::{DiffRequest, Error, Sides, Target, Vcs, VersionId};
 use crate::args::Scope;
 use crate::diff::{FileDiff, FileStatus, Section, parse};
 use std::collections::BTreeSet;
@@ -325,28 +325,7 @@ const DIFF_FLAGS: [&str; 7] = [
   "-M",
 ];
 
-impl Vcs for Git {
-  fn diff(&self, req: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
-    if let Some(rev) = req.revisions.iter().find(|r| r.starts_with('-')) {
-      return Err(Error::Git(format!("invalid revision: {rev}")));
-    }
-    // Outside a repository `git diff` falls back to comparing two paths
-    // and prints its usage text, so fail early with the real error.
-    self.root()?;
-    let mut files = self.tracked_diff(req)?;
-    if req.revisions.is_empty() && req.scope != Scope::Staged {
-      files.extend(self.untracked_diff(req)?);
-    }
-    if req.revisions.is_empty() && req.scope != Scope::Staged {
-      for file in self.unmerged(req)? {
-        if !files.iter().any(|f| f.path() == file.path()) {
-          files.push(file);
-        }
-      }
-    }
-    Ok(files)
-  }
-
+impl Git {
   fn stage(&self, file: &FileDiff) -> Result<(), Error> {
     self.write_index(&["add", "-A"], file)
   }
@@ -389,6 +368,42 @@ impl Vcs for Git {
 
   fn unstage_hunk(&self, file: &FileDiff, hunk: usize) -> Result<(), Error> {
     self.apply_to_index(&file.reverse_hunk_patch(hunk))
+  }
+}
+
+impl Vcs for Git {
+  fn diff(&self, req: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
+    if let Some(rev) = req.revisions.iter().find(|r| r.starts_with('-')) {
+      return Err(Error::Git(format!("invalid revision: {rev}")));
+    }
+    // Outside a repository `git diff` falls back to comparing two paths
+    // and prints its usage text, so fail early with the real error.
+    self.root()?;
+    let mut files = self.tracked_diff(req)?;
+    if req.revisions.is_empty() && req.scope != Scope::Staged {
+      files.extend(self.untracked_diff(req)?);
+    }
+    if req.revisions.is_empty() && req.scope != Scope::Staged {
+      for file in self.unmerged(req)? {
+        if !files.iter().any(|f| f.path() == file.path()) {
+          files.push(file);
+        }
+      }
+    }
+    Ok(files)
+  }
+
+  fn update_index(&self, file: &FileDiff, target: &Target, stage: bool) -> Result<(), Error> {
+    match (target, stage) {
+      (Target::File, true) => self.stage(file),
+      (Target::File, false) => self.unstage(file),
+      (Target::All(files), true) => self.stage_all(files),
+      (Target::All(files), false) => self.unstage_all(files),
+      (Target::Hunk(hunk), true) => self.stage_hunk(file, *hunk),
+      (Target::Hunk(hunk), false) => self.unstage_hunk(file, *hunk),
+      (Target::Lines(hunk, lines), true) => self.stage_lines(file, *hunk, lines),
+      (Target::Lines(hunk, lines), false) => self.unstage_lines(file, *hunk, lines),
+    }
   }
 
   fn sides(&self, req: &DiffRequest, file: &FileDiff) -> Sides {

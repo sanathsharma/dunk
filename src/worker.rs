@@ -101,57 +101,12 @@ impl Shared {
 mod tests {
   use super::*;
   use crate::diff::parse;
-  use crate::vcs::{Error, Sides, VersionId};
-  use std::collections::BTreeSet;
+  use crate::vcs::Memory;
   use std::sync::mpsc;
 
-  struct Fake;
-
-  impl Vcs for Fake {
-    fn diff(&self, _: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn sides(&self, _: &DiffRequest, _: &FileDiff) -> Sides {
-      Sides {
-        old: Some(b"a\n".to_vec()),
-        new: Some(b"b\n".to_vec()),
-        old_id: Some(VersionId(1)),
-        new_id: Some(VersionId(2)),
-      }
-    }
-
-    fn stage(&self, _: &FileDiff) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage(&self, _: &FileDiff) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn stage_all(&self, _: &[FileDiff]) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage_all(&self, _: &[FileDiff]) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn stage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), Error> {
-      Err(Error::Git("not expected in this test".into()))
-    }
+  /// One file whose contents differ between its old and new side.
+  fn fake() -> Memory {
+    Memory::default().commit("f.rs", "a\n").edit("f.rs", "b\n")
   }
 
   fn files(n: usize) -> Arc<Vec<FileDiff>> {
@@ -182,7 +137,7 @@ mod tests {
   fn highlights_every_file_off_the_calling_thread() {
     let (tx, rx) = mpsc::channel();
     let _worker = Worker::spawn(
-      Arc::new(Fake),
+      Arc::new(fake()),
       DiffRequest::default(),
       files(3),
       Arc::new(Highlighter::new(crate::highlight::DEFAULT_THEME).unwrap()),
@@ -201,7 +156,7 @@ mod tests {
     let refresh = || {
       let (tx, rx) = mpsc::channel();
       let _worker = Worker::spawn(
-        Arc::new(Fake),
+        Arc::new(fake()),
         DiffRequest::default(),
         files(3),
         highlighter.clone(),

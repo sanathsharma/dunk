@@ -2154,49 +2154,14 @@ mod tests {
     assert!(!app.quit);
   }
 
-  struct Slow(std::sync::Mutex<mpsc::Receiver<()>>);
-
-  impl Vcs for Slow {
-    fn diff(&self, _: &DiffRequest) -> Result<Vec<FileDiff>, vcs::Error> {
-      self.0.lock().unwrap().recv().unwrap();
-      Ok(vec![file("slow", 1)])
-    }
-
-    fn sides(&self, _: &DiffRequest, _: &FileDiff) -> vcs::Sides {
-      vcs::Sides::default()
-    }
-
-    fn stage(&self, _: &FileDiff) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage(&self, _: &FileDiff) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
-
-    fn stage_all(&self, _: &[FileDiff]) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage_all(&self, _: &[FileDiff]) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
-
-    fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
-
-    fn stage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
-
-    fn unstage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), vcs::Error> {
-      Err(vcs::Error::Git("not expected in this test".into()))
-    }
+  /// A file listed in both sections whose diff blocks until released.
+  fn slow_memory(gate: mpsc::Receiver<()>) -> crate::vcs::Memory {
+    crate::vcs::Memory::default()
+      .commit("slow", "1\n")
+      .edit("slow", "2\n")
+      .staged("slow")
+      .edit("slow", "3\n")
+      .gated(gate)
   }
 
   #[test]
@@ -2204,12 +2169,7 @@ mod tests {
     let (release, gate) = mpsc::channel();
     let (tx, rx) = mpsc::channel();
     // Returns at once even though the backend blocks until released.
-    spawn_load(
-      Arc::new(Slow(std::sync::Mutex::new(gate))),
-      DiffRequest::default(),
-      7,
-      tx,
-    );
+    spawn_load(Arc::new(slow_memory(gate)), DiffRequest::default(), 7, tx);
     assert!(rx.try_recv().is_err());
     // One release per section of the default working tree request.
     release.send(()).unwrap();
@@ -2403,7 +2363,7 @@ mod tests {
   fn press_a(app: &mut App, git: &impl Vcs) {
     app.on_key(key(KeyCode::Char('a')));
     let request = app.take_index_request().expect("a hunk request");
-    assert!(matches!(request.target, crate::staging::Target::Hunk(_)));
+    assert!(matches!(request.target, crate::vcs::Target::Hunk(_)));
     let result = request.run(git);
     assert!(app.on_indexed(request.follow, result));
     load(app, git);
