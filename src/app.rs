@@ -1245,12 +1245,22 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   spawn_input(tx.clone(), gate.clone());
   let editor = Editor::from_env();
   spawn_load(vcs.clone(), request.clone(), 0, tx.clone());
-  let _watch = if settings.watch {
-    let tx = tx.clone();
-    Some(Watch::start(root, move || tx.send(Event::Changed).is_ok()).map_err(io::Error::other)?)
-  } else {
-    None
-  };
+  // Registering watches on a big work tree takes hundreds of milliseconds, so
+  // it happens off the main thread. Dropping `_watch_stop` ends that thread
+  // and with it the watcher.
+  let _watch_stop = settings.watch.then(|| {
+    let (stop, stopped) = mpsc::channel::<()>();
+    let (root, tx) = (root.to_path_buf(), tx.clone());
+    thread::spawn(move || {
+      let sender = tx.clone();
+      if let Ok(_watch) = Watch::start(&root, move || sender.send(Event::Changed).is_ok()) {
+        // Reload once, to catch edits made while the watches were registering.
+        let _ = tx.send(Event::Changed);
+        let _ = stopped.recv();
+      }
+    });
+    stop
+  });
   // `latest` numbers the newest load asked for, `applied` the one on screen.
   let (mut latest, mut applied) = (0, 0);
 
