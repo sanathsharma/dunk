@@ -772,6 +772,16 @@ new file mode 100644
     (terminal, rows)
   }
 
+  fn col(n: usize) -> u16 {
+    u16::try_from(n).unwrap()
+  }
+
+  /// The column where `needle` starts in `row`, counting characters.
+  fn col_of(row: &str, needle: &str) -> u16 {
+    let at = row.find(needle).unwrap();
+    col(row.get(..at).unwrap().chars().count())
+  }
+
   fn row_with<'a>(rows: &'a [String], needle: &str) -> (usize, &'a String) {
     rows
       .iter()
@@ -814,14 +824,14 @@ new file mode 100644
     let buffer = terminal.backend().buffer();
     let bg = |rows: &[String], needle: &str| {
       let (y, row) = row_with(rows, needle);
-      let x = row.find(needle).unwrap() as u16;
-      buffer[(x, y as u16)].bg
+      let x = col(row.find(needle).unwrap());
+      buffer[(x, col(y))].bg
     };
     let current_bg = Palette::default().diff_current_hunk.bg.unwrap();
     assert_eq!(bg(&rows, "@@ -1,1"), current_bg);
     assert_ne!(bg(&rows, "@@ -9,1"), current_bg);
     let (y, _) = row_with(&rows, "@@ -1,1");
-    assert!(buffer[(5, y as u16)].modifier.contains(Modifier::REVERSED));
+    assert!(buffer[(5, col(y))].modifier.contains(Modifier::REVERSED));
 
     for _ in 0..3 {
       app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -830,11 +840,11 @@ new file mode 100644
     let buffer = terminal.backend().buffer();
     let (y, row) = row_with(&rows, "@@ -9,1");
     assert_eq!(
-      buffer[(row.find("@@").unwrap() as u16, y as u16)].bg,
+      buffer[(col(row.find("@@").unwrap()), col(y))].bg,
       current_bg
     );
     let (y, _) = row_with(&rows, "@@ -1,1");
-    assert_ne!(buffer[(5, y as u16)].bg, current_bg);
+    assert_ne!(buffer[(5, col(y))].bg, current_bg);
   }
 
   #[test]
@@ -852,8 +862,8 @@ new file mode 100644
     let buffer = terminal.backend().buffer();
     let bg = |needle: &str| {
       let (y, row) = row_with(&rows, needle);
-      let x = row[..row.find(needle).unwrap()].chars().count() as u16;
-      buffer[(x, y as u16)].bg
+      let x = col_of(row, needle);
+      buffer[(x, col(y))].bg
     };
     assert_eq!(bg("-old"), SELECTED_BG);
     assert_eq!(bg("+new"), SELECTED_BG);
@@ -963,11 +973,11 @@ new file mode 100644
     let (terminal, rows) = draw(&mut app, 80, 14);
     let buffer = terminal.backend().buffer();
     let (y, row) = row_with(&rows, "Staged (1)");
-    let x = row.find("Staged").unwrap() as u16;
-    assert!(!buffer[(x, y as u16)].modifier.contains(Modifier::REVERSED));
-    let x = rows[y + 1].find("src/a.rs").unwrap() as u16;
+    let x = col(row.find("Staged").unwrap());
+    assert!(!buffer[(x, col(y))].modifier.contains(Modifier::REVERSED));
+    let x = col(rows[y + 1].find("src/a.rs").unwrap());
     assert!(
-      buffer[(x, y as u16 + 1)]
+      buffer[(x, col(y) + 1)]
         .modifier
         .contains(Modifier::REVERSED)
     );
@@ -980,11 +990,11 @@ new file mode 100644
     let buffer = terminal.backend().buffer();
     let last_col = 80 - 2;
     let (y, _) = row_with(&rows, "+new");
-    assert_eq!(buffer[(last_col, y as u16)].bg, ADDED_BG);
+    assert_eq!(buffer[(last_col, col(y))].bg, ADDED_BG);
     let (y, _) = row_with(&rows, "-old");
-    assert_eq!(buffer[(last_col, y as u16)].bg, REMOVED_BG);
+    assert_eq!(buffer[(last_col, col(y))].bg, REMOVED_BG);
     let (y, _) = row_with(&rows, " keep");
-    assert_ne!(buffer[(last_col, y as u16)].bg, ADDED_BG);
+    assert_ne!(buffer[(last_col, col(y))].bg, ADDED_BG);
   }
 
   #[test]
@@ -993,8 +1003,8 @@ new file mode 100644
     let mut app = app_with(DIFF);
     let (terminal, rows) = draw(&mut app, 80, 14);
     let (y, row) = row_with(&rows, "+new");
-    let x = row[..row.find("+new").unwrap()].chars().count() as u16 + 1;
-    assert_eq!(terminal.backend().buffer()[(x, y as u16)].fg, Color::Reset);
+    let x = col_of(row, "+new") + 1;
+    assert_eq!(terminal.backend().buffer()[(x, col(y))].fg, Color::Reset);
 
     let red = Style::new().fg(Color::Rgb(200, 1, 2));
     let h = FileHighlight {
@@ -1003,8 +1013,8 @@ new file mode 100644
     app.on_highlighted(0, h);
     let (terminal, rows) = draw(&mut app, 80, 14);
     let (y, row) = row_with(&rows, "+new");
-    let x = row[..row.find("+new").unwrap()].chars().count() as u16 + 1;
-    let cell = &terminal.backend().buffer()[(x, y as u16)];
+    let x = col_of(row, "+new") + 1;
+    let cell = &terminal.backend().buffer()[(x, col(y))];
     assert_eq!(cell.fg, Color::Rgb(200, 1, 2));
     assert_eq!(cell.bg, Palette::default().diff_add_text.bg.unwrap());
     assert!(rows.iter().any(|r| r.contains("-old")));
@@ -1022,9 +1032,9 @@ new file mode 100644
     ] {
       let (line_bg, word_bg) = (line.bg.unwrap(), word.bg.unwrap());
       let (y, row) = row_with(&rows, needle);
-      let x = row[..row.find(needle).unwrap()].chars().count() as u16 + 1;
-      assert_eq!(buffer[(x, y as u16)].bg, word_bg);
-      assert_eq!(buffer[(79 - 1, y as u16)].bg, line_bg);
+      let x = col_of(row, needle) + 1;
+      assert_eq!(buffer[(x, col(y))].bg, word_bg);
+      assert_eq!(buffer[(79 - 1, col(y))].bg, line_bg);
     }
   }
 
@@ -1040,8 +1050,8 @@ new file mode 100644
       let (terminal, rows) = draw(&mut app, 80, 14);
       let buffer = terminal.backend().buffer();
       let (y, row) = row_with(&rows, "old");
-      let x = row[..row.find("old").unwrap()].chars().count() as u16;
-      let (word, rest) = (&buffer[(x, y as u16)], &buffer[(x + 10, y as u16)]);
+      let x = col_of(row, "old");
+      let (word, rest) = (&buffer[(x, col(y))], &buffer[(x + 10, col(y))]);
       assert_eq!(word.bg, p.diff_delete_text.bg.unwrap(), "split={split}");
       assert!(!word.modifier.contains(Modifier::REVERSED), "split={split}");
       assert!(rest.modifier.contains(Modifier::REVERSED), "split={split}");
@@ -1077,8 +1087,10 @@ new file mode 100644
       let (terminal, rows) = draw(app, 80, 14);
       let (y, row) = row_with(&rows, needle);
       // The first row character is a quote, so the cell is one to the left.
-      let x = row[..row.find(needle).unwrap()].chars().count() as isize - 1 + dx;
-      terminal.backend().buffer()[(x as u16, y as u16)].clone()
+      let x = col_of(row, needle)
+        .checked_add_signed(i16::try_from(dx - 1).unwrap())
+        .unwrap();
+      terminal.backend().buffer()[(x, col(y))].clone()
     };
     // The marker takes the line style, the changed word the emphasis on top.
     assert_eq!(cell(&mut app, "+new", 0).bg, Color::Rgb(1, 2, 3));
@@ -1103,7 +1115,7 @@ new file mode 100644
     app.palette.mode_normal = Style::new().fg(Color::Rgb(7, 7, 7));
     app.palette.mode_visual = Style::new().fg(Color::Rgb(8, 8, 8));
     let (terminal, rows) = draw(&mut app, 100, 14);
-    let at = |x: u16, y: usize| terminal.backend().buffer()[(x, y as u16)].clone();
+    let at = |x: u16, y: usize| terminal.backend().buffer()[(x, col(y))].clone();
 
     // The list border is `Border`, the diff border is `Border` under `DiffBorder`.
     assert_eq!(at(0, 0).fg, Color::Rgb(3, 3, 3));
@@ -1147,7 +1159,7 @@ new file mode 100644
     let bg_at = |app: &mut App, needle: &str, x: u16| {
       let (terminal, rows) = draw(app, 60, 12);
       let (y, _) = row_with(&rows, needle);
-      let cell = &terminal.backend().buffer()[(x, y as u16)];
+      let cell = &terminal.backend().buffer()[(x, col(y))];
       if cell.symbol() == BAR {
         cell.fg
       } else {
@@ -1181,7 +1193,7 @@ new file mode 100644
       let mut app = sectioned_app(&[section]);
       let (terminal, rows) = draw(&mut app, 60, 12);
       let (y, _) = row_with(&rows, "@@");
-      let cell = &terminal.backend().buffer()[(21, y as u16)];
+      let cell = &terminal.backend().buffer()[(21, col(y))];
       assert_eq!(cell.symbol(), BAR);
       cell.fg
     };
@@ -1203,9 +1215,9 @@ new file mode 100644
     app.palette.section_label = Style::new().fg(Color::Rgb(5, 5, 5));
     let (terminal, rows) = draw(&mut app, 80, 14);
     let (y, row) = row_with(&rows, "Unstaged");
-    let x = row[..row.find("Unstaged").unwrap()].chars().count() - 1;
+    let x = col_of(row, "Unstaged") - 1;
     assert_eq!(
-      terminal.backend().buffer()[(x as u16, y as u16)].fg,
+      terminal.backend().buffer()[(x, col(y))].fg,
       Color::Rgb(5, 5, 5)
     );
   }
@@ -1218,8 +1230,8 @@ new file mode 100644
     ));
     let (terminal, rows) = draw(&mut app, 80, 14);
     let (y, row) = row_with(&rows, "+hello");
-    let x = row[..row.find("+hello").unwrap()].chars().count() as u16 + 1;
-    assert_eq!(terminal.backend().buffer()[(x, y as u16)].bg, ADDED_BG);
+    let x = col_of(row, "+hello") + 1;
+    assert_eq!(terminal.backend().buffer()[(x, col(y))].bg, ADDED_BG);
   }
 
   const SPLIT_DIFF: &str = "\
@@ -1266,14 +1278,14 @@ diff --git a/a.rs b/a.rs
     assert!(rows[11].contains(" VISUAL 1 line "), "{}", rows[11]);
     let buffer = terminal.backend().buffer();
     let (y, row) = row_with(&rows, "-old2");
-    let left = row[..row.find("-old2").unwrap()].chars().count() as u16;
+    let left = col_of(row, "-old2");
     // The left line and the blank right column are both highlighted.
     for x in [left, 79] {
-      assert_eq!(buffer[(x, y as u16)].bg, SELECTED_BG, "column {x}");
+      assert_eq!(buffer[(x, col(y))].bg, SELECTED_BG, "column {x}");
     }
     let (y, _) = row_with(&rows, "-old1");
     for x in [left, 79] {
-      assert_ne!(buffer[(x, y as u16)].bg, SELECTED_BG, "column {x}");
+      assert_ne!(buffer[(x, col(y))].bg, SELECTED_BG, "column {x}");
     }
   }
 
@@ -1336,13 +1348,13 @@ diff --git a/a.rs b/a.rs
     let (terminal, rows) = draw(&mut app, 81, 12);
     let buffer = terminal.backend().buffer();
     let (y, row) = row_with(&rows, "-old1");
-    let new_x = row[..row.find("+new1").unwrap()].chars().count() as u16 - 1;
-    let old_x = row[..row.find("-old1").unwrap()].chars().count() as u16 - 1;
-    assert_eq!(buffer[(old_x, y as u16)].bg, REMOVED_BG);
-    assert_eq!(buffer[(new_x, y as u16)].bg, ADDED_BG);
+    let new_x = col_of(row, "+new1") - 1;
+    let old_x = col_of(row, "-old1") - 1;
+    assert_eq!(buffer[(old_x, col(y))].bg, REMOVED_BG);
+    assert_eq!(buffer[(new_x, col(y))].bg, ADDED_BG);
     let (y, _) = row_with(&rows, "-old2");
     // The blank right column carries no background.
-    assert_ne!(buffer[(new_x, y as u16)].bg, ADDED_BG);
+    assert_ne!(buffer[(new_x, col(y))].bg, ADDED_BG);
   }
 
   #[test]

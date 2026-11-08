@@ -437,13 +437,16 @@ diff --git a/a.rs b/a.rs
     let h = highlighter();
     let file = one_line_file();
     for i in 0..CACHE_ENTRIES + 10 {
-      h.diff(&file, &identified(b"a\n", b"b\n", 0, 10 + i as u64));
+      h.diff(
+        &file,
+        &identified(b"a\n", b"b\n", 0, 10 + u64::try_from(i).unwrap()),
+      );
     }
     let before = h.runs();
     // The first new version was evicted, the latest one is still held.
     h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));
     assert_eq!(h.runs(), before + 1);
-    let last = 10 + (CACHE_ENTRIES + 9) as u64;
+    let last = 10 + u64::try_from(CACHE_ENTRIES + 9).unwrap();
     h.diff(&file, &identified(b"a\n", b"b\n", 0, last));
     assert_eq!(h.runs(), before + 1);
   }
@@ -454,12 +457,18 @@ diff --git a/a.rs b/a.rs
     let file = one_line_file();
     // The shared 0 version takes one slot, so this fills the cache exactly.
     for i in 0..CACHE_ENTRIES - 1 {
-      h.diff(&file, &identified(b"a\n", b"b\n", 0, 10 + i as u64));
+      h.diff(
+        &file,
+        &identified(b"a\n", b"b\n", 0, 10 + u64::try_from(i).unwrap()),
+      );
     }
     // Use the oldest version again, then overflow the cache.
     h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));
     for i in CACHE_ENTRIES..CACHE_ENTRIES + 5 {
-      h.diff(&file, &identified(b"a\n", b"b\n", 0, 10 + i as u64));
+      h.diff(
+        &file,
+        &identified(b"a\n", b"b\n", 0, 10 + u64::try_from(i).unwrap()),
+      );
     }
     let before = h.runs();
     h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));

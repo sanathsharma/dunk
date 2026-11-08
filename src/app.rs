@@ -1475,11 +1475,11 @@ mod tests {
       section: None,
       hunks: vec![Hunk {
         old_start: 1,
-        old_len: lines as u32,
+        old_len: u32::try_from(lines).unwrap(),
         new_start: 1,
-        new_len: lines as u32,
+        new_len: u32::try_from(lines).unwrap(),
         heading: Vec::new(),
-        lines: (1..=lines as u32)
+        lines: (1..=u32::try_from(lines).unwrap())
           .map(|n| Line {
             kind: LineKind::Context,
             old_no: Some(n),
@@ -1657,12 +1657,15 @@ mod tests {
     assert_eq!(app.pan, 0);
     app.on_key(key(KeyCode::Char('l')));
     app.on_key(key(KeyCode::Right));
-    assert_eq!(app.pan, 2 * PAN_STEP as usize);
+    assert_eq!(app.pan, 2 * usize::try_from(PAN_STEP).unwrap());
     app.on_key(key(KeyCode::Left));
-    assert_eq!(app.pan, PAN_STEP as usize);
+    assert_eq!(app.pan, usize::try_from(PAN_STEP).unwrap());
     app.on_key(key(KeyCode::Char('v')));
     app.on_key(key(KeyCode::Char('l')));
-    assert_eq!((app.pan, app.mode), (2 * PAN_STEP as usize, Mode::Visual));
+    assert_eq!(
+      (app.pan, app.mode),
+      (2 * usize::try_from(PAN_STEP).unwrap(), Mode::Visual)
+    );
     app.on_key(key(KeyCode::Char('h')));
     app.on_key(key(KeyCode::Esc));
     app.select(0);
@@ -2318,35 +2321,35 @@ mod tests {
     }
 
     fn stage(&self, _: &FileDiff) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
 
     fn unstage(&self, _: &FileDiff) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
 
     fn stage_all(&self, _: &[FileDiff]) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
 
     fn unstage_all(&self, _: &[FileDiff]) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
 
     fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
 
     fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
 
     fn stage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
 
     fn unstage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), vcs::Error> {
-      unreachable!()
+      Err(vcs::Error::Git("not expected in this test".into()))
     }
   }
 
@@ -2897,7 +2900,7 @@ mod tests {
         .unwrap();
       assert!(status.success());
     };
-    let body = |lines: &[&str]| lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+    let body = |lines: &[&str]| lines.iter().flat_map(|l| [*l, "\n"]).collect::<String>();
     let numbers: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
     let old: Vec<&str> = numbers.iter().map(String::as_str).collect();
     let mut new = old.clone();
@@ -2927,7 +2930,7 @@ mod tests {
         out.push("new".into());
       }
     }
-    out.iter().map(|l| format!("{l}\n")).collect()
+    out.iter().flat_map(|l| [l.as_str(), "\n"]).collect()
   }
 
   fn split_cursor_to(app: &mut App, row: usize) {

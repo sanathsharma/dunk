@@ -775,7 +775,7 @@ index 111..222 100644
   /// The new side of `MODIFIED`: 22 lines named `l1` to `l22`.
   fn new_text() -> Vec<u8> {
     (1..=22)
-      .map(|n| format!("l{n}\n"))
+      .flat_map(|n| [format!("l{n}"), "\n".to_string()])
       .collect::<String>()
       .into_bytes()
   }

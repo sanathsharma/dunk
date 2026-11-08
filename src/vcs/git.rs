@@ -1033,12 +1033,12 @@ mod tests {
 
   fn numbered(edits: &[(usize, &str)]) -> String {
     (1..=20)
-      .map(|n| {
+      .flat_map(|n| {
         let line = edits
           .iter()
           .find(|(at, _)| *at == n)
-          .map_or(n.to_string(), |(_, text)| text.to_string());
-        format!("{line}\n")
+          .map_or_else(|| n.to_string(), |(_, text)| (*text).to_string());
+        [line, "\n".to_string()]
       })
       .collect()
   }

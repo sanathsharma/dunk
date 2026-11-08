@@ -109,7 +109,7 @@ mod tests {
 
   impl Vcs for Fake {
     fn diff(&self, _: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn sides(&self, _: &DiffRequest, _: &FileDiff) -> Sides {
@@ -122,35 +122,35 @@ mod tests {
     }
 
     fn stage(&self, _: &FileDiff) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn unstage(&self, _: &FileDiff) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn stage_all(&self, _: &[FileDiff]) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn unstage_all(&self, _: &[FileDiff]) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn stage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn unstage_hunk(&self, _: &FileDiff, _: usize) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn stage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
 
     fn unstage_lines(&self, _: &FileDiff, _: usize, _: &BTreeSet<usize>) -> Result<(), Error> {
-      unreachable!()
+      Err(Error::Git("not expected in this test".into()))
     }
   }
 
