@@ -3,7 +3,9 @@ mod git;
 use crate::args::Scope;
 use crate::diff::{FileDiff, ParseError, Section};
 use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io;
 
 pub use git::Git;
@@ -58,13 +60,18 @@ pub struct DiffRequest {
   pub context: Option<u32>,
 }
 
-/// Names one version of a file so its highlighting can be reused.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum VersionId {
-  /// The git object ID of a committed or staged version.
-  Object(String),
-  /// A hash of the contents of a working-tree file.
-  Content(u64),
+/// Names one version of a file by a hash of its contents, so its highlighting
+/// can be reused wherever the same bytes show up, such as a working-tree file
+/// that is then staged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VersionId(pub u64);
+
+impl VersionId {
+  pub fn of(bytes: &[u8]) -> Self {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    VersionId(hasher.finish())
+  }
 }
 
 /// The full contents of a file on each side of a diff. A side is `None` when

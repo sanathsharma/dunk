@@ -394,10 +394,10 @@ diff --git a/a.rs b/a.rs
     parse(diff.as_bytes()).unwrap().remove(0)
   }
 
-  fn identified(old: &[u8], new: &[u8], old_id: &str, new_id: &str) -> Sides {
+  fn identified(old: &[u8], new: &[u8], old_id: u64, new_id: u64) -> Sides {
     Sides {
-      old_id: Some(VersionId::Object(old_id.into())),
-      new_id: Some(VersionId::Object(new_id.into())),
+      old_id: Some(VersionId(old_id)),
+      new_id: Some(VersionId(new_id)),
       ..sides(Some(old), Some(new))
     }
   }
@@ -406,13 +406,13 @@ diff --git a/a.rs b/a.rs
   fn a_repeated_diff_reuses_highlighted_versions() {
     let h = highlighter();
     let file = one_line_file();
-    let first = h.diff(&file, &identified(b"a\n", b"b\n", "o1", "o2"));
+    let first = h.diff(&file, &identified(b"a\n", b"b\n", 1, 2));
     assert_eq!(h.runs(), 2);
-    let again = h.diff(&file, &identified(b"a\n", b"b\n", "o1", "o2"));
+    let again = h.diff(&file, &identified(b"a\n", b"b\n", 1, 2));
     assert_eq!(h.runs(), 2);
     assert_eq!(first, again);
     // A changed version is highlighted again, the unchanged one is not.
-    h.diff(&file, &identified(b"a\n", b"c\n", "o1", "o3"));
+    h.diff(&file, &identified(b"a\n", b"c\n", 1, 3));
     assert_eq!(h.runs(), 3);
   }
 
@@ -432,15 +432,15 @@ diff --git a/a.rs b/a.rs
     for i in 0..CACHE_ENTRIES + 10 {
       h.diff(
         &file,
-        &identified(b"a\n", b"b\n", "old", &format!("new{i}")),
+        &identified(b"a\n", b"b\n", 0, 10 + i as u64),
       );
     }
     let before = h.runs();
     // The first new version was evicted, the latest one is still held.
-    h.diff(&file, &identified(b"a\n", b"b\n", "old", "new0"));
+    h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));
     assert_eq!(h.runs(), before + 1);
-    let last = format!("new{}", CACHE_ENTRIES + 9);
-    h.diff(&file, &identified(b"a\n", b"b\n", "old", &last));
+    let last = 10 + (CACHE_ENTRIES + 9) as u64;
+    h.diff(&file, &identified(b"a\n", b"b\n", 0, last));
     assert_eq!(h.runs(), before + 1);
   }
 
@@ -448,23 +448,23 @@ diff --git a/a.rs b/a.rs
   fn a_cache_hit_keeps_the_version_from_being_evicted() {
     let h = highlighter();
     let file = one_line_file();
-    // The shared "old" version takes one slot, so this fills the cache exactly.
+    // The shared 0 version takes one slot, so this fills the cache exactly.
     for i in 0..CACHE_ENTRIES - 1 {
       h.diff(
         &file,
-        &identified(b"a\n", b"b\n", "old", &format!("new{i}")),
+        &identified(b"a\n", b"b\n", 0, 10 + i as u64),
       );
     }
     // Use the oldest version again, then overflow the cache.
-    h.diff(&file, &identified(b"a\n", b"b\n", "old", "new0"));
+    h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));
     for i in CACHE_ENTRIES..CACHE_ENTRIES + 5 {
       h.diff(
         &file,
-        &identified(b"a\n", b"b\n", "old", &format!("new{i}")),
+        &identified(b"a\n", b"b\n", 0, 10 + i as u64),
       );
     }
     let before = h.runs();
-    h.diff(&file, &identified(b"a\n", b"b\n", "old", "new0"));
+    h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));
     assert_eq!(h.runs(), before);
   }
 

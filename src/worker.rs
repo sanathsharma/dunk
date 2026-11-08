@@ -105,8 +105,8 @@ mod tests {
       Sides {
         old: Some(b"a\n".to_vec()),
         new: Some(b"b\n".to_vec()),
-        old_id: Some(VersionId::Object("old".into())),
-        new_id: Some(VersionId::Object("new".into())),
+        old_id: Some(VersionId(1)),
+        new_id: Some(VersionId(2)),
       }
     }
 

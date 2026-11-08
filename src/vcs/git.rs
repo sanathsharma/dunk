@@ -2,9 +2,7 @@ use super::{DiffRequest, Error, Sides, Vcs, VersionId};
 use crate::args::Scope;
 use crate::diff::{FileDiff, FileStatus, Section, parse};
 use std::collections::BTreeSet;
-use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -94,9 +92,8 @@ impl Git {
     let spec = match source {
       Source::WorkingTree => {
         let bytes = std::fs::read(root.join(file)).ok()?;
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        return Some((bytes, VersionId::Content(hasher.finish())));
+        let id = VersionId::of(&bytes);
+        return Some((bytes, id));
       }
       Source::Index => spec(":"),
       Source::Commit(rev) => spec(&format!("{rev}:")),
@@ -106,7 +103,8 @@ impl Git {
       .ok()?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
     let bytes = self.run(["cat-file", "blob", &oid]).ok()?;
-    Some((bytes, VersionId::Object(oid)))
+    let id = VersionId::of(&bytes);
+    Some((bytes, id))
   }
 
   /// Runs a git command that writes the index, with the paths taken
@@ -627,13 +625,13 @@ mod tests {
     let unstaged = git.sides(&DiffRequest::default(), &files[0]);
     assert_eq!(text(unstaged.old), "A\n2\n3\n");
     assert_eq!(text(unstaged.new), "A\n2\nC\n");
-    assert!(matches!(unstaged.old_id, Some(VersionId::Object(_))));
-    assert!(matches!(unstaged.new_id, Some(VersionId::Content(_))));
+    assert_eq!(unstaged.old_id, Some(VersionId::of(b"A\n2\n3\n")));
+    assert_eq!(unstaged.new_id, Some(VersionId::of(b"A\n2\nC\n")));
 
     let staged = git.sides(&DiffRequest::default(), &files[3]);
     assert_eq!(text(staged.old), "1\n2\n3\n");
     assert_eq!(text(staged.new), "A\n2\n3\n");
-    assert!(matches!(staged.new_id, Some(VersionId::Object(_))));
+    assert_eq!(staged.new_id, Some(VersionId::of(b"A\n2\n3\n")));
   }
 
   #[test]
@@ -840,7 +838,7 @@ mod tests {
   }
 
   #[test]
-  fn names_committed_and_staged_versions_by_object_id_and_working_files_by_content() {
+  fn names_every_version_by_a_hash_of_its_contents() {
     let d = repo();
     write(d.path(), "a.rs", "fn a() {}\n");
     commit_all(d.path(), "one");
@@ -849,8 +847,8 @@ mod tests {
     let request = DiffRequest::default();
     let file = git.diff(&request).unwrap().remove(0);
     let sides = git.sides(&request, &file);
-    assert!(matches!(&sides.old_id, Some(VersionId::Object(id)) if id.len() >= 40));
-    assert!(matches!(sides.new_id, Some(VersionId::Content(_))));
+    assert_eq!(sides.old_id, Some(VersionId::of(b"fn a() {}\n")));
+    assert_eq!(sides.new_id, Some(VersionId::of(b"fn b() {}\n")));
 
     let same = git.sides(&request, &file);
     assert_eq!(sides.new_id, same.new_id);
@@ -863,10 +861,12 @@ mod tests {
       ..DiffRequest::default()
     };
     let file = git.diff(&staged).unwrap().remove(0);
-    assert!(matches!(
+    // Staging moves the bytes from the working tree to the index without
+    // changing their ID, so their highlighting is reused.
+    assert_eq!(
       git.sides(&staged, &file).new_id,
-      Some(VersionId::Object(_))
-    ));
+      Some(VersionId::of(b"fn c() {}\n"))
+    );
   }
 
   fn status(d: &Path) -> String {
