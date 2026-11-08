@@ -20,17 +20,17 @@ enum Kind {
 
 impl Editor {
   /// `$VISUAL` if set and not blank, else `$EDITOR`.
-  pub fn from_env() -> Option<Editor> {
+  pub fn from_env() -> Option<Self> {
     let var = |name: &str| std::env::var_os(name).map(OsString::into_string);
     [var("VISUAL"), var("EDITOR")]
       .into_iter()
       .flatten()
       .flatten()
-      .find_map(|value| Editor::parse(&value))
+      .find_map(|value| Self::parse(&value))
   }
 
   /// Splits `command` on whitespace into the program and its own flags.
-  pub fn parse(command: &str) -> Option<Editor> {
+  pub fn parse(command: &str) -> Option<Self> {
     let mut words = command.split_whitespace().map(String::from);
     let program = words.next()?;
     let name = Path::new(&program).file_name()?.to_str()?;
@@ -38,7 +38,7 @@ impl Editor {
       "code" | "code-insiders" | "codium" => Kind::Code,
       _ => Kind::Terminal,
     };
-    Some(Editor {
+    Some(Self {
       program,
       args: words.collect(),
       kind,

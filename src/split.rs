@@ -13,20 +13,17 @@ pub fn pairs(hunk: &Hunk) -> Vec<Pair> {
   let mut out = Vec::with_capacity(lines.len());
   let mut i = 0;
   while i < lines.len() {
-    match lines[i].kind {
-      LineKind::Context => {
-        out.push((Some(i), Some(i)));
-        i += 1;
+    if lines[i].kind == LineKind::Context {
+      out.push((Some(i), Some(i)));
+      i += 1;
+    } else {
+      let removed_end = run_end(hunk, i, LineKind::Removed);
+      let added_end = run_end(hunk, removed_end, LineKind::Added);
+      let (removed, added) = (i..removed_end, removed_end..added_end);
+      for k in 0..removed.len().max(added.len()) {
+        out.push((removed.clone().nth(k), added.clone().nth(k)));
       }
-      _ => {
-        let removed_end = run_end(hunk, i, LineKind::Removed);
-        let added_end = run_end(hunk, removed_end, LineKind::Added);
-        let (removed, added) = (i..removed_end, removed_end..added_end);
-        for k in 0..removed.len().max(added.len()) {
-          out.push((removed.clone().nth(k), added.clone().nth(k)));
-        }
-        i = added_end;
-      }
+      i = added_end;
     }
   }
   out

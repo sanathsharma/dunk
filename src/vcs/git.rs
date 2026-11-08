@@ -15,7 +15,7 @@ pub struct Git {
 impl Git {
   /// Runs git as if started in `dir`; git finds the repository root itself.
   pub fn new(dir: impl Into<PathBuf>) -> Self {
-    Git { dir: dir.into() }
+    Self { dir: dir.into() }
   }
 
   fn command<I, S>(&self, dir: &Path, args: I) -> Result<Output, Error>
@@ -218,14 +218,14 @@ impl Git {
     if let Some(n) = req.context {
       args.push(format!("-U{n}"));
     }
-    if !req.revisions.is_empty() {
-      args.extend(req.revisions.iter().cloned());
-    } else {
+    if req.revisions.is_empty() {
       match req.scope {
         Scope::All => args.push(self.head()?),
         Scope::Staged => args.push("--cached".into()),
         Scope::Unstaged => {}
       }
+    } else {
+      args.extend(req.revisions.iter().cloned());
     }
     args.push("--".into());
     args.extend(req.paths.iter().cloned());
@@ -677,7 +677,7 @@ mod tests {
     write(d, "untracked.txt", "u\n");
 
     let req = |revs: &[&str]| DiffRequest {
-      revisions: revs.iter().map(|s| s.to_string()).collect(),
+      revisions: revs.iter().map(std::string::ToString::to_string).collect(),
       ..Default::default()
     };
     let git = Git::new(d);

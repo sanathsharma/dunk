@@ -54,8 +54,8 @@ fn default_path(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<Pat
 }
 
 impl Config {
-  fn parse(text: &str) -> Result<Config, String> {
-    let config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+  fn parse(text: &str) -> Result<Self, String> {
+    let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
     if let Some(theme) = &config.syntax.theme {
       highlight::resolve_theme(theme).map_err(|e| format!("syntax.theme: {e}"))?;
     }
@@ -65,21 +65,18 @@ impl Config {
 
   /// Reads `explicit`, or the default path when there is none. A missing
   /// default file is not an error, a missing explicit one is.
-  pub fn load(explicit: Option<&Path>) -> Result<Config, String> {
-    let path = match explicit {
-      Some(path) => path.to_path_buf(),
-      None => {
-        let xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let home = std::env::var("HOME").ok();
-        match default_path(xdg.as_deref(), home.as_deref()) {
-          Some(path) => path,
-          None => return Ok(Config::default()),
-        }
+  pub fn load(explicit: Option<&Path>) -> Result<Self, String> {
+    let path = if let Some(path) = explicit { path.to_path_buf() } else {
+      let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+      let home = std::env::var("HOME").ok();
+      match default_path(xdg.as_deref(), home.as_deref()) {
+        Some(path) => path,
+        None => return Ok(Self::default()),
       }
     };
     match fs::read_to_string(&path) {
-      Ok(text) => Config::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
-      Err(e) if e.kind() == io::ErrorKind::NotFound && explicit.is_none() => Ok(Config::default()),
+      Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+      Err(e) if e.kind() == io::ErrorKind::NotFound && explicit.is_none() => Ok(Self::default()),
       Err(e) => Err(format!("{}: {e}", path.display())),
     }
   }
@@ -87,7 +84,7 @@ impl Config {
 
 /// The settings after the command line, the config file and the built-in
 /// defaults are combined, in that order of priority.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Settings {
   pub layout: Layout,
   pub border: Border,
@@ -99,10 +96,10 @@ pub struct Settings {
 }
 
 impl Settings {
-  pub fn resolve(args: &Args, config: Config) -> Settings {
+  pub fn resolve(args: &Args, config: Config) -> Self {
     let syntax = args.syntax.or(config.syntax.enabled).unwrap_or(true);
     let theme = args.theme.clone().or(config.syntax.theme);
-    Settings {
+    Self {
       layout: args
         .layout
         .or(config.diff.layout)

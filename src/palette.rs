@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 /// The style of every highlight group. Each starts as its ANSI default, so
 /// the terminal's own palette picks the colors.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
   pub normal: Style,
   pub border: Style,
@@ -26,7 +26,7 @@ pub struct Palette {
 impl Default for Palette {
   fn default() -> Self {
     let mode = Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED);
-    Palette {
+    Self {
       normal: Style::new(),
       border: Style::new(),
       diff_border: Style::new(),
@@ -114,10 +114,10 @@ enum Value {
 impl Value {
   fn color(&self) -> Result<Color, String> {
     match self {
-      Value::Index(n) => u8::try_from(*n)
+      Self::Index(n) => u8::try_from(*n)
         .map(Color::Indexed)
         .map_err(|_| format!("palette index {n} is not between 0 and 255")),
-      Value::Text(text) => parse_color(text),
+      Self::Text(text) => parse_color(text),
     }
   }
 }

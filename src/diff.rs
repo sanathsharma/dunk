@@ -16,14 +16,14 @@ pub enum FileStatus {
 }
 
 impl FileStatus {
-  pub fn letter(self) -> char {
+  pub const fn letter(self) -> char {
     match self {
-      FileStatus::Added => 'A',
-      FileStatus::Deleted => 'D',
-      FileStatus::Modified => 'M',
-      FileStatus::Renamed => 'R',
-      FileStatus::Copied => 'C',
-      FileStatus::Conflicted => 'U',
+      Self::Added => 'A',
+      Self::Deleted => 'D',
+      Self::Modified => 'M',
+      Self::Renamed => 'R',
+      Self::Copied => 'C',
+      Self::Conflicted => 'U',
     }
   }
 }
@@ -217,7 +217,7 @@ impl FileDiff {
       None if narrowed.new_len > 0 => self.old_path.clone(),
       path => path.clone(),
     };
-    FileDiff {
+    Self {
       new_path,
       hunks: vec![narrowed],
       ..self.clone()
@@ -239,7 +239,7 @@ impl FileDiff {
 
   /// A file that holds hunk `hunk` turned around: the sides swap and so do
   /// added and removed lines. The lines keep their order and index.
-  fn reversed_hunk(&self, hunk: usize) -> FileDiff {
+  fn reversed_hunk(&self, hunk: usize) -> Self {
     let mut h = self.hunks[hunk].clone();
     (h.old_start, h.new_start) = (h.new_start, h.old_start);
     (h.old_len, h.new_len) = (h.new_len, h.old_len);
@@ -250,7 +250,7 @@ impl FileDiff {
         LineKind::Context => LineKind::Context,
       };
     }
-    FileDiff {
+    Self {
       old_path: self.new_path.clone(),
       new_path: self.old_path.clone(),
       hunks: vec![h],
@@ -263,7 +263,7 @@ impl FileDiff {
   /// neighboring hunk's context, or touches the hunk itself, merges the two.
   /// Lines beyond either end of the file are not shown. Also returns, for each
   /// hunk of the result, the index of the first hunk of `self` it holds.
-  pub fn widened(&self, extra: &[u32], text: &[u8]) -> (FileDiff, Vec<usize>) {
+  pub fn widened(&self, extra: &[u32], text: &[u8]) -> (Self, Vec<usize>) {
     let hunks = &self.hunks;
     let extra_of = |i: usize| extra.get(i).copied().unwrap_or(0) as usize;
     let mut file: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
@@ -344,7 +344,7 @@ impl FileDiff {
       i += 1;
     }
     (
-      FileDiff {
+      Self {
         hunks: shown,
         ..self.clone()
       },
@@ -405,7 +405,7 @@ fn num(bytes: &[u8]) -> Option<u32> {
 }
 
 /// Returns the index just past the closing quote of a C-style quoted string.
-fn quoted_end(s: &[u8]) -> Option<usize> {
+const fn quoted_end(s: &[u8]) -> Option<usize> {
   let mut i = 1;
   while i < s.len() {
     match s[i] {

@@ -28,7 +28,7 @@ impl Worker {
     highlighter: Arc<Highlighter>,
     focus: usize,
     done: F,
-  ) -> Worker
+  ) -> Self
   where
     V: Vcs + Send + Sync + 'static,
     F: Fn(usize, FileHighlight) -> bool + Send + 'static,
@@ -40,7 +40,7 @@ impl Worker {
         closed: false,
       }),
     });
-    let worker = Worker(shared.clone());
+    let worker = Self(shared.clone());
     thread::spawn(move || {
       while let Some(index) = shared.next() {
         let file = &files[index];

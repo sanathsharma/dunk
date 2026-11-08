@@ -143,10 +143,10 @@ pub enum Mode {
 }
 
 impl Mode {
-  pub fn label(self) -> &'static str {
+  pub const fn label(self) -> &'static str {
     match self {
-      Mode::Normal => "NORMAL",
-      Mode::Visual => "VISUAL",
+      Self::Normal => "NORMAL",
+      Self::Visual => "VISUAL",
     }
   }
 }
@@ -212,7 +212,7 @@ pub struct App {
 
 impl Default for App {
   fn default() -> Self {
-    App {
+    Self {
       mode: Mode::Normal,
       help: false,
       load: Load::Loading,
@@ -406,7 +406,7 @@ impl App {
   }
 
   /// Takes the file whose context changed and that needs new colors.
-  pub fn take_rehighlight(&mut self) -> Option<Rehighlight> {
+  pub const fn take_rehighlight(&mut self) -> Option<Rehighlight> {
     self.rehighlight.take()
   }
 
@@ -435,7 +435,7 @@ impl App {
       ));
       return;
     }
-    *slot = Some(sides.clone());
+    *slot = Some(sides);
     if let Some((wanted, hunks)) = self.pending_widen.take() {
       if wanted == index {
         self.set_context(index, hunks, Step::More);
@@ -446,7 +446,7 @@ impl App {
   }
 
   /// Takes the stage or unstage the last key press asked for.
-  pub fn take_index_request(&mut self) -> Option<IndexRequest> {
+  pub const fn take_index_request(&mut self) -> Option<IndexRequest> {
     self.index_request.take()
   }
 
@@ -872,7 +872,7 @@ impl App {
     });
   }
 
-  pub fn take_edit(&mut self) -> Option<EditRequest> {
+  pub const fn take_edit(&mut self) -> Option<EditRequest> {
     self.edit.take()
   }
 
@@ -991,14 +991,11 @@ impl App {
       });
     }
     self.scroll = self.scroll.min(self.max_scroll());
-    match anchor.and_then(|numbers| self.row_with_numbers(numbers)) {
-      Some(row) => self.cursor = row,
-      None => {
-        // The line under the cursor is hidden now. Go to the hunk that held it.
-        let file = &self.files[index];
-        let first = file.hunks[shown].changed().next();
-        self.cursor = row_of(file, self.layout, shown, first);
-      }
+    if let Some(row) = anchor.and_then(|numbers| self.row_with_numbers(numbers)) { self.cursor = row } else {
+      // The line under the cursor is hidden now. Go to the hunk that held it.
+      let file = &self.files[index];
+      let first = file.hunks[shown].changed().next();
+      self.cursor = row_of(file, self.layout, shown, first);
     }
     self.clamp_scroll();
   }
@@ -1065,7 +1062,7 @@ impl App {
     rows
   }
 
-  fn pan_by(&mut self, delta: isize) {
+  const fn pan_by(&mut self, delta: isize) {
     self.pan = self.pan.saturating_add_signed(delta);
   }
 
@@ -1144,7 +1141,7 @@ impl InputGate {
   /// until the guard drops.
   fn pause(&self) -> PauseGuard<'_> {
     self.paused.store(true, Ordering::SeqCst);
-    let held = self.reading.lock().unwrap_or_else(|e| e.into_inner());
+    let held = self.reading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     PauseGuard {
       gate: self,
       _held: held,
@@ -1170,7 +1167,7 @@ fn spawn_input(tx: Sender<Event>, gate: Arc<InputGate>) {
         thread::sleep(INPUT_POLL);
         continue;
       }
-      let _reading = gate.reading.lock().unwrap_or_else(|e| e.into_inner());
+      let _reading = gate.reading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
       match event::poll(INPUT_POLL) {
         Ok(true) => {}
         Ok(false) => continue,
@@ -1311,13 +1308,13 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
       }
       Ok(Event::Loaded(..)) => {}
       Ok(Event::Highlighted(id, index, highlight)) if id == applied => {
-        app.on_highlighted(index, highlight)
+        app.on_highlighted(index, highlight);
       }
       Ok(Event::Highlighted(..)) => {}
       Ok(Event::Sides(id, index, sides)) if id == applied => app.on_sides(index, sides),
       Ok(Event::Sides(..)) => {}
       Ok(Event::Rehighlighted(id, index, generation, highlight)) if id == applied => {
-        app.on_rehighlighted(index, generation, highlight)
+        app.on_rehighlighted(index, generation, highlight);
       }
       Ok(Event::Rehighlighted(..)) => {}
       Ok(Event::InputFailed(e)) => return Err(e),

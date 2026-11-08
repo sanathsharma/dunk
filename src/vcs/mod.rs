@@ -20,9 +20,9 @@ pub enum Error {
 impl fmt::Display for Error {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Error::Io(e) => write!(f, "failed to run git: {e}"),
-      Error::Git(msg) => write!(f, "{msg}"),
-      Error::Parse(msg) => write!(f, "unexpected git output: {msg}"),
+      Self::Io(e) => write!(f, "failed to run git: {e}"),
+      Self::Git(msg) => write!(f, "{msg}"),
+      Self::Parse(msg) => write!(f, "unexpected git output: {msg}"),
     }
   }
 }
@@ -31,22 +31,22 @@ impl std::error::Error for Error {}
 
 impl From<ParseError> for Error {
   fn from(e: ParseError) -> Self {
-    Error::Parse(e.to_string())
+    Self::Parse(e.to_string())
   }
 }
 
 impl From<io::Error> for Error {
   fn from(e: io::Error) -> Self {
-    Error::Io(e)
+    Self::Io(e)
   }
 }
 
 impl Section {
   /// The scope that selects only this section.
-  pub fn scope(self) -> Scope {
+  pub const fn scope(self) -> Scope {
     match self {
-      Section::Unstaged => Scope::Unstaged,
-      Section::Staged => Scope::Staged,
+      Self::Unstaged => Scope::Unstaged,
+      Self::Staged => Scope::Staged,
     }
   }
 }
@@ -70,7 +70,7 @@ impl VersionId {
   pub fn of(bytes: &[u8]) -> Self {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
-    VersionId(hasher.finish())
+    Self(hasher.finish())
   }
 }
 

@@ -206,7 +206,7 @@ pub fn parse() -> Args {
 
 #[cfg(test)]
 impl Args {
-  pub fn parse_from(args: &[&str]) -> Args {
+  pub fn parse_from(args: &[&str]) -> Self {
     from_matches(&command().get_matches_from(args))
   }
 }

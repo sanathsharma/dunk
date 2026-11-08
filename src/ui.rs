@@ -41,7 +41,7 @@ const HELP_MENU: &[(&str, &str)] = &[
 
 impl Row<'_> {
   /// Whether the row is in the hunk under the cursor.
-  fn active(&self) -> bool {
+  const fn active(&self) -> bool {
     match self {
       Row::Header(_, active) | Row::Line(_, _, _, active) => *active,
     }
@@ -143,7 +143,7 @@ fn message(frame: &mut Frame, area: Rect, text: &str) {
   frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), middle);
 }
 
-fn status_color(status: FileStatus) -> Color {
+const fn status_color(status: FileStatus) -> Color {
   match status {
     FileStatus::Added => Color::Green,
     FileStatus::Deleted => Color::Red,
@@ -153,7 +153,7 @@ fn status_color(status: FileStatus) -> Color {
   }
 }
 
-fn border_type(border: Border) -> BorderType {
+const fn border_type(border: Border) -> BorderType {
   match border {
     Border::Plain => BorderType::Plain,
     Border::Rounded => BorderType::Rounded,
@@ -520,15 +520,12 @@ fn line_spans(
     Span::styled(marker.to_string(), under),
   ];
   let plain;
-  let pieces = match styled {
-    Some(pieces) => pieces,
-    None => {
-      plain = vec![(
-        Style::new(),
-        String::from_utf8_lossy(&l.content).into_owned(),
-      )];
-      &plain
-    }
+  let pieces = if let Some(pieces) = styled { pieces } else {
+    plain = vec![(
+      Style::new(),
+      String::from_utf8_lossy(&l.content).into_owned(),
+    )];
+    &plain
   };
   let mut code: Vec<(Style, String)> = emphasize(pieces, changed, word_bg, under)
     .into_iter()
@@ -1154,7 +1151,7 @@ diff --git a/a.rs b/a.rs
     let mut app = split_app();
     let (_, rows) = draw(&mut app, 81, 12);
     let (_, keep) = row_with(&rows, "keep");
-    assert!(keep.matches("keep").count() == 2);
+    assert_eq!(keep.matches("keep").count(), 2);
     let (_, pair) = row_with(&rows, "-old1");
     assert!(pair.contains("+new1"));
     assert!(pair.find("-old1") < pair.find("+new1"));

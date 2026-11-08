@@ -26,7 +26,7 @@ pub type Styled = Vec<(Style, String)>;
 
 /// Colors for every line of a diff, indexed like `FileDiff::hunks[h].lines[l]`.
 /// A line is `None` when its file version could not be highlighted.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct FileHighlight {
   pub hunks: Vec<Vec<Option<Styled>>>,
 }
@@ -107,7 +107,7 @@ impl Highlighter {
       .find(|n| n.as_name() == canonical)
       .copied()
       .unwrap_or(EmbeddedThemeName::Base16OceanDark);
-    Ok(Highlighter {
+    Ok(Self {
       syntaxes: two_face::syntax::extra_newlines(),
       theme: two_face::theme::extra().get(id).clone(),
       cache: Mutex::default(),
@@ -190,7 +190,7 @@ impl Highlighter {
     let Some(id) = id else {
       return self.file(path, bytes).map(Arc::new);
     };
-    let key = (id.clone(), path.to_path_buf());
+    let key = (*id, path.to_path_buf());
     if let Some(hit) = self.cache.lock().unwrap().get(&key) {
       return hit;
     }
@@ -223,7 +223,7 @@ fn map_lines(file: &FileDiff, old: Option<&[Styled]>, new: Option<&[Styled]>) ->
 
 /// Themes such as `ansi` and `base16` encode terminal palette colors in the
 /// alpha channel: 0 means the palette index is in red, 1 means the default.
-fn convert(style: SyntectStyle) -> Style {
+const fn convert(style: SyntectStyle) -> Style {
   let fg = style.foreground;
   let color = match fg.a {
     0 => Some(Color::Indexed(fg.r)),

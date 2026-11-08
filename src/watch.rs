@@ -23,7 +23,7 @@ impl Watch {
   pub fn start(
     root: &Path,
     changed: impl FnMut() -> bool + Send + 'static,
-  ) -> notify::Result<Watch> {
+  ) -> notify::Result<Self> {
     let (tx, rx) = mpsc::channel();
     let base = root.to_path_buf();
     let ignored = Arc::new(RwLock::new(ignored_roots(root)));
@@ -46,7 +46,7 @@ impl Watch {
     )?;
     watcher.watch(root, RecursiveMode::Recursive)?;
     thread::spawn(move || debounce(&rx, QUIET, changed));
-    Ok(Watch { _watcher: watcher })
+    Ok(Self { _watcher: watcher })
   }
 }
 
@@ -222,7 +222,7 @@ mod tests {
     let handle = thread::spawn(move || {
       debounce(&rx, Duration::from_millis(80), || {
         fired_tx.send(Instant::now()).is_ok()
-      })
+      });
     });
     let start = Instant::now();
     for _ in 0..20 {
