@@ -6,6 +6,7 @@ use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
 use crate::palette::Palette;
 use crate::split;
+use crate::staging::{self, Follow, IndexRequest, Refusal, Target};
 use crate::ui;
 use crate::vcs::{self, DiffRequest, Sides, Vcs};
 use crate::watch::Watch;
@@ -49,53 +50,6 @@ pub enum Event {
   /// once the changeset is read again.
   Indexed(Option<Follow>, Result<(), vcs::Error>),
   InputFailed(io::Error),
-}
-
-/// Where the selection goes after a reload: an entry of the file list, named
-/// by path and section so it can be found again, and optionally one of its
-/// hunks for the cursor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Follow {
-  pub path: PathBuf,
-  pub section: Section,
-  pub hunk: Option<usize>,
-}
-
-/// What a stage or unstage moves.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-  File,
-  Hunk(usize),
-  /// The lines of a hunk at these indexes into the hunk's lines.
-  Lines(usize, BTreeSet<usize>),
-  /// Every file of the list that is in the section the request moves out of.
-  All(Vec<FileDiff>),
-}
-
-/// A stage or unstage of a file, a hunk or some of its lines waiting to run.
-pub struct IndexRequest {
-  pub file: FileDiff,
-  pub target: Target,
-  /// True to stage, false to unstage.
-  pub stage: bool,
-  pub follow: Option<Follow>,
-}
-
-impl IndexRequest {
-  /// Writes the index as the request asks.
-  pub fn run(&self, vcs: &(impl Vcs + ?Sized)) -> Result<(), vcs::Error> {
-    let file = &self.file;
-    match (&self.target, self.stage) {
-      (Target::File, true) => vcs.stage(file),
-      (Target::File, false) => vcs.unstage(file),
-      (Target::All(files), true) => vcs.stage_all(files),
-      (Target::All(files), false) => vcs.unstage_all(files),
-      (Target::Hunk(hunk), true) => vcs.stage_hunk(file, *hunk),
-      (Target::Hunk(hunk), false) => vcs.unstage_hunk(file, *hunk),
-      (Target::Lines(hunk, lines), true) => vcs.stage_lines(file, *hunk, lines),
-      (Target::Lines(hunk, lines), false) => vcs.unstage_lines(file, *hunk, lines),
-    }
-  }
 }
 
 /// A file, relative to the repository root, and the 1-based line to open it at.
@@ -487,62 +441,27 @@ impl App {
   /// Asks to stage the selected file, or to unstage it when it is in the
   /// staged section.
   fn toggle_stage(&mut self) {
-    let Some(file) = self.files.get(self.selected) else {
-      return;
-    };
-    let Some(section) = file.section else {
-      self.notice = Some("read-only: revision".into());
-      return;
-    };
-    self.index_request = Some(IndexRequest {
-      file: file.clone(),
-      target: Target::File,
-      stage: section == Section::Unstaged,
-      follow: self.neighbour(),
-    });
+    let request = staging::toggle_file(&self.files, self.selected);
+    self.request_index(request);
   }
 
   /// Asks to stage every unstaged entry, or to unstage every staged entry
-  /// when none is left to stage. The selection follows its file into the
-  /// section the file moves to.
+  /// when none is left to stage.
   fn toggle_stage_all(&mut self) {
-    let Some(file) = self.files.get(self.selected) else {
-      return;
-    };
-    if file.section.is_none() {
-      self.notice = Some("read-only: revision".into());
-      return;
+    let request = staging::toggle_all(&self.files, self.selected);
+    self.request_index(request);
+  }
+
+  /// Keeps a request for the event loop to run, or shows why there is none.
+  fn request_index(&mut self, request: Result<IndexRequest, Refusal>) {
+    match request {
+      Ok(request) => self.index_request = Some(request),
+      Err(refusal) => {
+        if let Some(notice) = refusal.notice() {
+          self.notice = Some(notice.into());
+        }
+      }
     }
-    let stage = self
-      .files
-      .iter()
-      .any(|f| f.section == Some(Section::Unstaged));
-    let from = if stage {
-      Section::Unstaged
-    } else {
-      Section::Staged
-    };
-    let files: Vec<FileDiff> = self
-      .files
-      .iter()
-      .filter(|f| f.section == Some(from))
-      .cloned()
-      .collect();
-    let to = if stage {
-      Section::Staged
-    } else {
-      Section::Unstaged
-    };
-    self.index_request = Some(IndexRequest {
-      file: file.clone(),
-      target: Target::All(files),
-      stage,
-      follow: Some(Follow {
-        path: file.path().to_path_buf(),
-        section: to,
-        hunk: Some(0),
-      }),
-    });
   }
 
   /// Asks to stage the hunk under the cursor, or to unstage it when the
@@ -597,9 +516,7 @@ impl App {
     let follow = if !leaves || hunk.saturating_add(1) < file.hunks.len() {
       Some(in_entry(hunk))
     } else {
-      self
-        .neighbour()
-        .or_else(|| hunk.checked_sub(1).map(in_entry))
+      staging::neighbour(&self.files, self.selected).or_else(|| hunk.checked_sub(1).map(in_entry))
     };
     let target = lines.map_or(Target::Hunk(hunk), |lines| Target::Lines(hunk, lines));
     self.index_request = Some(IndexRequest {
@@ -702,26 +619,6 @@ impl App {
       KeyCode::Char('?') => self.help = true,
       _ => {}
     }
-  }
-
-  /// The entry after the selected one in its section, or the one before it
-  /// when the selected entry is the last.
-  fn neighbour(&self) -> Option<Follow> {
-    let section = self.files.get(self.selected)?.section?;
-    let in_section = |i: &usize| {
-      self
-        .files
-        .get(*i)
-        .is_some_and(|f| f.section == Some(section))
-    };
-    let next = (self.selected.saturating_add(1)..self.files.len()).find(in_section);
-    let previous = (0..self.selected).rev().find(in_section);
-    let at = next.or(previous)?;
-    Some(Follow {
-      path: self.files.get(at)?.path().to_path_buf(),
-      section,
-      hunk: None,
-    })
   }
 
   pub fn on_key(&mut self, key: KeyEvent) {

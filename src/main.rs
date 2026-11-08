@@ -6,6 +6,7 @@ mod editor;
 mod highlight;
 mod palette;
 mod split;
+mod staging;
 mod ui;
 mod vcs;
 mod watch;
