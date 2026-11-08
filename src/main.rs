@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn Error>> {
   if !io::stdout().is_terminal() {
     return Err("dunk needs a terminal".into());
   }
-  let dir = args.directory.as_deref().unwrap_or(Path::new("."));
+  let dir = args.directory.as_deref().unwrap_or_else(|| Path::new("."));
   let request = DiffRequest {
     scope: args.scope,
     revisions: args.revisions,

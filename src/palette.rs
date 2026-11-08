@@ -90,6 +90,10 @@ pub struct Highlights {
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[allow(
+  clippy::struct_excessive_bools,
+  reason = "one flag per style key in the file"
+)]
 struct Spec {
   fg: Option<Value>,
   bg: Option<Value>,
@@ -127,10 +131,13 @@ fn parse_color(text: &str) -> Result<Color, String> {
     let digits = (hex.len() == 6 && hex.is_ascii())
       .then(|| u32::from_str_radix(hex, 16).ok())
       .flatten();
-    return match digits {
-      Some(n) => Ok(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)),
-      None => Err(format!("unknown color '{text}', expected #rrggbb")),
-    };
+    return digits.map_or_else(
+      || Err(format!("unknown color '{text}', expected #rrggbb")),
+      |n| {
+        let [_, r, g, b] = n.to_be_bytes();
+        Ok(Color::Rgb(r, g, b))
+      },
+    );
   }
   Ok(match text.to_ascii_lowercase().as_str() {
     "black" => Color::Black,

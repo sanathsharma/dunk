@@ -1,7 +1,7 @@
 use crate::diff::FileDiff;
 use crate::highlight::{FileHighlight, Highlighter};
 use crate::vcs::{DiffRequest, Vcs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 struct State {
@@ -43,7 +43,9 @@ impl Worker {
     let worker = Self(shared.clone());
     thread::spawn(move || {
       while let Some(index) = shared.next() {
-        let file = &files[index];
+        let Some(file) = files.get(index) else {
+          continue;
+        };
         let result = if file.binary || file.hunks.is_empty() {
           FileHighlight::default()
         } else {
@@ -60,13 +62,13 @@ impl Worker {
 
   /// Moves the file the worker should do next to the front of the queue.
   pub fn focus(&self, index: usize) {
-    self.0.state.lock().unwrap().focus = index;
+    self.0.lock().focus = index;
   }
 }
 
 impl Drop for Worker {
   fn drop(&mut self) {
-    self.0.state.lock().unwrap().closed = true;
+    self.0.lock().closed = true;
   }
 }
 
@@ -74,15 +76,24 @@ impl Shared {
   /// Takes the pending file closest to the focus, or `None` when the queue
   /// is empty or closed.
   fn next(&self) -> Option<usize> {
-    let mut state = self.state.lock().unwrap();
-    if state.closed || state.pending.is_empty() {
+    let mut state = self.lock();
+    if state.closed {
       return None;
     }
     let focus = state.focus;
-    let at = (0..state.pending.len())
-      .min_by_key(|&i| state.pending[i].abs_diff(focus))
-      .expect("pending is not empty");
+    let at = state
+      .pending
+      .iter()
+      .enumerate()
+      .min_by_key(|(_, file)| file.abs_diff(focus))
+      .map(|(at, _)| at)?;
     Some(state.pending.remove(at))
+  }
+
+  /// The queue stays usable after a panic elsewhere, since each update to it
+  /// is a single assignment or removal.
+  fn lock(&self) -> MutexGuard<'_, State> {
+    self.state.lock().unwrap_or_else(PoisonError::into_inner)
   }
 }
 

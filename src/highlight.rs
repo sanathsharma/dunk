@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme};
 use syntect::parsing::SyntaxSet;
@@ -171,12 +171,12 @@ impl Highlighter {
     let old = self.version(
       file.old_path.as_deref(),
       sides.old.as_deref(),
-      &sides.old_id,
+      sides.old_id.as_ref(),
     );
     let new = self.version(
       file.new_path.as_deref(),
       sides.new.as_deref(),
-      &sides.new_id,
+      sides.new_id.as_ref(),
     );
     map_lines(
       file,
@@ -185,18 +185,25 @@ impl Highlighter {
     )
   }
 
-  fn version(&self, path: Option<&Path>, bytes: Option<&[u8]>, id: &Option<VersionId>) -> Lines {
+  fn version(&self, path: Option<&Path>, bytes: Option<&[u8]>, id: Option<&VersionId>) -> Lines {
     let (path, bytes) = path.zip(bytes)?;
     let Some(id) = id else {
       return self.file(path, bytes).map(Arc::new);
     };
     let key = (*id, path.to_path_buf());
-    if let Some(hit) = self.cache.lock().unwrap().get(&key) {
+    let hit = self.cache().get(&key);
+    if let Some(hit) = hit {
       return hit;
     }
     let lines = self.file(path, bytes).map(Arc::new);
-    self.cache.lock().unwrap().insert(key, lines.clone());
+    self.cache().insert(key, lines.clone());
     lines
+  }
+
+  /// The cache stays usable after a panic elsewhere, since an entry is never
+  /// left half written.
+  fn cache(&self) -> MutexGuard<'_, Cache> {
+    self.cache.lock().unwrap_or_else(PoisonError::into_inner)
   }
 }
 
@@ -430,10 +437,7 @@ diff --git a/a.rs b/a.rs
     let h = highlighter();
     let file = one_line_file();
     for i in 0..CACHE_ENTRIES + 10 {
-      h.diff(
-        &file,
-        &identified(b"a\n", b"b\n", 0, 10 + i as u64),
-      );
+      h.diff(&file, &identified(b"a\n", b"b\n", 0, 10 + i as u64));
     }
     let before = h.runs();
     // The first new version was evicted, the latest one is still held.
@@ -450,18 +454,12 @@ diff --git a/a.rs b/a.rs
     let file = one_line_file();
     // The shared 0 version takes one slot, so this fills the cache exactly.
     for i in 0..CACHE_ENTRIES - 1 {
-      h.diff(
-        &file,
-        &identified(b"a\n", b"b\n", 0, 10 + i as u64),
-      );
+      h.diff(&file, &identified(b"a\n", b"b\n", 0, 10 + i as u64));
     }
     // Use the oldest version again, then overflow the cache.
     h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));
     for i in CACHE_ENTRIES..CACHE_ENTRIES + 5 {
-      h.diff(
-        &file,
-        &identified(b"a\n", b"b\n", 0, 10 + i as u64),
-      );
+      h.diff(&file, &identified(b"a\n", b"b\n", 0, 10 + i as u64));
     }
     let before = h.runs();
     h.diff(&file, &identified(b"a\n", b"b\n", 0, 10));

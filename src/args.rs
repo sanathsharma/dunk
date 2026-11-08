@@ -44,7 +44,12 @@ pub struct Args {
 }
 
 fn command() -> Command {
-  Command::new("dunk")
+  display_args(selection_args(Command::new("dunk")))
+}
+
+/// The options that choose which changes to show.
+fn selection_args(cmd: Command) -> Command {
+  cmd
     .version(env!("CARGO_PKG_VERSION"))
     .about("Terminal viewer for git diffs")
     .arg(
@@ -81,6 +86,11 @@ fn command() -> Command {
         .action(ArgAction::SetTrue)
         .conflicts_with("revisions"),
     )
+}
+
+/// The options that shape what is drawn and when it refreshes.
+fn display_args(cmd: Command) -> Command {
+  cmd
     .arg(
       Arg::new("layout")
         .long("layout")

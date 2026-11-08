@@ -991,7 +991,9 @@ impl App {
       });
     }
     self.scroll = self.scroll.min(self.max_scroll());
-    if let Some(row) = anchor.and_then(|numbers| self.row_with_numbers(numbers)) { self.cursor = row } else {
+    if let Some(row) = anchor.and_then(|numbers| self.row_with_numbers(numbers)) {
+      self.cursor = row
+    } else {
       // The line under the cursor is hidden now. Go to the hunk that held it.
       let file = &self.files[index];
       let first = file.hunks[shown].changed().next();
@@ -1141,7 +1143,10 @@ impl InputGate {
   /// until the guard drops.
   fn pause(&self) -> PauseGuard<'_> {
     self.paused.store(true, Ordering::SeqCst);
-    let held = self.reading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let held = self
+      .reading
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner);
     PauseGuard {
       gate: self,
       _held: held,
@@ -1167,7 +1172,10 @@ fn spawn_input(tx: Sender<Event>, gate: Arc<InputGate>) {
         thread::sleep(INPUT_POLL);
         continue;
       }
-      let _reading = gate.reading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      let _reading = gate
+        .reading
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
       match event::poll(INPUT_POLL) {
         Ok(true) => {}
         Ok(false) => continue,

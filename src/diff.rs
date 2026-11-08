@@ -64,6 +64,14 @@ pub enum Section {
   Staged,
 }
 
+fn to_u32(n: usize) -> u32 {
+  u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+fn to_usize(n: u32) -> usize {
+  usize::try_from(n).unwrap_or(usize::MAX)
+}
+
 /// A path with its `a/` or `b/` prefix, quoted the way git does when it holds
 /// control characters, quotes or backslashes.
 fn prefixed(prefix: &[u8], path: &Path) -> Vec<u8> {
@@ -98,6 +106,16 @@ pub struct FileDiff {
 }
 
 impl Hunk {
+  /// The index just past the run of `kind` lines that starts at `start`.
+  pub fn run_end(&self, start: usize, kind: LineKind) -> usize {
+    self
+      .lines
+      .iter()
+      .skip(start)
+      .position(|l| l.kind != kind)
+      .map_or(self.lines.len(), |n| start.saturating_add(n))
+  }
+
   /// Indexes of the added and removed lines.
   pub fn changed(&self) -> impl Iterator<Item = usize> + Clone + '_ {
     self
@@ -116,7 +134,7 @@ impl FileDiff {
       .new_path
       .as_deref()
       .or(self.old_path.as_deref())
-      .expect("parser guarantees one path")
+      .unwrap_or_else(|| Path::new(""))
   }
 
   pub fn count(&self, kind: LineKind) -> usize {
@@ -132,7 +150,9 @@ impl FileDiff {
   /// line, which would need mode lines for a new or deleted file. A new file is
   /// written as `--- /dev/null` and a deleted one as `+++ /dev/null`.
   pub fn hunk_patch(&self, hunk: usize) -> Vec<u8> {
-    let h = &self.hunks[hunk];
+    let Some(h) = self.hunks.get(hunk) else {
+      return Vec::new();
+    };
     let old = self.old_path.as_deref().map(|p| prefixed(b"a/", p));
     let new = self.new_path.as_deref().map(|p| prefixed(b"b/", p));
     let name = |side: &Option<Vec<u8>>| side.clone().unwrap_or_else(|| b"/dev/null".to_vec());
@@ -173,7 +193,9 @@ impl FileDiff {
   /// range becomes context and an added one outside it is left out, so the
   /// patch changes nothing but the selection.
   pub fn line_patch(&self, hunk: usize, lines: &BTreeSet<usize>) -> Vec<u8> {
-    let h = &self.hunks[hunk];
+    let Some(h) = self.hunks.get(hunk) else {
+      return Vec::new();
+    };
     let mut kept: Vec<Line> = Vec::new();
     for (i, line) in h.lines.iter().enumerate() {
       if lines.contains(&i) || line.kind == LineKind::Context {
@@ -184,10 +206,12 @@ impl FileDiff {
         LineKind::Added => {}
         LineKind::Removed
           if line.no_newline
-            && h.lines[i + 1..]
+            && h
+              .lines
               .iter()
               .enumerate()
-              .any(|(at, l)| l.kind == LineKind::Added && lines.contains(&(i + 1 + at))) =>
+              .skip(i.saturating_add(1))
+              .any(|(at, l)| l.kind == LineKind::Added && lines.contains(&at)) =>
         {
           // Text can only follow a line that ends in a newline. The old line
           // goes and comes back with its newline, ahead of the added lines.
@@ -207,8 +231,8 @@ impl FileDiff {
     }
     let count = |kinds: [LineKind; 2]| kept.iter().filter(|l| kinds.contains(&l.kind)).count();
     let narrowed = Hunk {
-      old_len: count([LineKind::Context, LineKind::Removed]) as u32,
-      new_len: count([LineKind::Context, LineKind::Added]) as u32,
+      old_len: to_u32(count([LineKind::Context, LineKind::Removed])),
+      new_len: to_u32(count([LineKind::Context, LineKind::Added])),
       lines: kept,
       ..h.clone()
     };
@@ -240,7 +264,13 @@ impl FileDiff {
   /// A file that holds hunk `hunk` turned around: the sides swap and so do
   /// added and removed lines. The lines keep their order and index.
   fn reversed_hunk(&self, hunk: usize) -> Self {
-    let mut h = self.hunks[hunk].clone();
+    let Some(h) = self.hunks.get(hunk) else {
+      return Self {
+        hunks: Vec::new(),
+        ..self.clone()
+      };
+    };
+    let mut h = h.clone();
     (h.old_start, h.new_start) = (h.new_start, h.old_start);
     (h.old_len, h.new_len) = (h.new_len, h.old_len);
     for line in &mut h.lines {
@@ -265,83 +295,98 @@ impl FileDiff {
   /// hunk of the result, the index of the first hunk of `self` it holds.
   pub fn widened(&self, extra: &[u32], text: &[u8]) -> (Self, Vec<usize>) {
     let hunks = &self.hunks;
-    let extra_of = |i: usize| extra.get(i).copied().unwrap_or(0) as usize;
+    let extra_of = |i: usize| to_usize(extra.get(i).copied().unwrap_or(0));
     let mut file: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
     let ends_with_newline = file.last().is_some_and(|l| l.is_empty());
     if ends_with_newline {
       file.pop();
     }
-    let total = file.len() as u32;
+    let total = to_u32(file.len());
     let line_at = |new_no: u32, delta: i64| Line {
       kind: LineKind::Context,
-      old_no: u32::try_from(i64::from(new_no) + delta).ok(),
+      old_no: u32::try_from(i64::from(new_no).saturating_add(delta)).ok(),
       new_no: Some(new_no),
-      content: file[new_no as usize - 1].to_vec(),
+      content: file
+        .get(to_usize(new_no).saturating_sub(1))
+        .copied()
+        .unwrap_or_default()
+        .to_vec(),
       no_newline: !ends_with_newline && new_no == total,
     };
     // Gap `g` lies above hunk `g`, so gap 0 is the top of the file and gap
-    // `hunks.len()` the bottom. `below[g]` is what hunk `g` shows above itself,
-    // `above[g]` what hunk `g - 1` shows below itself. A merged gap shows all
-    // of its lines as `above[g]`.
-    let mut above: Vec<Vec<Line>> = vec![Vec::new(); hunks.len() + 1];
-    let mut below: Vec<Vec<Line>> = vec![Vec::new(); hunks.len() + 1];
-    let mut merged = vec![false; hunks.len() + 1];
-    for gap in 0..=hunks.len() {
-      let up = gap.checked_sub(1).map(|i| &hunks[i]);
-      let down = hunks.get(gap);
-      let lo = up.map_or(1, |h| h.last_new() + 1);
-      let hi = down.map_or(total, |h| h.first_new() - 1).min(total);
-      if lo > hi {
-        continue;
-      }
-      // Old line numbers trail the new ones by the same amount across a gap.
-      let delta = match (up, down) {
-        (Some(h), _) => i64::from(h.last_old()) - i64::from(h.last_new()),
-        (None, Some(h)) => i64::from(h.first_old()) - i64::from(h.first_new()),
-        (None, None) => continue,
-      };
-      let size = (hi - lo + 1) as usize;
-      let from_above = up.map_or(0, |_| extra_of(gap - 1));
-      let from_below = down.map_or(0, |_| extra_of(gap));
-      if up.is_some() && down.is_some() && from_above + from_below >= size {
-        merged[gap] = true;
-        above[gap] = (lo..=hi).map(|n| line_at(n, delta)).collect();
-        continue;
-      }
-      let shown_above = from_above.min(size) as u32;
-      let shown_below = from_below.min(size) as u32;
-      above[gap] = (lo..lo + shown_above).map(|n| line_at(n, delta)).collect();
-      below[gap] = (hi + 1 - shown_below..=hi)
-        .map(|n| line_at(n, delta))
-        .collect();
-    }
+    // `hunks.len()` the bottom. `below` is what hunk `g` shows above itself,
+    // `above` what hunk `g - 1` shows below itself. A merged gap shows all of
+    // its lines as `above`.
+    let gaps: Vec<Gap> = (0..=hunks.len())
+      .map(|gap| {
+        let up = gap.checked_sub(1).and_then(|i| hunks.get(i));
+        let down = hunks.get(gap);
+        let lo = up.map_or(1, |h| h.last_new().saturating_add(1));
+        let hi = down
+          .map_or(total, |h| h.first_new().saturating_sub(1))
+          .min(total);
+        if lo > hi {
+          return Gap::default();
+        }
+        // Old line numbers trail the new ones by the same amount across a gap.
+        let delta = match (up, down) {
+          (Some(h), _) => i64::from(h.last_old()).saturating_sub(i64::from(h.last_new())),
+          (None, Some(h)) => i64::from(h.first_old()).saturating_sub(i64::from(h.first_new())),
+          (None, None) => return Gap::default(),
+        };
+        let size = to_usize(hi.saturating_sub(lo).saturating_add(1));
+        let from_above = up.map_or(0, |_| extra_of(gap.saturating_sub(1)));
+        let from_below = down.map_or(0, |_| extra_of(gap));
+        if up.is_some() && down.is_some() && from_above.saturating_add(from_below) >= size {
+          return Gap {
+            above: (lo..=hi).map(|n| line_at(n, delta)).collect(),
+            below: Vec::new(),
+            merged: true,
+          };
+        }
+        let shown_above = to_u32(from_above.min(size));
+        let shown_below = to_u32(from_below.min(size));
+        Gap {
+          above: (lo..lo.saturating_add(shown_above))
+            .map(|n| line_at(n, delta))
+            .collect(),
+          below: (hi.saturating_add(1).saturating_sub(shown_below)..=hi)
+            .map(|n| line_at(n, delta))
+            .collect(),
+          merged: false,
+        }
+      })
+      .collect();
     let mut shown: Vec<Hunk> = Vec::new();
     let mut owners = Vec::new();
     let mut i = 0;
-    while i < hunks.len() {
+    while let Some(first) = hunks.get(i) {
       owners.push(i);
-      let mut hunk = hunks[i].clone();
-      let mut changed = !below[i].is_empty();
-      hunk.lines.splice(0..0, below[i].iter().cloned());
+      let mut hunk = first.clone();
+      let own = gaps.get(i);
+      let mut changed = own.is_some_and(|g| !g.below.is_empty());
+      if let Some(g) = own {
+        hunk.lines.splice(0..0, g.below.iter().cloned());
+      }
       loop {
-        changed |= !above[i + 1].is_empty();
-        hunk.lines.extend(above[i + 1].iter().cloned());
-        if !merged[i + 1] {
+        let next = gaps.get(i.saturating_add(1));
+        if let Some(g) = next {
+          changed |= !g.above.is_empty();
+          hunk.lines.extend(g.above.iter().cloned());
+        }
+        if !next.is_some_and(|g| g.merged) {
           break;
         }
-        i += 1;
-        hunk.lines.extend(hunks[i].lines.iter().cloned());
+        i = i.saturating_add(1);
+        if let Some(merged) = hunks.get(i) {
+          hunk.lines.extend(merged.lines.iter().cloned());
+        }
       }
       if changed {
-        let old = hunk.lines.iter().filter_map(|l| l.old_no);
-        let new = hunk.lines.iter().filter_map(|l| l.new_no);
-        hunk.old_start = old.clone().next().unwrap_or(hunk.old_start);
-        hunk.old_len = old.count() as u32;
-        hunk.new_start = new.clone().next().unwrap_or(hunk.new_start);
-        hunk.new_len = new.count() as u32;
+        hunk.recount();
       }
       shown.push(hunk);
-      i += 1;
+      i = i.saturating_add(1);
     }
     (
       Self {
@@ -353,25 +398,47 @@ impl FileDiff {
   }
 }
 
+/// What the context around one hunk looks like in `FileDiff::widened`.
+#[derive(Default)]
+struct Gap {
+  above: Vec<Line>,
+  below: Vec<Line>,
+  merged: bool,
+}
+
 impl Hunk {
+  /// Takes the start and length of each side from the hunk's lines.
+  fn recount(&mut self) {
+    let old = self.lines.iter().filter_map(|l| l.old_no);
+    let new = self.lines.iter().filter_map(|l| l.new_no);
+    self.old_start = old.clone().next().unwrap_or(self.old_start);
+    self.old_len = to_u32(old.count());
+    self.new_start = new.clone().next().unwrap_or(self.new_start);
+    self.new_len = to_u32(new.count());
+  }
+
   /// The first line the hunk covers on the old side. A hunk with no lines on a
   /// side names the line before it, so its first line is the next one.
   fn first_old(&self) -> u32 {
-    self.old_start + u32::from(self.old_len == 0)
+    self.old_start.saturating_add(u32::from(self.old_len == 0))
   }
 
   fn first_new(&self) -> u32 {
-    self.new_start + u32::from(self.new_len == 0)
+    self.new_start.saturating_add(u32::from(self.new_len == 0))
   }
 
   fn last_old(&self) -> u32 {
-    (self.old_start + self.old_len)
+    self
+      .old_start
+      .saturating_add(self.old_len)
       .saturating_sub(1)
       .max(self.old_start)
   }
 
   fn last_new(&self) -> u32 {
-    (self.new_start + self.new_len)
+    self
+      .new_start
+      .saturating_add(self.new_len)
       .saturating_sub(1)
       .max(self.new_start)
   }
@@ -405,13 +472,13 @@ fn num(bytes: &[u8]) -> Option<u32> {
 }
 
 /// Returns the index just past the closing quote of a C-style quoted string.
-const fn quoted_end(s: &[u8]) -> Option<usize> {
+fn quoted_end(s: &[u8]) -> Option<usize> {
   let mut i = 1;
-  while i < s.len() {
-    match s[i] {
-      b'\\' => i += 2,
-      b'"' => return Some(i + 1),
-      _ => i += 1,
+  while let Some(&b) = s.get(i) {
+    match b {
+      b'\\' => i = i.saturating_add(2),
+      b'"' => return Some(i.saturating_add(1)),
+      _ => i = i.saturating_add(1),
     }
   }
   None
@@ -438,17 +505,19 @@ fn unquote(s: &[u8]) -> Vec<u8> {
       Some(b't') => out.push(b'\t'),
       Some(b'v') => out.push(11),
       Some(d @ b'0'..=b'7') => {
-        let mut v = u32::from(d - b'0');
+        let mut v = u32::from(d.saturating_sub(b'0'));
         for _ in 0..2 {
           match it.peek() {
             Some(&n @ b'0'..=b'7') => {
-              v = v * 8 + u32::from(n - b'0');
+              v = v
+                .saturating_mul(8)
+                .saturating_add(u32::from(n.saturating_sub(b'0')));
               it.next();
             }
             _ => break,
           }
         }
-        out.push(v as u8);
+        out.push(u8::try_from(v & 0xFF).unwrap_or_default());
       }
       Some(c) => out.push(c),
       None => out.push(b'\\'),
@@ -473,8 +542,8 @@ fn header_path(raw: &[u8], prefix: &[u8]) -> Option<PathBuf> {
 fn git_line_paths(rest: &[u8]) -> Option<(PathBuf, PathBuf)> {
   if rest.first() == Some(&b'"') {
     let end = quoted_end(rest)?;
-    let old = unquote(&rest[..end]);
-    let new = unquote(rest.get(end + 1..)?);
+    let old = unquote(rest.get(..end)?);
+    let new = unquote(rest.get(end.saturating_add(1)..)?);
     return Some((
       path(old.strip_prefix(b"a/")?),
       path(new.strip_prefix(b"b/")?),
@@ -485,18 +554,14 @@ fn git_line_paths(rest: &[u8]) -> Option<(PathBuf, PathBuf)> {
     return None;
   }
   let n = n / 2;
-  let (old, new) = (&rest[..n + 2], &rest[n + 3..]);
-  if rest[n + 2] == b' ' && old.starts_with(b"a/") && new.starts_with(b"b/") && old[2..] == new[2..]
-  {
-    Some((path(&old[2..]), path(&new[2..])))
-  } else {
-    None
-  }
+  let old = rest.get(..n.saturating_add(2))?.strip_prefix(b"a/")?;
+  let new = rest.get(n.saturating_add(3)..)?.strip_prefix(b"b/")?;
+  (rest.get(n.saturating_add(2)) == Some(&b' ') && old == new).then(|| (path(old), path(new)))
 }
 
 fn range(s: &[u8]) -> Option<(u32, u32)> {
   match s.iter().position(|&b| b == b',') {
-    Some(p) => Some((num(&s[..p])?, num(&s[p + 1..])?)),
+    Some(p) => Some((num(s.get(..p)?)?, num(s.get(p.saturating_add(1)..)?)?)),
     None => Some((num(s)?, 1)),
   }
 }
@@ -505,10 +570,10 @@ fn range(s: &[u8]) -> Option<(u32, u32)> {
 fn hunk_header(line: &[u8]) -> Option<Hunk> {
   let rest = line.strip_prefix(b"@@ -")?;
   let end = find(rest, b" @@")?;
-  let (ranges, tail) = (&rest[..end], &rest[end + 3..]);
+  let (ranges, tail) = (rest.get(..end)?, rest.get(end.saturating_add(3)..)?);
   let sep = find(ranges, b" +")?;
-  let (old_start, old_len) = range(&ranges[..sep])?;
-  let (new_start, new_len) = range(&ranges[sep + 2..])?;
+  let (old_start, old_len) = range(ranges.get(..sep)?)?;
+  let (new_start, new_len) = range(ranges.get(sep.saturating_add(2)..)?)?;
   Some(Hunk {
     old_start,
     old_len,
@@ -526,7 +591,7 @@ fn hunk_lines(hunk: &mut Hunk, lines: &[&[u8]], mut i: usize) -> Result<usize, P
   let (mut old_no, mut new_no) = (hunk.old_start, hunk.new_start);
   while old_left > 0 || new_left > 0 {
     let raw = *lines.get(i).ok_or_else(|| err("truncated hunk", b""))?;
-    i += 1;
+    i = i.saturating_add(1);
     let (kind, content) = match raw.split_first() {
       Some((b' ', c)) => (LineKind::Context, c),
       None => (LineKind::Context, raw),
@@ -553,10 +618,10 @@ fn hunk_lines(hunk: &mut Hunk, lines: &[&[u8]], mut i: usize) -> Result<usize, P
         (None, Some(new_no))
       }
     };
-    old_no += u32::from(old.is_some());
-    new_no += u32::from(new.is_some());
+    old_no = old_no.saturating_add(u32::from(old.is_some()));
+    new_no = new_no.saturating_add(u32::from(new.is_some()));
     let no_newline = lines.get(i).is_some_and(|l| l.starts_with(b"\\"));
-    i += usize::from(no_newline);
+    i = i.saturating_add(usize::from(no_newline));
     hunk.lines.push(Line {
       kind,
       old_no: old,
@@ -586,7 +651,7 @@ fn file_diff(rest: &[u8], lines: &[&[u8]], mut i: usize) -> Result<(FileDiff, us
     if l.starts_with(b"@@ ") || l.starts_with(b"diff --git ") {
       break;
     }
-    i += 1;
+    i = i.saturating_add(1);
     if l.starts_with(b"new file mode") {
       file.status = FileStatus::Added;
       file.old_path = None;
@@ -614,7 +679,7 @@ fn file_diff(rest: &[u8], lines: &[&[u8]], mut i: usize) -> Result<(FileDiff, us
 
   while let Some(&l) = lines.get(i).filter(|l| l.starts_with(b"@@ ")) {
     let mut hunk = hunk_header(l).ok_or_else(|| err("bad hunk header", l))?;
-    i = hunk_lines(&mut hunk, lines, i + 1)?;
+    i = hunk_lines(&mut hunk, lines, i.saturating_add(1))?;
     file.hunks.push(hunk);
   }
 
@@ -633,7 +698,7 @@ pub fn parse(input: &[u8]) -> Result<Vec<FileDiff>, ParseError> {
   let mut files = Vec::new();
   let mut i = 0;
   while let Some(&l) = lines.get(i) {
-    i += 1;
+    i = i.saturating_add(1);
     if let Some(rest) = l.strip_prefix(b"diff --git ") {
       let (file, next) = file_diff(rest, &lines, i)?;
       files.push(file);

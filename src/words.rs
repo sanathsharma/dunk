@@ -13,53 +13,55 @@ pub fn changed_words(hunk: &Hunk) -> Vec<Vec<Range<usize>>> {
   let lines = &hunk.lines;
   let mut out = vec![Vec::new(); lines.len()];
   let mut i = 0;
-  while i < lines.len() {
-    if lines[i].kind != LineKind::Removed {
-      i += 1;
+  while let Some(line) = lines.get(i) {
+    if line.kind != LineKind::Removed {
+      i = i.saturating_add(1);
       continue;
     }
-    let removed_end = run_end(hunk, i, LineKind::Removed);
-    let added_end = run_end(hunk, removed_end, LineKind::Added);
-    let pairs = (removed_end - i).min(added_end - removed_end);
+    let removed_end = hunk.run_end(i, LineKind::Removed);
+    let added_end = hunk.run_end(removed_end, LineKind::Added);
+    let pairs = removed_end
+      .saturating_sub(i)
+      .min(added_end.saturating_sub(removed_end));
     for k in 0..pairs {
-      let (old, new) = (i + k, removed_end + k);
+      let (old, new) = (i.saturating_add(k), removed_end.saturating_add(k));
+      let (Some(removed), Some(added)) = (lines.get(old), lines.get(new)) else {
+        continue;
+      };
       let (old_ranges, new_ranges) = diff_words(
-        &String::from_utf8_lossy(&lines[old].content),
-        &String::from_utf8_lossy(&lines[new].content),
+        &String::from_utf8_lossy(&removed.content),
+        &String::from_utf8_lossy(&added.content),
       );
-      out[old] = old_ranges;
-      out[new] = new_ranges;
+      if let Some(slot) = out.get_mut(old) {
+        *slot = old_ranges;
+      }
+      if let Some(slot) = out.get_mut(new) {
+        *slot = new_ranges;
+      }
     }
     i = added_end.max(removed_end);
   }
   out
 }
 
-fn run_end(hunk: &Hunk, start: usize, kind: LineKind) -> usize {
-  hunk.lines[start..]
-    .iter()
-    .position(|l| l.kind != kind)
-    .map_or(hunk.lines.len(), |n| start + n)
-}
-
 fn diff_words(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
   let diff = TextDiff::configure().diff_unicode_words(old, new);
   let (mut old_ranges, mut new_ranges) = (Vec::new(), Vec::new());
-  let (mut old_at, mut new_at) = (0, 0);
+  let (mut old_at, mut new_at) = (0_usize, 0_usize);
   for change in diff.iter_all_changes() {
     let len = change.value().len();
     match change.tag() {
       ChangeTag::Equal => {
-        old_at += len;
-        new_at += len;
+        old_at = old_at.saturating_add(len);
+        new_at = new_at.saturating_add(len);
       }
       ChangeTag::Delete => {
-        push(&mut old_ranges, old_at..old_at + len);
-        old_at += len;
+        push(&mut old_ranges, old_at..old_at.saturating_add(len));
+        old_at = old_at.saturating_add(len);
       }
       ChangeTag::Insert => {
-        push(&mut new_ranges, new_at..new_at + len);
-        new_at += len;
+        push(&mut new_ranges, new_at..new_at.saturating_add(len));
+        new_at = new_at.saturating_add(len);
       }
     }
   }

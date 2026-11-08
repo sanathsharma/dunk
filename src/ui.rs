@@ -520,7 +520,9 @@ fn line_spans(
     Span::styled(marker.to_string(), under),
   ];
   let plain;
-  let pieces = if let Some(pieces) = styled { pieces } else {
+  let pieces = if let Some(pieces) = styled {
+    pieces
+  } else {
     plain = vec![(
       Style::new(),
       String::from_utf8_lossy(&l.content).into_owned(),

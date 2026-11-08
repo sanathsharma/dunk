@@ -66,7 +66,9 @@ impl Config {
   /// Reads `explicit`, or the default path when there is none. A missing
   /// default file is not an error, a missing explicit one is.
   pub fn load(explicit: Option<&Path>) -> Result<Self, String> {
-    let path = if let Some(path) = explicit { path.to_path_buf() } else {
+    let path = if let Some(path) = explicit {
+      path.to_path_buf()
+    } else {
       let xdg = std::env::var("XDG_CONFIG_HOME").ok();
       let home = std::env::var("HOME").ok();
       match default_path(xdg.as_deref(), home.as_deref()) {

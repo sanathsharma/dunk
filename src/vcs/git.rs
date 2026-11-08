@@ -18,7 +18,7 @@ impl Git {
     Self { dir: dir.into() }
   }
 
-  fn command<I, S>(&self, dir: &Path, args: I) -> Result<Output, Error>
+  fn command<I, S>(dir: &Path, args: I) -> Result<Output, Error>
   where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -32,7 +32,7 @@ impl Git {
   }
 
   /// Like `command`, with `input` on the standard input.
-  fn command_with_input<I, S>(&self, dir: &Path, args: I, input: &[u8]) -> Result<Output, Error>
+  fn command_with_input<I, S>(dir: &Path, args: I, input: &[u8]) -> Result<Output, Error>
   where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -48,7 +48,9 @@ impl Git {
     // Dropping the handle closes the pipe so git sees the end of the input.
     // Git can exit before it reads everything, and its stderr then says why,
     // so a failed write is not an error here.
-    let _ = child.stdin.take().expect("stdin is piped").write_all(input);
+    if let Some(mut stdin) = child.stdin.take() {
+      let _ = stdin.write_all(input);
+    }
     Ok(child.wait_with_output()?)
   }
 
@@ -57,7 +59,7 @@ impl Git {
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
   {
-    let out = self.command(&self.dir, args)?;
+    let out = Self::command(&self.dir, args)?;
     if !out.status.success() {
       return Err(git_error(&out));
     }
@@ -73,7 +75,7 @@ impl Git {
   /// The commit to compare the working tree with. An unborn branch has no
   /// HEAD, so it compares with the empty tree.
   fn head(&self) -> Result<String, Error> {
-    let probe = self.command(&self.dir, ["rev-parse", "--verify", "-q", "HEAD"])?;
+    let probe = Self::command(&self.dir, ["rev-parse", "--verify", "-q", "HEAD"])?;
     if probe.status.success() {
       return Ok("HEAD".into());
     }
@@ -131,7 +133,7 @@ impl Git {
     full.extend(args.iter().map(OsStr::new));
     full.push("--".as_ref());
     full.extend(paths.iter().map(|p| p.as_os_str()));
-    let out = self.command(&root, full)?;
+    let out = Self::command(&root, full)?;
     if !out.status.success() {
       return Err(git_error(&out));
     }
@@ -154,7 +156,7 @@ impl Git {
   fn apply_to_index(&self, patch: &[u8]) -> Result<(), Error> {
     let root = self.root()?;
     let args = ["apply", "--cached", "--recount", "--unidiff-zero", "-"];
-    let out = self.command_with_input(&root, args, patch)?;
+    let out = Self::command_with_input(&root, args, patch)?;
     if !out.status.success() {
       return Err(git_error(&out));
     }
@@ -177,7 +179,9 @@ impl Git {
       let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
         continue;
       };
-      let name = path(&entry[tab + 1..]);
+      let Some(name) = entry.get(tab.saturating_add(1)..).map(path) else {
+        continue;
+      };
       if files.iter().any(|f| f.path() == name) {
         continue;
       }
@@ -203,15 +207,13 @@ impl Git {
     };
     let a = if a.is_empty() { "HEAD" } else { a };
     let b = if b.is_empty() { "HEAD" } else { b };
-    match self.run(["merge-base", a, b]) {
-      Ok(out) => Source::Commit(String::from_utf8_lossy(&out).trim().to_string()),
-      Err(_) => old,
-    }
+    self.run(["merge-base", a, b]).map_or(old, |out| {
+      Source::Commit(String::from_utf8_lossy(&out).trim().to_string())
+    })
   }
 
   fn tracked_diff(&self, req: &DiffRequest) -> Result<Vec<FileDiff>, Error> {
-    let mut args: Vec<String> = ["diff"]
-      .into_iter()
+    let mut args: Vec<String> = std::iter::once("diff")
       .chain(DIFF_FLAGS)
       .map(String::from)
       .collect();
@@ -264,7 +266,7 @@ impl Git {
         args.push(context.as_ref());
       }
       args.extend(["--".as_ref(), "/dev/null".as_ref(), OsStr::from_bytes(file)]);
-      let out = self.command(&root, args)?;
+      let out = Self::command(&root, args)?;
       if !matches!(out.status.code(), Some(0 | 1)) {
         return Err(git_error(&out));
       }

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -35,9 +35,9 @@ impl Watch {
           return;
         }
         if event.paths.iter().any(|p| edits_ignore_rules(p)) {
-          *ignored.write().unwrap() = ignored_roots(&base);
+          *ignored.write().unwrap_or_else(PoisonError::into_inner) = ignored_roots(&base);
         }
-        let ignored = ignored.read().unwrap();
+        let ignored = ignored.read().unwrap_or_else(PoisonError::into_inner);
         if event.paths.iter().any(|p| relevant(&base, &ignored, p)) {
           let _ = tx.send(());
         }
@@ -101,10 +101,15 @@ pub fn relevant(root: &Path, ignored: &HashSet<PathBuf>, path: &Path) -> bool {
       _ => None,
     })
     .collect();
-  match parts.iter().position(|p| *p == ".git") {
-    None => !rel.ancestors().any(|dir| ignored.contains(dir)),
-    Some(at) => matches!(&parts[at + 1..], [name] if *name == "index" || *name == "HEAD"),
-  }
+  parts.iter().position(|p| *p == ".git").map_or_else(
+    || !rel.ancestors().any(|dir| ignored.contains(dir)),
+    |at| {
+      matches!(
+        parts.get(at.saturating_add(1)..),
+        Some([name]) if *name == "index" || *name == "HEAD"
+      )
+    },
+  )
 }
 
 /// Turns bursts of signals on `rx` into single calls of `fire`: after a
@@ -114,7 +119,7 @@ pub fn debounce(rx: &Receiver<()>, quiet: Duration, mut fire: impl FnMut() -> bo
   while rx.recv().is_ok() {
     loop {
       match rx.recv_timeout(quiet) {
-        Ok(()) => continue,
+        Ok(()) => {}
         Err(RecvTimeoutError::Timeout) => break,
         Err(RecvTimeoutError::Disconnected) => {
           fire();
