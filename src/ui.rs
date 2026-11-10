@@ -73,12 +73,27 @@ enum Row<'a> {
   Line(&'a DiffLine, Option<&'a Styled>, &'a [Range<usize>], bool),
 }
 
+/// The app name and version at the right of the footer.
+const VERSION_LABEL: &str = concat!(" dunk v", env!("CARGO_PKG_VERSION"), " ");
+
 pub fn render(frame: &mut Frame, app: &mut App) {
   let area = frame.area();
   frame.buffer_mut().set_style(area, app.palette.normal);
   let [main, footer] =
     Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-  frame.render_widget(Paragraph::new(footer_line(app)), footer);
+  let [left, right] = Layout::horizontal([
+    Constraint::Fill(1),
+    Constraint::Length(VERSION_LABEL.len() as u16),
+  ])
+  .areas(footer);
+  frame.render_widget(Paragraph::new(footer_line(app)), left);
+  frame.render_widget(
+    Paragraph::new(Span::styled(
+      VERSION_LABEL,
+      Style::new().fg(Color::DarkGray),
+    )),
+    right,
+  );
   render_main(frame, main, app);
   // The prompt takes every key, so it is drawn whatever is behind it.
   if app.prompt.is_some() {
