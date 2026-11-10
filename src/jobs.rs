@@ -1,8 +1,10 @@
 //! Runs background jobs and routes their results back, dropping the ones a
 //! newer load has made stale.
 
+use crate::args::Scope;
 use crate::diff::FileDiff;
 use crate::highlight::{FileHighlight, Highlighter};
+use crate::restore::RestoreRequest;
 use crate::staging::{Follow, IndexRequest};
 use crate::vcs::{self, DiffRequest, Sides, Vcs};
 use crate::worker::Worker;
@@ -35,6 +37,11 @@ pub enum Done {
   /// A stage or unstage finished. Carries the entry the selection moves to
   /// once the changeset is read again.
   Indexed(Option<Follow>, Result<(), vcs::Error>),
+  /// A restore or nuke finished, wholly or in part. Carries the entry the
+  /// selection moves to once the changeset is read again.
+  Restored(Option<Follow>, Result<(), vcs::Error>),
+  /// The whole working tree changeset, read for a nuke from a narrowed view.
+  Widened(Result<Vec<FileDiff>, vcs::Error>),
   Highlighted {
     load: u64,
     index: usize,
@@ -114,6 +121,34 @@ impl Runner {
     thread::spawn(move || {
       let result = request.run(&*vcs);
       deliver(Done::Indexed(request.follow, result));
+    });
+  }
+
+  /// Whether the view shows only part of the working tree changeset: a
+  /// scope of staged or unstaged changes, with no revision.
+  pub fn narrowed(&self) -> bool {
+    self.request.revisions.is_empty() && self.request.scope != Scope::All
+  }
+
+  /// Reads the changeset with every scope, off the calling thread. The paths
+  /// stay as the view has them.
+  pub fn load_whole(&self) {
+    let request = DiffRequest {
+      scope: Scope::All,
+      ..self.request.clone()
+    };
+    let (vcs, deliver) = (self.vcs.clone(), self.deliver.clone());
+    thread::spawn(move || {
+      deliver(Done::Widened(vcs.changeset(&request)));
+    });
+  }
+
+  /// Throws away changes off the calling thread.
+  pub fn restore(&self, request: RestoreRequest) {
+    let (vcs, deliver) = (self.vcs.clone(), self.deliver.clone());
+    thread::spawn(move || {
+      let result = vcs.restore(&request.files(), request.kind);
+      deliver(Done::Restored(request.follow, result));
     });
   }
 
@@ -427,5 +462,114 @@ mod tests {
       rx.recv_timeout(std::time::Duration::from_millis(100))
         .is_err()
     );
+  }
+
+  /// `a` and `b` unstaged and `c` staged.
+  fn three() -> Arc<Memory> {
+    Arc::new(
+      Memory::default()
+        .commit("a", "1\n")
+        .commit("b", "1\n")
+        .commit("c", "1\n")
+        .edit("a", "2\n")
+        .edit("b", "2\n")
+        .edit("c", "2\n")
+        .staged("c"),
+    )
+  }
+
+  fn runner_with(vcs: Arc<Memory>, request: DiffRequest) -> (Runner, mpsc::Receiver<Done>) {
+    let (tx, rx) = mpsc::channel();
+    let deliver: Deliver = Arc::new(move |done| tx.send(done).is_ok());
+    (Runner::new(vcs, request, None, deliver), rx)
+  }
+
+  fn scoped(scope: Scope) -> DiffRequest {
+    DiffRequest {
+      scope,
+      ..DiffRequest::default()
+    }
+  }
+
+  #[test]
+  fn a_restore_runs_off_the_calling_thread_and_delivers_the_follow_target() {
+    let vcs = three();
+    let (mut runner, rx) = runner_with(vcs.clone(), DiffRequest::default());
+    let files = show(&mut runner, &rx);
+    let at = files
+      .iter()
+      .position(|f| f.path() == std::path::Path::new("a"))
+      .unwrap();
+    let request = crate::restore::restore_file(&files, at).unwrap();
+    let follow = request.follow.clone();
+    assert!(follow.is_some());
+    runner.restore(request);
+    let Some(Done::Restored(delivered, result)) = runner.accept(rx.recv().unwrap()) else {
+      panic!("a restore result is never stale");
+    };
+    result.unwrap();
+    assert_eq!(delivered, follow);
+    let after = vcs.changeset(&DiffRequest::default()).unwrap();
+    assert!(after.iter().all(|f| f.path() != std::path::Path::new("a")));
+  }
+
+  #[test]
+  fn a_restore_that_finishes_after_a_newer_load_started_is_still_taken() {
+    let (mut runner, rx) = runner_with(three(), DiffRequest::default());
+    let files = show(&mut runner, &rx);
+    runner.restore(crate::restore::nuke_all(&files).unwrap());
+    runner.load();
+    // The load and the restore race, so take messages until the restore.
+    let restored = loop {
+      let done = rx.recv().unwrap();
+      if matches!(done, Done::Restored(..)) {
+        break done;
+      }
+    };
+    assert!(matches!(
+      runner.accept(restored),
+      Some(Done::Restored(None, Ok(())))
+    ));
+  }
+
+  #[test]
+  fn a_narrowed_view_is_a_working_tree_scope_without_revisions() {
+    let narrowed = |request: DiffRequest| runner_with(three(), request).0.narrowed();
+    assert!(!narrowed(DiffRequest::default()));
+    assert!(narrowed(scoped(Scope::Staged)));
+    assert!(narrowed(scoped(Scope::Unstaged)));
+    let revision = DiffRequest {
+      scope: Scope::Staged,
+      revisions: vec!["HEAD".into()],
+      ..DiffRequest::default()
+    };
+    assert!(!narrowed(revision));
+  }
+
+  #[test]
+  fn load_whole_reads_every_scope_and_keeps_the_paths() {
+    let (mut runner, rx) = runner_with(three(), scoped(Scope::Staged));
+    runner.load_whole();
+    let Some(Done::Widened(result)) = runner.accept(rx.recv().unwrap()) else {
+      panic!("a widened read is never stale");
+    };
+    assert_eq!(result.unwrap().len(), 3);
+
+    let limited = DiffRequest {
+      scope: Scope::Staged,
+      paths: vec!["a".into()],
+      ..DiffRequest::default()
+    };
+    let (runner, rx) = runner_with(three(), limited);
+    runner.load_whole();
+    let Done::Widened(result) = rx.recv().unwrap() else {
+      panic!("expected the widened read");
+    };
+    let names: Vec<_> = result
+      .unwrap()
+      .iter()
+      .map(|f| f.path().display().to_string())
+      .collect();
+    assert_eq!(names, ["a"]);
   }
 }

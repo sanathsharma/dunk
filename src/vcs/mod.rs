@@ -9,6 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::path::PathBuf;
 
 pub use git::Git;
 #[cfg(test)]
@@ -19,6 +20,12 @@ pub enum Error {
   Io(io::Error),
   Git(String),
   Parse(String),
+  /// A restore that went on past files it could not restore.
+  Restore {
+    done: usize,
+    total: usize,
+    failed: Vec<(PathBuf, String)>,
+  },
 }
 
 impl fmt::Display for Error {
@@ -27,6 +34,24 @@ impl fmt::Display for Error {
       Self::Io(e) => write!(f, "failed to run git: {e}"),
       Self::Git(msg) => write!(f, "{msg}"),
       Self::Parse(msg) => write!(f, "unexpected git output: {msg}"),
+      Self::Restore {
+        done,
+        total,
+        failed,
+      } => {
+        write!(
+          f,
+          "Restored {done} of {total} files, {} failed: ",
+          failed.len()
+        )?;
+        for (i, (path, why)) in failed.iter().enumerate() {
+          if i > 0 {
+            f.write_str(", ")?;
+          }
+          write!(f, "{} ({why})", path.display())?;
+        }
+        Ok(())
+      }
     }
   }
 }
@@ -100,6 +125,16 @@ pub enum Target {
   All(Vec<FileDiff>),
 }
 
+/// What a restore does to its files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+  /// Throws away the working-tree changes of unstaged entries.
+  Restore,
+  /// Returns files to `HEAD`: staged and unstaged changes both go, and
+  /// untracked files are deleted.
+  Nuke,
+}
+
 pub trait Vcs {
   fn diff(&self, request: &DiffRequest) -> Result<Vec<FileDiff>, Error>;
 
@@ -131,6 +166,10 @@ pub trait Vcs {
   /// is true, otherwise unstaging it and keeping the working tree. An
   /// untracked file can be staged by hunk or by line.
   fn update_index(&self, file: &FileDiff, target: &Target, stage: bool) -> Result<(), Error>;
+
+  /// Throws away changes as `kind` says, for each of `files`. Keeps going
+  /// past a file that fails and reports the failures together.
+  fn restore(&self, files: &[FileDiff], kind: Kind) -> Result<(), Error>;
 
   /// Reads both versions of `file` as `request` compared them.
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;

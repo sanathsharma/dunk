@@ -3,11 +3,13 @@ use crate::args::{Border, Layout as DiffLayout};
 use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind, Section};
 use crate::highlight::{FileHighlight, Styled};
 use crate::palette::Palette;
+use crate::restore::Prompt;
 use crate::split::pairs;
+use crate::vcs::Kind;
 use crate::words::changed_words;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 use std::borrow::Cow;
@@ -35,6 +37,11 @@ const HELP_MENU: &[(&str, &str)] = &[
     "A",
     "stage all files, or unstage all when none is left to stage",
   ),
+  (
+    "r",
+    "restore the file: discard its unstaged changes, after typing restore",
+  ),
+  ("x", "nuke: every file back to HEAD, after typing nuke"),
   (",/.", "first, last file"),
   ("?", "open this help"),
   ("q, esc", "quit"),
@@ -72,7 +79,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
   let [main, footer] =
     Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
   frame.render_widget(Paragraph::new(footer_line(app)), footer);
+  render_main(frame, main, app);
+  // The prompt takes every key, so it is drawn whatever is behind it.
+  if app.prompt.is_some() {
+    render_prompt(frame, main, app);
+  }
+}
 
+fn render_main(frame: &mut Frame, main: Rect, app: &mut App) {
   if let Load::Failed(message) = &app.load {
     let text = Paragraph::new(format!("Error: {message}")).style(Style::new().fg(Color::Red));
     frame.render_widget(text, main);
@@ -136,9 +150,105 @@ fn render_help(frame: &mut Frame, area: Rect, app: &App) {
   );
 }
 
+/// The lines of the confirmation: what is lost per file, the warning and the
+/// input. At most `room` rows are left for files, with the last one saying
+/// how many more there are when they do not all fit.
+fn prompt_lines(prompt: &Prompt, room: usize) -> Vec<Line<'static>> {
+  let entries = &prompt.request().entries;
+  let (shown, hidden) = if entries.len() <= room {
+    (entries.len(), 0)
+  } else {
+    let shown = room.saturating_sub(1);
+    (shown, entries.len().saturating_sub(shown))
+  };
+  let mut lines = Vec::new();
+  if prompt.narrowed() {
+    lines.push(Line::from(
+      " The view is narrowed, but a nuke covers every file.",
+    ));
+    lines.push(Line::from(""));
+  }
+  for entry in entries.iter().take(shown) {
+    lines.push(Line::from(format!(
+      " {}  ({})",
+      entry.file.path().display(),
+      entry.loss.label()
+    )));
+  }
+  if hidden > 0 {
+    lines.push(Line::from(format!(" … and {hidden} more")));
+  }
+  lines.push(Line::from(""));
+  lines.push(Line::from(" This cannot be undone."));
+  lines.push(Line::from(vec![
+    Span::raw(" Type "),
+    Span::styled(prompt.word(), Style::new().add_modifier(Modifier::BOLD)),
+    Span::raw(" to confirm, esc to cancel."),
+  ]));
+  lines.push(Line::from(format!(" > {}", prompt.input())));
+  lines
+}
+
+/// Rows of the confirmation that are not files: the warning, the instruction,
+/// the input, the blank line before them and the narrowed note with its blank.
+const fn prompt_fixed_rows(narrowed: bool) -> usize {
+  if narrowed { 6 } else { 4 }
+}
+
+fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
+  let Some(prompt) = &app.prompt else {
+    return;
+  };
+  let count = prompt.request().entries.len();
+  let verb = match prompt.request().kind {
+    Kind::Restore => "Restore",
+    Kind::Nuke => "Nuke",
+  };
+  let noun = if count == 1 { "file" } else { "files" };
+  let title = format!(" {verb} {count} {noun} ");
+  // Two rows go to the borders.
+  let room = usize::from(area.height)
+    .saturating_sub(2)
+    .saturating_sub(prompt_fixed_rows(prompt.narrowed()));
+  let lines = prompt_lines(prompt, room);
+  let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+  let width = widest
+    .saturating_add(3)
+    .max(title.chars().count().saturating_add(2))
+    .min(usize::from(area.width));
+  let width = u16::try_from(width).unwrap_or(u16::MAX);
+  let height = u16::try_from(lines.len())
+    .unwrap_or(u16::MAX)
+    .saturating_add(2)
+    .min(area.height);
+  let [_, row, _] = Layout::vertical([
+    Constraint::Fill(1),
+    Constraint::Length(height),
+    Constraint::Fill(1),
+  ])
+  .areas(area);
+  let [_, popup, _] = Layout::horizontal([
+    Constraint::Fill(1),
+    Constraint::Length(width),
+    Constraint::Fill(1),
+  ])
+  .areas(row);
+  frame.render_widget(Clear, popup);
+  let block = Block::bordered()
+    .border_type(border_type(app.border))
+    .border_style(app.palette.border)
+    .title_style(app.palette.border)
+    .title(title);
+  frame.render_widget(
+    Paragraph::new(lines).block(block).style(app.palette.normal),
+    popup,
+  );
+}
+
 /// The mode at the left, then the notice or the key help.
 fn footer_line(app: &App) -> Line<'static> {
   let style = match app.mode {
+    _ if app.prompt.is_some() => app.palette.mode_restore,
     Mode::Normal => app.palette.mode_normal,
     Mode::Visual => app.palette.mode_visual,
   };
@@ -857,6 +967,17 @@ new file mode 100644
   }
 
   #[test]
+  fn the_help_menu_lists_restore_and_nuke() {
+    let mut app = app_with(DIFF);
+    app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    let (_, rows) = draw(&mut app, 110, 30);
+    let (_, restore) = row_with(&rows, "discard its unstaged changes");
+    assert!(restore.contains(" r "), "{restore}");
+    let (_, nuke) = row_with(&rows, "back to HEAD");
+    assert!(nuke.contains(" x "), "{nuke}");
+  }
+
+  #[test]
   fn the_footer_shows_the_mode_at_the_left_and_notices_beside_it() {
     let mut app = app_with(DIFF);
     let (_, rows) = draw(&mut app, 100, 8);
@@ -985,6 +1106,160 @@ new file mode 100644
     let mut app = App::default();
     app.on_loaded(Ok(entries));
     app
+  }
+
+  /// An app listing one entry per `(name, section)`, all with the diff of
+  /// the first file of `DIFF`.
+  fn named_app(entries: &[(&str, Section)]) -> App {
+    let template = parse(DIFF.as_bytes()).unwrap().remove(0);
+    let files = entries
+      .iter()
+      .map(|&(name, section)| FileDiff {
+        old_path: Some(name.into()),
+        new_path: Some(name.into()),
+        section: Some(section),
+        ..template.clone()
+      })
+      .collect();
+    let mut app = App::default();
+    app.on_loaded(Ok(files));
+    app
+  }
+
+  fn press(app: &mut App, keys: &str) {
+    for c in keys.chars() {
+      app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+  }
+
+  #[test]
+  fn the_restore_prompt_names_the_file_what_it_loses_and_the_word_to_type() {
+    let mut app = named_app(&[("src/lib.rs", Section::Unstaged)]);
+    press(&mut app, "r");
+    let (_, rows) = draw(&mut app, 100, 24);
+    row_with(&rows, "Restore 1 file");
+    assert!(
+      rows
+        .iter()
+        .any(|r| r.contains("src/lib.rs") && r.contains("(unstaged)")),
+      "{rows:#?}"
+    );
+    row_with(&rows, "This cannot be undone");
+    row_with(&rows, "Type restore to confirm");
+    assert!(rows[23].starts_with("\" RESTORE "), "{}", rows[23]);
+  }
+
+  #[test]
+  fn the_nuke_prompt_lists_every_file_sorted_with_its_loss() {
+    let mut app = named_app(&[("b.rs", Section::Staged), ("a.rs", Section::Unstaged)]);
+    press(&mut app, "x");
+    let (_, rows) = draw(&mut app, 100, 24);
+    row_with(&rows, "Nuke 2 files");
+    row_with(&rows, "Type nuke to confirm");
+    let at = |name: &str, label: &str| {
+      rows
+        .iter()
+        .position(|r| r.contains(name) && r.contains(label))
+        .unwrap_or_else(|| panic!("no row with {name} and {label} in {rows:#?}"))
+    };
+    assert!(at("a.rs", "(unstaged)") < at("b.rs", "(staged)"));
+  }
+
+  #[test]
+  fn only_the_word_to_type_is_bold() {
+    for (keys, word) in [("r", "restore"), ("x", "nuke")] {
+      let mut app = named_app(&[("a.rs", Section::Unstaged)]);
+      press(&mut app, keys);
+      let (terminal, rows) = draw(&mut app, 100, 24);
+      let (y, row) = row_with(&rows, &format!("Type {word} to confirm"));
+      // The test backend puts a quote before each row.
+      let start = col_of(row, word) - 1;
+      let buffer = terminal.backend().buffer();
+      let bold = |x: u16| buffer[(x, col(y))].modifier.contains(Modifier::BOLD);
+      let len = col(word.chars().count());
+      for x in start..start + len {
+        assert!(bold(x), "{word}: column {x} is not bold in {row}");
+      }
+      assert!(!bold(start - 1), "the space before {word} is bold");
+      assert!(!bold(start + len), "the space after {word} is bold");
+      assert!(!bold(start - 5), "'Type' is bold");
+    }
+  }
+
+  #[test]
+  fn typed_input_shows_after_the_prompt_arrow() {
+    let mut app = named_app(&[("a.rs", Section::Unstaged)]);
+    // The first `r` opens the prompt, the rest is typed into it.
+    press(&mut app, "rrest");
+    let (_, rows) = draw(&mut app, 100, 24);
+    assert!(rows.iter().any(|r| r.contains("> rest")), "{rows:#?}");
+  }
+
+  #[test]
+  fn a_long_list_is_cut_to_the_room_and_the_input_stays_in_view() {
+    let names: Vec<String> = (1..=10).map(|n| format!("f{n:02}.rs")).collect();
+    let entries: Vec<(&str, Section)> = names
+      .iter()
+      .map(|n| (n.as_str(), Section::Unstaged))
+      .collect();
+    let mut app = named_app(&entries);
+    press(&mut app, "x");
+    // 15 rows less the footer, two borders and four fixed rows leave eight
+    // for files.
+    let (_, rows) = draw(&mut app, 100, 15);
+    row_with(&rows, "Nuke 10 files");
+    row_with(&rows, "… and 3 more");
+    let listed = rows.iter().filter(|r| r.contains("(unstaged)")).count();
+    assert_eq!(listed, 7, "{rows:#?}");
+    row_with(&rows, "> ");
+  }
+
+  #[test]
+  fn every_file_is_listed_when_the_room_is_exactly_enough() {
+    let names: Vec<String> = (1..=8).map(|n| format!("f{n:02}.rs")).collect();
+    let entries: Vec<(&str, Section)> = names
+      .iter()
+      .map(|n| (n.as_str(), Section::Unstaged))
+      .collect();
+    let mut app = named_app(&entries);
+    press(&mut app, "x");
+    let (_, rows) = draw(&mut app, 100, 15);
+    assert!(!rows.iter().any(|r| r.contains("more")), "{rows:#?}");
+    assert_eq!(rows.iter().filter(|r| r.contains("(unstaged)")).count(), 8);
+  }
+
+  #[test]
+  fn a_narrowed_view_says_the_nuke_covers_more_and_still_fits() {
+    let mut app = named_app(&[("a.rs", Section::Staged)]);
+    let request = crate::restore::nuke_all(&app.files).unwrap();
+    app.prompt = Some(Prompt::new(request).narrowed_view());
+    let (_, rows) = draw(&mut app, 100, 12);
+    row_with(&rows, "The view is narrowed");
+    row_with(&rows, "> ");
+  }
+
+  #[test]
+  fn the_prompt_is_drawn_even_when_the_changeset_became_empty() {
+    let mut app = named_app(&[("a.rs", Section::Unstaged)]);
+    press(&mut app, "r");
+    app.on_loaded(Ok(Vec::new()));
+    assert!(app.files.is_empty());
+    let (_, rows) = draw(&mut app, 100, 24);
+    row_with(&rows, "Restore 1 file");
+  }
+
+  #[test]
+  fn the_prompt_survives_a_tiny_terminal() {
+    let names: Vec<String> = (1..=5).map(|n| format!("f{n}.rs")).collect();
+    let entries: Vec<(&str, Section)> = names
+      .iter()
+      .map(|n| (n.as_str(), Section::Unstaged))
+      .collect();
+    for (width, height) in [(30, 6), (12, 3), (5, 2), (1, 1)] {
+      let mut app = named_app(&entries);
+      press(&mut app, "x");
+      draw(&mut app, width, height);
+    }
   }
 
   #[test]
@@ -1187,6 +1462,22 @@ new file mode 100644
     app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
     let (terminal, _) = draw(&mut app, 100, 14);
     assert_eq!(terminal.backend().buffer()[(1, 13)].fg, Color::Rgb(8, 8, 8));
+  }
+
+  #[test]
+  fn the_footer_label_takes_the_restore_group_while_a_prompt_is_open() {
+    let mut app = named_app(&[("a.rs", Section::Unstaged)]);
+    app.palette.mode_normal = Style::new().fg(Color::Rgb(7, 7, 7));
+    app.palette.mode_restore = Style::new().fg(Color::Rgb(9, 9, 9));
+    let (terminal, _) = draw(&mut app, 100, 14);
+    assert_eq!(terminal.backend().buffer()[(1, 13)].fg, Color::Rgb(7, 7, 7));
+    press(&mut app, "r");
+    let (terminal, rows) = draw(&mut app, 100, 14);
+    assert!(rows[13].starts_with("\" RESTORE "), "{}", rows[13]);
+    assert_eq!(terminal.backend().buffer()[(1, 13)].fg, Color::Rgb(9, 9, 9));
+    app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let (terminal, _) = draw(&mut app, 100, 14);
+    assert_eq!(terminal.backend().buffer()[(1, 13)].fg, Color::Rgb(7, 7, 7));
   }
 
   #[test]

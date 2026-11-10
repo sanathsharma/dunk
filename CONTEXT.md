@@ -67,3 +67,11 @@ _Avoid_: selected row (selection and section already use "select")
 
 **Hunk bar**:
 The one-cell bar beside the hunk under the cursor. It is white for an unstaged hunk and blue for a staged one. A hunk in a revision's diff is already committed, so its bar is blue.
+
+**Restore**:
+Throwing away the working-tree changes of one unstaged entry so the file matches the index again. An untracked file has no index version, so restoring it deletes the file. A conflicted file gets its conflict markers back and stays conflicted. It never changes the index and cannot be undone. A staged entry is never restored, and a revision's changeset, being read-only, cannot be either.
+_Avoid_: discard, revert, reset, checkout
+
+**Nuke**:
+Returning every entry of the changeset to `HEAD`, whatever its section: unstaged changes, staged changes and untracked files, which are deleted. A conflicted file is resolved to its `HEAD` version. Ignored files stay. Scope does not narrow it. It cannot be undone. Both restore and nuke ask the user to type a confirmation word first, after listing the files affected.
+_Avoid_: restore all, discard all, reset hard

@@ -6,6 +6,7 @@ use crate::highlight::FileHighlight;
 use crate::highlight::Highlighter;
 use crate::jobs::{Deliver, Done, Rehighlight, Runner};
 use crate::palette::Palette;
+use crate::restore::{self, Prompt};
 use crate::split;
 use crate::staging::{self, Follow, IndexRequest, Refusal};
 use crate::ui;
@@ -89,6 +90,9 @@ pub struct App {
   pub mode: Mode,
   /// Whether the help menu covers the diff. It takes every key until closed.
   pub help: bool,
+  /// The confirmation a restore or nuke waits behind. It takes every key
+  /// until closed.
+  pub prompt: Option<Prompt>,
   pub load: Load,
   /// The files as shown, with any added context.
   pub files: Arc<Vec<FileDiff>>,
@@ -148,6 +152,7 @@ impl Default for App {
     Self {
       mode: Mode::Normal,
       help: false,
+      prompt: None,
       load: Load::Loading,
       files: Arc::new(Vec::new()),
       loaded: Arc::new(Vec::new()),
@@ -393,6 +398,16 @@ impl App {
           self.reload();
         }
       }
+      Done::Restored(follow, result) => {
+        // A restore that failed in part still changed the tree, so the
+        // changeset is read again either way.
+        self.follow = follow;
+        if let Err(e) = result {
+          self.notice = Some(e.to_string());
+        }
+        self.reload();
+      }
+      Done::Widened(result) => self.on_widened(result),
       Done::Highlighted {
         index, highlight, ..
       } => self.on_highlighted(index, highlight),
@@ -451,6 +466,68 @@ impl App {
         self.notice = Some(e.to_string());
         false
       }
+    }
+  }
+
+  /// Opens the confirmation to restore the selected file, or shows why it
+  /// cannot.
+  fn open_restore(&mut self) {
+    match restore::restore_file(&self.files, self.selected) {
+      Ok(request) => self.prompt = Some(Prompt::new(request)),
+      Err(refusal) => self.notice = refusal.notice().map(Into::into),
+    }
+  }
+
+  /// Opens the confirmation to return every file to `HEAD`, or shows why it
+  /// cannot.
+  fn open_nuke(&mut self) {
+    // A narrowed view lists less than a nuke covers, so read the rest first.
+    if let Some(jobs) = &self.jobs
+      && jobs.narrowed()
+    {
+      jobs.load_whole();
+      return;
+    }
+    match restore::nuke_all(&self.files) {
+      Ok(request) => self.prompt = Some(Prompt::new(request)),
+      Err(refusal) => self.notice = refusal.notice().map(Into::into),
+    }
+  }
+
+  /// Opens the nuke confirmation from the whole changeset, which a narrowed
+  /// view had to read. Does nothing when another confirmation opened first.
+  fn on_widened(&mut self, result: Result<Vec<FileDiff>, vcs::Error>) {
+    if self.prompt.is_some() {
+      return;
+    }
+    match result.map(|files| restore::nuke_all(&files)) {
+      Ok(Ok(request)) => self.prompt = Some(Prompt::new(request).narrowed_view()),
+      Ok(Err(refusal)) => self.notice = refusal.notice().map(Into::into),
+      Err(e) => self.notice = Some(e.to_string()),
+    }
+  }
+
+  /// Takes a key for the confirmation. Escape closes it and `Ctrl-c` quits.
+  fn on_prompt_key(&mut self, key: KeyEvent) {
+    let Some(prompt) = &mut self.prompt else {
+      return;
+    };
+    let typing = !key
+      .modifiers
+      .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+      KeyCode::Esc => self.prompt = None,
+      KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+      KeyCode::Char(c) if typing => prompt.push(c),
+      KeyCode::Backspace => prompt.pop(),
+      KeyCode::Enter if prompt.confirmed() => {
+        if let Some(prompt) = self.prompt.take()
+          && let Some(jobs) = &self.jobs
+        {
+          jobs.restore(prompt.into_request());
+        }
+      }
+      _ => {}
     }
   }
 
@@ -526,6 +603,9 @@ impl App {
 
   /// The mode for the footer, with the size of the selection in visual mode.
   pub fn mode_label(&self) -> String {
+    if self.prompt.is_some() {
+      return "RESTORE".into();
+    }
     match self.mode {
       Mode::Normal => self.mode.label().to_string(),
       Mode::Visual => {
@@ -587,6 +667,7 @@ impl App {
       KeyCode::Char('l') | KeyCode::Right => self.pan_by(PAN_STEP),
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('a') => self.stage_selection(),
+      KeyCode::Char('r' | 'x') => self.notice = Some("Leave visual mode first".into()),
       KeyCode::Char('?') => self.help = true,
       _ => {}
     }
@@ -597,6 +678,9 @@ impl App {
       return;
     }
     self.notice = None;
+    if self.prompt.is_some() {
+      return self.on_prompt_key(key);
+    }
     if self.help {
       match key.code {
         KeyCode::Esc | KeyCode::Char('q' | '?') => self.help = false,
@@ -636,6 +720,8 @@ impl App {
       KeyCode::Char('=') => self.change_context(Step::Reset),
       KeyCode::Char('f') => self.toggle_stage(),
       KeyCode::Char('A') => self.toggle_stage_all(),
+      KeyCode::Char('r') => self.open_restore(),
+      KeyCode::Char('x') => self.open_nuke(),
       KeyCode::Char(',') => self.select(0),
       KeyCode::Char('.') => self.select(self.files.len().saturating_sub(1)),
       KeyCode::Char('a') => {
@@ -2250,6 +2336,239 @@ mod tests {
     assert_eq!(app.selected, app.files.len() - 1);
     app.on_key(key(KeyCode::Char(',')));
     assert_eq!(app.selected, 0);
+  }
+
+  fn press_all(app: &mut App, keys: &str) {
+    for c in keys.chars() {
+      app.on_key(key(KeyCode::Char(c)));
+    }
+  }
+
+  #[test]
+  fn r_opens_a_prompt_for_the_selected_file_and_esc_closes_it() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('r')));
+    let prompt = app.prompt.as_ref().unwrap();
+    assert_eq!(prompt.word(), "restore");
+    assert_eq!(prompt.request().entries.len(), 1);
+    assert_eq!(app.mode_label(), "RESTORE");
+
+    // The prompt takes every key, so `q` does not quit.
+    app.on_key(key(KeyCode::Char('q')));
+    assert!(!app.quit);
+    app.on_key(key(KeyCode::Esc));
+    assert!(app.prompt.is_none());
+    assert!(!app.quit);
+    assert_eq!(app.mode_label(), "NORMAL");
+  }
+
+  #[test]
+  fn typing_restore_and_enter_restores_the_file_and_follows_its_neighbour() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "restore");
+    app.on_key(key(KeyCode::Enter));
+    assert!(app.prompt.is_none());
+    finish_index(&mut app, &git);
+    let unstaged: Vec<_> = app
+      .files
+      .iter()
+      .filter(|f| f.section == Some(Section::Unstaged))
+      .map(|f| f.path().display().to_string())
+      .collect();
+    assert_eq!(unstaged, ["b"]);
+    assert_eq!(selected_name(&app), ("b".into(), Some(Section::Unstaged)));
+    assert_eq!(app.notice, None);
+  }
+
+  #[test]
+  fn a_wrong_word_or_the_wrong_case_leaves_the_prompt_open_and_runs_nothing() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    for typed in ["restor", "Restore", "restore ", "nuke", ""] {
+      app.on_key(key(KeyCode::Char('r')));
+      if app.prompt.is_none() {
+        app.on_key(key(KeyCode::Char('r')));
+      }
+      press_all(&mut app, typed);
+      app.on_key(key(KeyCode::Enter));
+      assert!(app.prompt.is_some(), "{typed:?} closed the prompt");
+      assert!(quiet(&git.rx), "{typed:?} ran a job");
+      app.on_key(key(KeyCode::Esc));
+    }
+  }
+
+  #[test]
+  fn backspace_fixes_a_typo_before_enter() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "restorex");
+    app.on_key(key(KeyCode::Backspace));
+    app.on_key(key(KeyCode::Enter));
+    assert!(app.prompt.is_none());
+    finish_index(&mut app, &git);
+    assert_eq!(app.notice, None);
+  }
+
+  #[test]
+  fn ctrl_c_in_the_prompt_quits_and_other_control_keys_type_nothing() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('r')));
+    app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(app.prompt.as_ref().unwrap().input(), "");
+    assert!(!app.quit);
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.quit);
+  }
+
+  #[test]
+  fn r_is_refused_with_a_notice_and_opens_no_prompt() {
+    // A staged entry.
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.select(
+      app
+        .files
+        .iter()
+        .position(|f| f.section == Some(Section::Staged))
+        .unwrap(),
+    );
+    app.on_key(key(KeyCode::Char('r')));
+    assert!(app.prompt.is_none());
+    assert_eq!(
+      app.notice.as_deref(),
+      Some("Staged: unstage with f before restoring")
+    );
+
+    // A revision's changeset.
+    let mut app = ready(vec![file_in("a", None)], 5);
+    app.on_key(key(KeyCode::Char('r')));
+    assert!(app.prompt.is_none());
+    assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
+
+    // Nothing listed.
+    let mut app = ready(Vec::new(), 5);
+    app.on_key(key(KeyCode::Char('r')));
+    assert!(app.prompt.is_none());
+    assert_eq!(app.notice.as_deref(), Some("Nothing to restore"));
+  }
+
+  #[test]
+  fn r_in_visual_mode_only_shows_a_notice() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('v')));
+    app.on_key(key(KeyCode::Char('r')));
+    assert!(app.prompt.is_none());
+    assert_eq!(app.mode, Mode::Visual);
+    assert_eq!(app.notice.as_deref(), Some("Leave visual mode first"));
+  }
+
+  #[test]
+  fn x_opens_a_nuke_prompt_for_every_file_and_nuke_clears_the_changeset() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('x')));
+    let prompt = app.prompt.as_ref().unwrap();
+    assert_eq!(prompt.word(), "nuke");
+    assert_eq!(prompt.request().entries.len(), 3);
+    assert!(!prompt.narrowed());
+    assert_eq!(app.mode_label(), "RESTORE");
+
+    press_all(&mut app, "nuke");
+    app.on_key(key(KeyCode::Enter));
+    finish_index(&mut app, &git);
+    assert!(app.files.is_empty());
+    assert!(!app.quit);
+    assert_eq!(git.index_text("c"), Some("1\n".into()));
+  }
+
+  /// Like `rig`, for a view limited to `scope`.
+  fn rig_scoped(app: &mut App, vcs: crate::vcs::Memory, scope: crate::args::Scope) -> Rig {
+    let git = Arc::new(vcs);
+    let (tx, rx) = mpsc::channel();
+    let deliver: Deliver = Arc::new(move |done| tx.send(done).is_ok());
+    let request = DiffRequest {
+      scope,
+      ..DiffRequest::default()
+    };
+    app.jobs = Some(Runner::new(git.clone(), request, None, deliver));
+    Rig { git, rx }
+  }
+
+  #[test]
+  fn x_in_a_narrowed_view_nukes_the_whole_changeset_and_says_so() {
+    for scope in [crate::args::Scope::Staged, crate::args::Scope::Unstaged] {
+      let mut app = App::default();
+      let git = rig_scoped(&mut app, stage_memory(), scope);
+      load(&mut app, &git);
+      assert!(app.files.len() < 3);
+      app.on_key(key(KeyCode::Char('x')));
+      settle(&mut app, &git.rx);
+      let prompt = app.prompt.as_ref().unwrap();
+      assert_eq!(prompt.request().entries.len(), 3, "{scope:?}");
+      assert!(prompt.narrowed(), "{scope:?}");
+    }
+  }
+
+  #[test]
+  fn a_reload_keeps_the_prompt_open_and_the_captured_file_is_the_one_restored() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rest");
+
+    // The watcher sees a save and reads the changeset again.
+    git.save("b", "3\n");
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('n')));
+    assert!(app.prompt.is_some(), "the reload closed the prompt");
+    assert_eq!(app.prompt.as_ref().unwrap().input(), "restn");
+    app.on_key(key(KeyCode::Backspace));
+    press_all(&mut app, "ore");
+    app.on_key(key(KeyCode::Enter));
+    finish_index(&mut app, &git);
+
+    let unstaged: Vec<_> = app
+      .files
+      .iter()
+      .filter(|f| f.section == Some(Section::Unstaged))
+      .map(|f| f.path().display().to_string())
+      .collect();
+    assert_eq!(unstaged, ["b"], "only the captured file a was restored");
+  }
+
+  #[test]
+  fn a_partly_failed_restore_shows_its_summary_and_still_reloads() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    let failure = vcs::Error::Restore {
+      done: 11,
+      total: 12,
+      failed: vec![("src/foo.rs".into(), "permission denied".into())],
+    };
+    app.on_job(Done::Restored(None, Err(failure)));
+    assert_eq!(
+      app.notice.as_deref(),
+      Some("Restored 11 of 12 files, 1 failed: src/foo.rs (permission denied)")
+    );
+    // The changeset is read again, and the notice stays until the next key.
+    settle(&mut app, &git.rx);
+    assert!(app.notice.is_some());
   }
 
   /// Presses `f` and runs what it asked for, as the event loop does.

@@ -12,6 +12,7 @@ pub struct Palette {
   pub section_label: Style,
   pub mode_normal: Style,
   pub mode_visual: Style,
+  pub mode_restore: Style,
   pub diff_add: Style,
   pub diff_delete: Style,
   pub diff_add_text: Style,
@@ -35,6 +36,10 @@ impl Default for Palette {
       section_label: Style::new().add_modifier(Modifier::BOLD),
       mode_normal: mode,
       mode_visual: mode,
+      // Red stands out while a restore or nuke waits for confirmation.
+      mode_restore: Style::new()
+        .fg(Color::Red)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED),
       diff_add: Style::new().bg(Color::Green),
       diff_delete: Style::new().bg(Color::Red),
       diff_add_text: Style::new().bg(Color::LightGreen),
@@ -70,6 +75,8 @@ pub struct Highlights {
   mode_normal: Option<Spec>,
   #[serde(rename = "ModeVisual")]
   mode_visual: Option<Spec>,
+  #[serde(rename = "ModeRestore")]
+  mode_restore: Option<Spec>,
   #[serde(rename = "DiffAdd")]
   diff_add: Option<Spec>,
   #[serde(rename = "DiffDelete")]
@@ -213,6 +220,7 @@ impl Highlights {
       ),
       ("ModeNormal", &self.mode_normal, &mut palette.mode_normal),
       ("ModeVisual", &self.mode_visual, &mut palette.mode_visual),
+      ("ModeRestore", &self.mode_restore, &mut palette.mode_restore),
       ("DiffAdd", &self.diff_add, &mut palette.diff_add),
       ("DiffDelete", &self.diff_delete, &mut palette.diff_delete),
       (
@@ -334,6 +342,7 @@ mod tests {
       "SectionLabel",
       "ModeNormal",
       "ModeVisual",
+      "ModeRestore",
       "DiffAdd",
       "DiffDelete",
       "DiffAddText",
@@ -347,6 +356,22 @@ mod tests {
     ] {
       assert!(err.contains(group), "{group} missing from {err}");
     }
+  }
+
+  #[test]
+  fn the_restore_mode_label_is_red_by_default_and_can_be_restyled() {
+    let danger = Style::new()
+      .fg(Color::Red)
+      .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    assert_eq!(Palette::default().mode_restore, danger);
+    let p = palette("ModeRestore = { fg = \"#f38ba8\", bold = true }").unwrap();
+    assert_eq!(
+      p.mode_restore,
+      Style::new()
+        .fg(Color::Rgb(0xf3, 0x8b, 0xa8))
+        .add_modifier(Modifier::BOLD)
+    );
+    assert_eq!(p.mode_normal, Palette::default().mode_normal);
   }
 
   #[test]

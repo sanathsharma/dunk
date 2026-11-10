@@ -78,11 +78,21 @@ Press `?` in dunk for the same list.
 | `a` | Stage or unstage the hunk under the cursor, or the selection in visual mode |
 | `f` | Stage or unstage the whole file |
 | `A` | Stage every unstaged file, or unstage every staged file when none is left to stage |
+| `r` | Restore the file under the cursor: discard its unstaged changes. Asks you to type `restore` first. |
+| `x` | Nuke: return every file to `HEAD`, staged and unstaged. Asks you to type `nuke` first. |
 | `e` | Open the cursor's line in `$VISUAL` or `$EDITOR` |
 | `?` | Open the help menu |
 | `q`, `Esc`, `Ctrl-c` | Quit |
 
-The footer shows the current mode, normal or visual.
+The footer shows the current mode: normal, visual, or restore while a confirmation is open.
+
+### Restore and nuke
+
+Both keys list the files they will touch and what each one loses, then wait for you to type a word. `Enter` confirms only when the word matches exactly, and `Esc` cancels. Neither can be undone.
+
+`r` works on the unstaged part of one file and leaves the index alone. An untracked file is deleted. A conflicted file gets its conflict markers back and stays conflicted. A staged entry is refused, so unstage it with `f` first.
+
+`x` returns every file in the changeset to `HEAD`: staged changes, unstaged changes and untracked files, which are deleted. A conflicted file is resolved to its `HEAD` version. Ignored files stay. It covers the whole working tree even under `--staged` or `--unstaged`, and the prompt says so, but it stays inside the paths you passed. Neither key works in visual mode or on a revision.
 
 ### Editor
 
@@ -121,7 +131,7 @@ The `[highlights]` table restyles parts of the screen. Group names are CamelCase
 | `DiffBorder` | Added to `Border` on the diff pane only |
 | `CursorLine` | The row under the cursor |
 | `SectionLabel` | The unstaged and staged labels in the file list |
-| `ModeNormal`, `ModeVisual` | The mode label in the footer |
+| `ModeNormal`, `ModeVisual`, `ModeRestore` | The mode label in the footer. `ModeRestore` shows while a restore or nuke waits for confirmation, and is bold red by default. |
 | `DiffAdd`, `DiffDelete` | Added and removed lines |
 | `DiffAddText`, `DiffDeleteText` | Changed words inside an added or removed line |
 | `DiffHunkHeader` | The row that opens a hunk |
@@ -157,6 +167,7 @@ CursorLine = { bg = "#313244" }
 SectionLabel = { fg = "#cba6f7", bold = true }
 ModeNormal = { fg = "#1e1e2e", bg = "#89b4fa", bold = true }
 ModeVisual = { fg = "#1e1e2e", bg = "#cba6f7", bold = true }
+ModeRestore = { fg = "#1e1e2e", bg = "#f38ba8", bold = true }
 DiffHunkBar = { fg = "#cdd6f4" }
 DiffHunkBarStaged = { fg = "#89b4fa" }
 

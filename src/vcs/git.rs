@@ -1,9 +1,9 @@
-use super::{DiffRequest, Error, Sides, Target, Vcs, VersionId};
+use super::{DiffRequest, Error, Kind, Sides, Target, Vcs, VersionId};
 use crate::args::Scope;
 use crate::diff::{FileDiff, FileStatus, Section, parse};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -107,6 +107,121 @@ impl Git {
     let bytes = self.run(["cat-file", "blob", &oid]).ok()?;
     let id = VersionId::of(&bytes);
     Some((bytes, id))
+  }
+
+  /// The paths of `files` that a git listing command prints, found in one
+  /// call. `args` is the command and its flags, before the paths.
+  fn listed(root: &Path, args: &[&str], files: &[FileDiff]) -> Result<HashSet<PathBuf>, Error> {
+    let mut full: Vec<&OsStr> = vec!["--literal-pathspecs".as_ref()];
+    full.extend(args.iter().map(OsStr::new));
+    full.push("--".as_ref());
+    full.extend(files.iter().map(|f| f.path().as_os_str()));
+    let out = Self::command(root, full)?;
+    if !out.status.success() {
+      return Err(git_error(&out));
+    }
+    Ok(
+      out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(path)
+        .collect(),
+    )
+  }
+
+  /// The paths of `files` that the index lists.
+  fn tracked(root: &Path, files: &[FileDiff]) -> Result<HashSet<PathBuf>, Error> {
+    Self::listed(root, &["ls-files", "-z"], files)
+  }
+
+  /// Throws away the working-tree changes of `files`: tracked files go back
+  /// to the index, untracked files are deleted. A file that fails does not
+  /// stop the others, and the error names each failure.
+  fn restore_worktree(&self, files: &[FileDiff]) -> Result<(), Error> {
+    if files.is_empty() {
+      return Ok(());
+    }
+    let root = self.root()?;
+    let tracked = Self::tracked(&root, files)?;
+    let (known, untracked): (Vec<_>, Vec<_>) = files
+      .iter()
+      .cloned()
+      .partition(|f| tracked.contains(f.path()));
+    let (conflicted, plain): (Vec<_>, Vec<_>) = known
+      .into_iter()
+      .partition(|f| f.status == FileStatus::Conflicted);
+    let mut failed = self.restore_group(&["restore"], &plain);
+    failed.extend(self.restore_group(&["restore", "--merge"], &conflicted));
+    failed.extend(Self::delete(&root, &untracked));
+    Self::restored(files.len(), failed)
+  }
+
+  /// Returns every path of `files` to `HEAD`, in the index and in the working
+  /// tree.
+  fn nuke_worktree(&self, files: &[FileDiff]) -> Result<(), Error> {
+    let files = unique(files);
+    if files.is_empty() {
+      return Ok(());
+    }
+    let root = self.root()?;
+    let head = self.head()?;
+    // A staged deletion is in `HEAD` but not in the index.
+    let mut known_paths = Self::tracked(&root, &files)?;
+    known_paths.extend(Self::listed(
+      &root,
+      &["ls-tree", "-r", "-z", "--name-only", &head],
+      &files,
+    )?);
+    let (known, untracked): (Vec<_>, Vec<_>) = files
+      .iter()
+      .cloned()
+      .partition(|f| known_paths.contains(f.path()));
+    let source = format!("--source={head}");
+    let mut failed = self.restore_group(&["restore", &source, "--staged", "--worktree"], &known);
+    failed.extend(Self::delete(&root, &untracked));
+    Self::restored(files.len(), failed)
+  }
+
+  /// Deletes `files` from the working tree and returns the ones that could
+  /// not go. A file that is already gone is what the caller wanted.
+  fn delete(root: &Path, files: &[FileDiff]) -> Vec<(PathBuf, String)> {
+    files
+      .iter()
+      .filter_map(|file| match std::fs::remove_file(root.join(file.path())) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+          Some((file.path().to_path_buf(), e.kind().to_string()))
+        }
+        _ => None,
+      })
+      .collect()
+  }
+
+  /// `Ok` when nothing failed, otherwise the error that names each failure.
+  fn restored(total: usize, failed: Vec<(PathBuf, String)>) -> Result<(), Error> {
+    if failed.is_empty() {
+      return Ok(());
+    }
+    Err(Error::Restore {
+      done: total.saturating_sub(failed.len()),
+      total,
+      failed,
+    })
+  }
+
+  /// Runs a restore command on `files` in one call. When it fails, tries each
+  /// file alone to find which ones git cannot restore.
+  fn restore_group(&self, args: &[&str], files: &[FileDiff]) -> Vec<(PathBuf, String)> {
+    match self.write_index_all(args, files) {
+      Ok(()) => Vec::new(),
+      Err(e) => match files {
+        [file] => vec![(file.path().to_path_buf(), e.to_string())],
+        _ => files
+          .iter()
+          .flat_map(|f| self.restore_group(args, std::slice::from_ref(f)))
+          .collect(),
+      },
+    }
   }
 
   /// Runs a git command that writes the index, with the paths taken
@@ -406,6 +521,13 @@ impl Vcs for Git {
     }
   }
 
+  fn restore(&self, files: &[FileDiff], kind: Kind) -> Result<(), Error> {
+    match kind {
+      Kind::Restore => self.restore_worktree(files),
+      Kind::Nuke => self.nuke_worktree(files),
+    }
+  }
+
   fn sides(&self, req: &DiffRequest, file: &FileDiff) -> Sides {
     let (Ok(root), Ok(head)) = (self.root(), self.head()) else {
       return Sides::default();
@@ -430,6 +552,16 @@ impl Vcs for Git {
       new_id,
     }
   }
+}
+
+/// `files` with each path once, the first entry of a path winning.
+fn unique(files: &[FileDiff]) -> Vec<FileDiff> {
+  let mut seen = HashSet::new();
+  files
+    .iter()
+    .filter(|f| seen.insert(f.path().to_path_buf()))
+    .cloned()
+    .collect()
 }
 
 fn path(bytes: &[u8]) -> PathBuf {
@@ -1299,5 +1431,295 @@ mod tests {
     git.stage(&file).unwrap();
     let err = git.stage_hunk(&file, 0).unwrap_err();
     assert!(matches!(err, Error::Git(ref m) if m.contains("patch")));
+  }
+
+  fn unstaged(vcs: &Git) -> Vec<FileDiff> {
+    vcs
+      .changeset(&DiffRequest::default())
+      .unwrap()
+      .into_iter()
+      .filter(|f| f.section == Some(Section::Unstaged))
+      .collect()
+  }
+
+  fn listed(vcs: &Git) -> Vec<(String, Option<Section>)> {
+    vcs
+      .changeset(&DiffRequest::default())
+      .unwrap()
+      .iter()
+      .map(|f| (f.path().display().to_string(), f.section))
+      .collect()
+  }
+
+  #[test]
+  fn restoring_returns_the_file_to_the_index_and_keeps_what_is_staged() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "a.txt", "2\n");
+    git(d, &["add", "a.txt"]);
+    write(d, "a.txt", "3\n");
+    let vcs = Git::new(d);
+    vcs.restore(&unstaged(&vcs), Kind::Restore).unwrap();
+    assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "2\n");
+    assert_eq!(listed(&vcs), [("a.txt".into(), Some(Section::Staged))]);
+  }
+
+  #[test]
+  fn restoring_brings_back_a_deleted_file() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "gone.txt", "keep\n");
+    commit_all(d, "init");
+    fs::remove_file(d.join("gone.txt")).unwrap();
+    let vcs = Git::new(d);
+    vcs.restore(&unstaged(&vcs), Kind::Restore).unwrap();
+    assert_eq!(fs::read_to_string(d.join("gone.txt")).unwrap(), "keep\n");
+    assert!(listed(&vcs).is_empty());
+  }
+
+  #[test]
+  fn restoring_takes_a_path_that_starts_with_a_dash_literally() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "-n", "1\n");
+    write(d, "n", "1\n");
+    commit_all(d, "init");
+    write(d, "-n", "2\n");
+    write(d, "n", "2\n");
+    let vcs = Git::new(d);
+    let dash: Vec<_> = unstaged(&vcs)
+      .into_iter()
+      .filter(|f| f.path() == Path::new("-n"))
+      .collect();
+    vcs.restore(&dash, Kind::Restore).unwrap();
+    assert_eq!(fs::read_to_string(d.join("-n")).unwrap(), "1\n");
+    assert_eq!(fs::read_to_string(d.join("n")).unwrap(), "2\n");
+  }
+
+  #[test]
+  fn restoring_deletes_an_untracked_file() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "new.txt", "u\n");
+    let vcs = Git::new(d);
+    vcs.restore(&unstaged(&vcs), Kind::Restore).unwrap();
+    assert!(!d.join("new.txt").exists());
+    assert!(listed(&vcs).is_empty());
+  }
+
+  #[test]
+  fn restoring_a_conflicted_file_brings_back_its_markers_and_leaves_it_conflicted() {
+    let tmp = conflicted_repo();
+    let d = tmp.path();
+    write(d, "c.txt", "resolved by hand\n");
+    let vcs = Git::new(d);
+    vcs.restore(&unstaged(&vcs), Kind::Restore).unwrap();
+    let text = fs::read_to_string(d.join("c.txt")).unwrap();
+    assert!(text.contains("<<<<<<<") && text.contains("ours") && text.contains("theirs"));
+    assert!(status(d).contains("UU c.txt"));
+  }
+
+  /// Makes `dir` read-only. Returns false when that does not stop writes,
+  /// as for root, so the caller can skip its test.
+  fn lock(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let blocked = fs::write(dir.join(".probe"), "").is_err();
+    if !blocked {
+      unlock(dir);
+    }
+    blocked
+  }
+
+  fn unlock(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::remove_file(dir.join(".probe"));
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+  }
+
+  #[test]
+  fn restoring_goes_on_after_an_untracked_file_cannot_be_deleted() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    fs::create_dir(d.join("ro")).unwrap();
+    write(d, "ro/x.txt", "u\n");
+    write(d, "ok.txt", "u\n");
+    if !lock(&d.join("ro")) {
+      return;
+    }
+    let vcs = Git::new(d);
+    let result = vcs.restore(&unstaged(&vcs), Kind::Restore);
+    unlock(&d.join("ro"));
+    assert!(!d.join("ok.txt").exists());
+    assert!(d.join("ro/x.txt").exists());
+    assert_eq!(
+      result.unwrap_err().to_string(),
+      "Restored 1 of 2 files, 1 failed: ro/x.txt (permission denied)"
+    );
+  }
+
+  #[test]
+  fn restoring_goes_on_after_git_cannot_restore_one_tracked_file() {
+    let tmp = repo();
+    let d = tmp.path();
+    fs::create_dir(d.join("ro")).unwrap();
+    write(d, "ro/x.txt", "1\n");
+    write(d, "ok.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "ro/x.txt", "2\n");
+    write(d, "ok.txt", "2\n");
+    if !lock(&d.join("ro")) {
+      return;
+    }
+    let vcs = Git::new(d);
+    let result = vcs.restore(&unstaged(&vcs), Kind::Restore);
+    unlock(&d.join("ro"));
+    assert_eq!(fs::read_to_string(d.join("ok.txt")).unwrap(), "1\n");
+    assert_eq!(fs::read_to_string(d.join("ro/x.txt")).unwrap(), "2\n");
+    let message = result.unwrap_err().to_string();
+    assert!(
+      message.starts_with("Restored 1 of 2 files, 1 failed: ro/x.txt ("),
+      "{message}"
+    );
+  }
+
+  fn everything(vcs: &Git) -> Vec<FileDiff> {
+    vcs.changeset(&DiffRequest::default()).unwrap()
+  }
+
+  #[test]
+  fn a_nuke_returns_a_file_with_staged_and_unstaged_changes_to_head() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "a.txt", "2\n");
+    git(d, &["add", "a.txt"]);
+    write(d, "a.txt", "3\n");
+    let vcs = Git::new(d);
+    vcs.restore(&everything(&vcs), Kind::Nuke).unwrap();
+    assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "1\n");
+    assert!(listed(&vcs).is_empty());
+    assert!(status(d).is_empty());
+  }
+
+  #[test]
+  fn a_nuke_deletes_untracked_and_newly_staged_files() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "added.txt", "new\n");
+    git(d, &["add", "added.txt"]);
+    write(d, "added.txt", "newer\n");
+    write(d, "untracked.txt", "u\n");
+    let vcs = Git::new(d);
+    vcs.restore(&everything(&vcs), Kind::Nuke).unwrap();
+    assert!(!d.join("added.txt").exists());
+    assert!(!d.join("untracked.txt").exists());
+    assert!(status(d).is_empty());
+  }
+
+  #[test]
+  fn a_nuke_brings_back_a_file_whose_deletion_was_staged() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "gone.txt", "keep\n");
+    commit_all(d, "init");
+    git(d, &["rm", "-q", "gone.txt"]);
+    let vcs = Git::new(d);
+    vcs.restore(&everything(&vcs), Kind::Nuke).unwrap();
+    assert_eq!(fs::read_to_string(d.join("gone.txt")).unwrap(), "keep\n");
+    assert!(status(d).is_empty());
+  }
+
+  #[test]
+  fn a_nuke_resolves_a_conflicted_file_to_head() {
+    let tmp = conflicted_repo();
+    let d = tmp.path();
+    write(d, "c.txt", "resolved by hand\n");
+    let vcs = Git::new(d);
+    vcs.restore(&everything(&vcs), Kind::Nuke).unwrap();
+    assert_eq!(fs::read_to_string(d.join("c.txt")).unwrap(), "ours\n");
+    assert!(status(d).is_empty());
+  }
+
+  #[test]
+  fn a_nuke_works_before_the_first_commit() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    git(d, &["add", "a.txt"]);
+    write(d, "b.txt", "2\n");
+    let vcs = Git::new(d);
+    vcs.restore(&everything(&vcs), Kind::Nuke).unwrap();
+    assert!(!d.join("a.txt").exists());
+    assert!(!d.join("b.txt").exists());
+    assert!(status(d).is_empty());
+  }
+
+  #[test]
+  fn a_nuke_takes_a_path_that_starts_with_a_dash_literally() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "-n", "1\n");
+    write(d, "n", "1\n");
+    commit_all(d, "init");
+    write(d, "-n", "2\n");
+    write(d, "n", "2\n");
+    let vcs = Git::new(d);
+    let dash: Vec<_> = everything(&vcs)
+      .into_iter()
+      .filter(|f| f.path() == Path::new("-n"))
+      .collect();
+    vcs.restore(&dash, Kind::Nuke).unwrap();
+    assert_eq!(fs::read_to_string(d.join("-n")).unwrap(), "1\n");
+    assert_eq!(fs::read_to_string(d.join("n")).unwrap(), "2\n");
+  }
+
+  #[test]
+  fn a_nuke_leaves_ignored_files_and_unlisted_files_alone() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, ".gitignore", "*.log\n");
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "debug.log", "keep me\n");
+    write(d, "a.txt", "2\n");
+    let vcs = Git::new(d);
+    vcs.restore(&everything(&vcs), Kind::Nuke).unwrap();
+    assert_eq!(
+      fs::read_to_string(d.join("debug.log")).unwrap(),
+      "keep me\n"
+    );
+  }
+
+  #[test]
+  fn a_nuke_goes_on_after_a_file_cannot_be_deleted() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    fs::create_dir(d.join("ro")).unwrap();
+    write(d, "ro/x.txt", "u\n");
+    write(d, "a.txt", "2\n");
+    if !lock(&d.join("ro")) {
+      return;
+    }
+    let vcs = Git::new(d);
+    let result = vcs.restore(&everything(&vcs), Kind::Nuke);
+    unlock(&d.join("ro"));
+    assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "1\n");
+    assert!(d.join("ro/x.txt").exists());
+    assert_eq!(
+      result.unwrap_err().to_string(),
+      "Restored 1 of 2 files, 1 failed: ro/x.txt (permission denied)"
+    );
   }
 }

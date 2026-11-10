@@ -3,7 +3,7 @@
 //!
 //! It supports whole-file, hunk and line staging. Revisions are not supported.
 
-use super::{DiffRequest, Error, Sides, Target, Vcs, VersionId};
+use super::{DiffRequest, Error, Kind, Sides, Target, Vcs, VersionId};
 use crate::args::Scope;
 use crate::diff::{self, FileDiff, Hunk, LineKind, Section};
 use similar::TextDiff;
@@ -299,6 +299,16 @@ impl Vcs for Memory {
     }
   }
 
+  fn restore(&self, files: &[FileDiff], kind: Kind) -> Result<(), Error> {
+    match kind {
+      Kind::Restore => self.update(files, |v| v.work.clone_from(&v.index)),
+      Kind::Nuke => self.update(files, |v| {
+        v.index.clone_from(&v.head);
+        v.work.clone_from(&v.head);
+      }),
+    }
+  }
+
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides {
     let scope = file.section.map_or(request.scope, Section::scope);
     let Some(versions) = self.lock().get(file.path()).cloned() else {
@@ -341,6 +351,83 @@ mod tests {
   fn unchanged_files_are_not_listed() {
     let names: Vec<_> = changeset(&repo()).into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["a", "new"]);
+  }
+
+  #[test]
+  fn restoring_an_unstaged_file_drops_it_from_the_changeset() {
+    let vcs = repo().commit("c", "1\n").edit("c", "2\n").staged("c");
+    let files = vcs.changeset(&DiffRequest::default()).unwrap();
+    let a = files.iter().find(|f| f.path() == Path::new("a")).unwrap();
+    vcs.restore(std::slice::from_ref(a), Kind::Restore).unwrap();
+    assert_eq!(
+      changeset(&vcs),
+      [
+        ("new".into(), Some(Section::Unstaged)),
+        ("c".into(), Some(Section::Staged)),
+      ]
+    );
+  }
+
+  #[test]
+  fn restoring_keeps_the_staged_part_of_a_file() {
+    let vcs = Memory::default()
+      .commit("a", "1\n")
+      .edit("a", "2\n")
+      .staged("a");
+    vcs.save("a", "3\n");
+    let files = vcs.changeset(&DiffRequest::default()).unwrap();
+    let unstaged = files
+      .iter()
+      .find(|f| f.section == Some(Section::Unstaged))
+      .unwrap();
+    vcs
+      .restore(std::slice::from_ref(unstaged), Kind::Restore)
+      .unwrap();
+    assert_eq!(vcs.index_text("a"), Some("2\n".into()));
+    assert_eq!(changeset(&vcs), [("a".into(), Some(Section::Staged))]);
+  }
+
+  #[test]
+  fn a_nuke_returns_the_index_and_the_working_tree_to_head() {
+    let vcs = Memory::default()
+      .commit("both", "1\n")
+      .commit("staged", "1\n")
+      .commit("plain", "1\n")
+      .edit("both", "2\n")
+      .staged("both")
+      .edit("staged", "2\n")
+      .staged("staged")
+      .edit("plain", "2\n")
+      .edit("new", "x\n")
+      .edit("added", "y\n")
+      .staged("added");
+    vcs.save("both", "3\n");
+    let files = vcs.changeset(&DiffRequest::default()).unwrap();
+    vcs.restore(&files, Kind::Nuke).unwrap();
+    assert!(changeset(&vcs).is_empty());
+    assert_eq!(vcs.index_text("both"), Some("1\n".into()));
+    assert_eq!(vcs.index_text("staged"), Some("1\n".into()));
+    assert_eq!(vcs.index_text("added"), None);
+  }
+
+  #[test]
+  fn restoring_an_untracked_file_deletes_it() {
+    let vcs = repo();
+    let files = vcs.changeset(&DiffRequest::default()).unwrap();
+    let new = files.iter().find(|f| f.path() == Path::new("new")).unwrap();
+    vcs
+      .restore(std::slice::from_ref(new), Kind::Restore)
+      .unwrap();
+    assert!(changeset(&vcs).iter().all(|(name, _)| name != "new"));
+  }
+
+  #[test]
+  fn restoring_an_unknown_file_is_an_error() {
+    let vcs = repo();
+    let mut files = vcs.changeset(&DiffRequest::default()).unwrap();
+    files[0].new_path = Some("ghost".into());
+    files[0].old_path = Some("ghost".into());
+    assert!(vcs.restore(&files[..1], Kind::Restore).is_err());
   }
 
   #[test]

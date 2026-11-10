@@ -6,6 +6,7 @@ mod editor;
 mod highlight;
 mod jobs;
 mod palette;
+mod restore;
 mod split;
 mod staging;
 mod ui;

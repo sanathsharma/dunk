@@ -48,6 +48,10 @@ pub enum Refusal {
   NoHunk,
   /// A selection holds no added or removed line.
   NoChangedLines,
+  /// A restore needs an unstaged entry, and this one is staged.
+  Staged,
+  /// No entry is left that a restore could touch.
+  NothingToRestore,
 }
 
 impl Refusal {
@@ -62,6 +66,8 @@ impl Refusal {
       }
       Self::NoHunk => Some("No hunk under the cursor"),
       Self::NoChangedLines => Some("no changed lines selected"),
+      Self::Staged => Some("Staged: unstage with f before restoring"),
+      Self::NothingToRestore => Some("Nothing to restore"),
     }
   }
 }

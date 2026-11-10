@@ -2,6 +2,7 @@
 name = "dunk"
 version = "0.2.0"
 edition = "2024"
+publish = false
 
 [lints.rust]
 unsafe_code = "forbid"
