@@ -105,6 +105,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     right,
   );
   render_main(frame, main, app);
+  // The help menu takes every key, so it is drawn whatever is behind it,
+  // including the loading, error and no-changes screens.
+  if app.help {
+    render_help(frame, main, app);
+  }
   // The prompt takes every key, so it is drawn whatever is behind it.
   if app.prompt.is_some() {
     render_prompt(frame, main, app);
@@ -136,9 +141,6 @@ fn render_main(frame: &mut Frame, main: Rect, app: &mut App) {
     border_type: border_type(app.border),
   };
   app.chords.render(frame, diff, &styles, Instant::now());
-  if app.help {
-    render_help(frame, main, app);
-  }
 }
 
 fn render_help(frame: &mut Frame, area: Rect, app: &App) {
@@ -1110,6 +1112,15 @@ new file mode 100644
         .iter()
         .any(|r| r.contains("Error: not a git repository"))
     );
+  }
+
+  #[test]
+  fn the_help_menu_shows_when_there_are_no_changes() {
+    let mut app = App::default();
+    app.on_loaded(Ok(Vec::new()));
+    app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    let (_, rows) = draw(&mut app, 100, 40);
+    row_with(&rows, "Help (esc or q closes)");
   }
 
   #[test]
