@@ -147,7 +147,7 @@ impl Runner {
   pub fn restore(&self, request: RestoreRequest) {
     let (vcs, deliver) = (self.vcs.clone(), self.deliver.clone());
     thread::spawn(move || {
-      let result = vcs.restore(&request.files(), request.kind);
+      let result = request.run(&*vcs);
       deliver(Done::Restored(request.follow, result));
     });
   }

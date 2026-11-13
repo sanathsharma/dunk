@@ -1,4 +1,5 @@
 use crate::args::{Border, Layout};
+use crate::chord::{Binding, Chords, Feed, Group};
 use crate::config::Settings;
 use crate::diff::{FileDiff, FileStatus, Hunk, Section};
 use crate::editor::Editor;
@@ -22,14 +23,44 @@ use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long the input thread waits for a key before checking whether it
 /// should step aside.
 const INPUT_POLL: Duration = Duration::from_millis(50);
+
+/// How long a chord waits for its follow-up key before the popup lists them.
+/// Long enough that typing both keys quickly never flashes it.
+const CHORD_DELAY: Duration = Duration::from_millis(300);
+
+/// What a finished chord asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordAction {
+  RestoreFile,
+  RestoreHunk,
+}
+
+/// The chords of normal mode. Visual mode has none: its `r` restores the
+/// selection at once.
+const CHORDS: &[Group<ChordAction>] = &[Group {
+  prefix: 'r',
+  title: "restore",
+  keys: &[
+    Binding {
+      key: 'f',
+      label: "file",
+      action: ChordAction::RestoreFile,
+    },
+    Binding {
+      key: 'h',
+      label: "hunk",
+      action: ChordAction::RestoreHunk,
+    },
+  ],
+}];
 
 pub enum Event {
   Key(KeyEvent),
@@ -93,6 +124,8 @@ pub struct App {
   /// The confirmation a restore or nuke waits behind. It takes every key
   /// until closed.
   pub prompt: Option<Prompt>,
+  /// The chord waiting for its follow-up key, if any.
+  pub chords: Chords<ChordAction>,
   pub load: Load,
   /// The files as shown, with any added context.
   pub files: Arc<Vec<FileDiff>>,
@@ -153,6 +186,7 @@ impl Default for App {
       mode: Mode::Normal,
       help: false,
       prompt: None,
+      chords: Chords::new(CHORDS, CHORD_DELAY),
       load: Load::Loading,
       files: Arc::new(Vec::new()),
       loaded: Arc::new(Vec::new()),
@@ -478,6 +512,34 @@ impl App {
     }
   }
 
+  /// Opens the confirmation to restore the hunk under the cursor, or only
+  /// the lines `lines` of it, or shows why it cannot. Returns whether the
+  /// confirmation opened.
+  fn open_restore_hunk(&mut self, lines: Option<BTreeSet<usize>>) -> bool {
+    let request = restore::restore_hunk(&self.files, self.selected, self.cursor_hunk(), lines);
+    match request {
+      Ok(request) => {
+        self.prompt = Some(Prompt::new(request));
+        true
+      }
+      Err(refusal) => {
+        self.notice = refusal.notice().map(Into::into);
+        false
+      }
+    }
+  }
+
+  /// Opens the confirmation to restore the selected lines. With none changed
+  /// it only shows a notice and stays in visual mode.
+  fn restore_selection(&mut self) {
+    let Some((_, lines)) = self.selection_lines() else {
+      return;
+    };
+    if self.open_restore_hunk(Some(lines)) {
+      self.mode = Mode::Normal;
+    }
+  }
+
   /// Opens the confirmation to return every file to `HEAD`, or shows why it
   /// cannot.
   fn open_nuke(&mut self) {
@@ -667,9 +729,19 @@ impl App {
       KeyCode::Char('l') | KeyCode::Right => self.pan_by(PAN_STEP),
       KeyCode::Char('s') => self.toggle_layout(),
       KeyCode::Char('a') => self.stage_selection(),
-      KeyCode::Char('r' | 'x') => self.notice = Some("Leave visual mode first".into()),
+      KeyCode::Char('r') => self.restore_selection(),
+      KeyCode::Char('x') => self.notice = Some("Leave visual mode first".into()),
       KeyCode::Char('?') => self.help = true,
       _ => {}
+    }
+  }
+
+  fn on_chord(&mut self, action: ChordAction) {
+    match action {
+      ChordAction::RestoreFile => self.open_restore(),
+      ChordAction::RestoreHunk => {
+        self.open_restore_hunk(None);
+      }
     }
   }
 
@@ -693,6 +765,14 @@ impl App {
       return self.on_visual_key(key);
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // `Ctrl-c` quits even while a chord waits.
+    if !(ctrl && key.code == KeyCode::Char('c')) {
+      match self.chords.feed(key, Instant::now()) {
+        Feed::Pass => {}
+        Feed::Wait | Feed::Cancel => return,
+        Feed::Done(action) => return self.on_chord(action),
+      }
+    }
     let page = signed(self.viewport.max(1));
     match key.code {
       KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -720,7 +800,6 @@ impl App {
       KeyCode::Char('=') => self.change_context(Step::Reset),
       KeyCode::Char('f') => self.toggle_stage(),
       KeyCode::Char('A') => self.toggle_stage_all(),
-      KeyCode::Char('r') => self.open_restore(),
       KeyCode::Char('x') => self.open_nuke(),
       KeyCode::Char(',') => self.select(0),
       KeyCode::Char('.') => self.select(self.files.len().saturating_sub(1)),
@@ -1277,13 +1356,25 @@ pub fn run<V: Vcs + Send + Sync + 'static>(
   let _watch_stop = settings.watch.then(|| spawn_watch(root, &tx));
   while !app.quit {
     terminal.draw(|frame| ui::render(frame, &mut app))?;
-    match rx.recv() {
-      Ok(Event::Key(key)) => app.on_key(key),
-      Ok(Event::Changed) => app.reload(),
-      Ok(Event::Job(done)) => app.on_job(done),
-      Ok(Event::InputFailed(e)) => return Err(e),
-      Ok(Event::Resize) => {}
-      Err(_) => break,
+    // While a chord's popup is due, sleep only until then, so it shows
+    // without another key press.
+    let event = match app.chords.wake_in(Instant::now()) {
+      Some(wait) => match rx.recv_timeout(wait) {
+        Ok(event) => Some(event),
+        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Disconnected) => break,
+      },
+      None => match rx.recv() {
+        Ok(event) => Some(event),
+        Err(_) => break,
+      },
+    };
+    match event {
+      Some(Event::Key(key)) => app.on_key(key),
+      Some(Event::Changed) => app.reload(),
+      Some(Event::Job(done)) => app.on_job(done),
+      Some(Event::InputFailed(e)) => return Err(e),
+      Some(Event::Resize) | None => {}
     }
     if let Some(edit) = app.take_edit() {
       match &editor {
@@ -2349,7 +2440,7 @@ mod tests {
     let mut app = App::default();
     let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     let prompt = app.prompt.as_ref().unwrap();
     assert_eq!(prompt.word(), "restore");
     assert_eq!(prompt.request().entries.len(), 1);
@@ -2369,7 +2460,7 @@ mod tests {
     let mut app = App::default();
     let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     press_all(&mut app, "restore");
     app.on_key(key(KeyCode::Enter));
     assert!(app.prompt.is_none());
@@ -2391,9 +2482,8 @@ mod tests {
     let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
     for typed in ["restor", "Restore", "restore ", "nuke", ""] {
-      app.on_key(key(KeyCode::Char('r')));
       if app.prompt.is_none() {
-        app.on_key(key(KeyCode::Char('r')));
+        press_all(&mut app, "rf");
       }
       press_all(&mut app, typed);
       app.on_key(key(KeyCode::Enter));
@@ -2408,7 +2498,7 @@ mod tests {
     let mut app = App::default();
     let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     press_all(&mut app, "restorex");
     app.on_key(key(KeyCode::Backspace));
     app.on_key(key(KeyCode::Enter));
@@ -2422,7 +2512,7 @@ mod tests {
     let mut app = App::default();
     let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     assert_eq!(app.prompt.as_ref().unwrap().input(), "");
     assert!(!app.quit);
@@ -2443,7 +2533,7 @@ mod tests {
         .position(|f| f.section == Some(Section::Staged))
         .unwrap(),
     );
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     assert!(app.prompt.is_none());
     assert_eq!(
       app.notice.as_deref(),
@@ -2452,24 +2542,24 @@ mod tests {
 
     // A revision's changeset.
     let mut app = ready(vec![file_in("a", None)], 5);
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     assert!(app.prompt.is_none());
     assert_eq!(app.notice.as_deref(), Some("read-only: revision"));
 
     // Nothing listed.
     let mut app = ready(Vec::new(), 5);
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     assert!(app.prompt.is_none());
     assert_eq!(app.notice.as_deref(), Some("Nothing to restore"));
   }
 
   #[test]
-  fn r_in_visual_mode_only_shows_a_notice() {
+  fn x_in_visual_mode_only_shows_a_notice() {
     let mut app = App::default();
     let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
     app.on_key(key(KeyCode::Char('v')));
-    app.on_key(key(KeyCode::Char('r')));
+    app.on_key(key(KeyCode::Char('x')));
     assert!(app.prompt.is_none());
     assert_eq!(app.mode, Mode::Visual);
     assert_eq!(app.notice.as_deref(), Some("Leave visual mode first"));
@@ -2528,7 +2618,7 @@ mod tests {
     let mut app = App::default();
     let git = rig(&mut app, stage_memory());
     load(&mut app, &git);
-    app.on_key(key(KeyCode::Char('r')));
+    press_all(&mut app, "rf");
     press_all(&mut app, "rest");
 
     // The watcher sees a save and reads the changeset again.
@@ -3135,5 +3225,171 @@ mod tests {
       })
       .collect();
     assert_eq!(index_of(&git, "f"), expected);
+  }
+  /// `f` has hunks at lines 2 and 19.
+  fn two_hunk_memory() -> crate::vcs::Memory {
+    let text = |a: &str, b: &str| {
+      (1..=20)
+        .map(|n| match n {
+          2 => format!("{a}\n"),
+          19 => format!("{b}\n"),
+          _ => format!("{n}\n"),
+        })
+        .collect::<String>()
+    };
+    crate::vcs::Memory::default()
+      .commit("f", &text("2", "19"))
+      .edit("f", &text("TWO", "NINETEEN"))
+  }
+
+  #[test]
+  fn r_alone_opens_nothing_and_a_follow_up_finishes_the_chord() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    press_all(&mut app, "r");
+    assert!(app.prompt.is_none());
+    assert_eq!(app.mode_label(), "NORMAL");
+    press_all(&mut app, "f");
+    assert!(app.prompt.is_some());
+  }
+
+  #[test]
+  fn a_pending_chord_swallows_the_next_key_and_esc_does_not_quit() {
+    for second in [
+      KeyCode::Esc,
+      KeyCode::Char('q'),
+      KeyCode::Char('x'),
+      KeyCode::Char('j'),
+    ] {
+      let mut app = App::default();
+      let git = rig(&mut app, stage_memory());
+      load(&mut app, &git);
+      let before = app.selected;
+      press_all(&mut app, "r");
+      app.on_key(key(second));
+      assert!(!app.quit, "{second:?} quit");
+      assert!(app.prompt.is_none(), "{second:?} opened a prompt");
+      assert_eq!(app.cursor, 1, "{second:?} moved the cursor");
+      assert_eq!(app.selected, before);
+      // The chord is over, so `f` is a normal key again.
+      press_all(&mut app, "f");
+      assert!(
+        app.prompt.is_none() || app.quit,
+        "{second:?} left the chord open"
+      );
+    }
+  }
+
+  #[test]
+  fn ctrl_c_quits_while_a_chord_waits() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    press_all(&mut app, "r");
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.quit);
+  }
+
+  #[test]
+  fn rh_opens_a_prompt_for_the_hunk_and_restoring_it_follows_the_next_hunk() {
+    let mut app = App::default();
+    let git = rig(&mut app, two_hunk_memory());
+    load(&mut app, &git);
+    press_all(&mut app, "rh");
+    let prompt = app.prompt.as_ref().unwrap();
+    assert_eq!(prompt.word(), "restore");
+    assert_eq!(
+      prompt.request().entries.first().unwrap().loss.label(),
+      "hunk, 2 lines"
+    );
+    press_all(&mut app, "restore");
+    app.on_key(key(KeyCode::Enter));
+    finish_index(&mut app, &git);
+    let work = git.work_text("f").unwrap();
+    assert!(
+      work.contains("\n2\n") && work.contains("NINETEEN"),
+      "{work}"
+    );
+    assert_eq!(app.files[app.selected].hunks.len(), 1);
+    assert_eq!(app.mode_label(), "NORMAL");
+  }
+
+  #[test]
+  fn visual_r_restores_the_selected_lines_after_the_typed_word() {
+    let mut app = App::default();
+    let git = rig(&mut app, two_hunk_memory());
+    load(&mut app, &git);
+    app.on_key(key(KeyCode::Char('v')));
+    // The first changed line of the hunk is the removed one.
+    let first_changed = app.files[app.selected].hunks[0].changed().next().unwrap();
+    while app
+      .selection_lines()
+      .is_none_or(|(_, lines)| !lines.contains(&first_changed))
+    {
+      app.on_key(key(KeyCode::Char('j')));
+    }
+    app.on_key(key(KeyCode::Char('r')));
+    assert_eq!(app.mode, Mode::Normal);
+    let prompt = app.prompt.as_ref().unwrap();
+    assert_eq!(prompt.request().part.as_ref().unwrap().hunk, 0);
+    press_all(&mut app, "restore");
+    app.on_key(key(KeyCode::Enter));
+    finish_index(&mut app, &git);
+    let work = git.work_text("f").unwrap();
+    assert!(work.contains("\n2\n") && work.contains("TWO"), "{work}");
+  }
+
+  #[test]
+  fn visual_r_on_context_only_shows_a_notice_and_stays_in_visual_mode() {
+    let mut app = App::default();
+    let git = rig(&mut app, two_hunk_memory());
+    load(&mut app, &git);
+    let file = &app.files[app.selected];
+    let changed: BTreeSet<usize> = file.hunks[0].changed().collect();
+    let context_row = (0..app.rows())
+      .find(|row| {
+        locate(file, app.layout, *row)
+          .is_some_and(|(h, line)| h == 0 && line.is_some_and(|l| !changed.contains(&l)))
+      })
+      .unwrap();
+    app.cursor = context_row;
+    app.on_key(key(KeyCode::Char('v')));
+    app.on_key(key(KeyCode::Char('r')));
+    assert!(app.prompt.is_none());
+    assert_eq!(app.mode, Mode::Visual);
+    assert_eq!(app.notice.as_deref(), Some("no changed lines selected"));
+  }
+
+  #[test]
+  fn rh_on_a_staged_entry_is_refused_with_the_staged_notice() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    app.select(
+      app
+        .files
+        .iter()
+        .position(|f| f.section == Some(Section::Staged))
+        .unwrap(),
+    );
+    press_all(&mut app, "rh");
+    assert!(app.prompt.is_none());
+    assert_eq!(
+      app.notice.as_deref(),
+      Some("Staged: unstage with f before restoring")
+    );
+  }
+
+  #[test]
+  fn chords_are_not_read_while_the_prompt_or_help_is_open() {
+    let mut app = App::default();
+    let git = rig(&mut app, stage_memory());
+    load(&mut app, &git);
+    press_all(&mut app, "rf");
+    // The `r` is typed into the prompt, and no chord starts.
+    press_all(&mut app, "r");
+    assert!(app.chords.wake_in(Instant::now()).is_none());
+    assert_eq!(app.prompt.as_ref().unwrap().input(), "r");
   }
 }

@@ -52,6 +52,10 @@ pub enum Refusal {
   Staged,
   /// No entry is left that a restore could touch.
   NothingToRestore,
+  /// A conflicted file has no hunks to restore on their own.
+  RestoreConflicted,
+  /// A renamed or copied file has no hunks to restore on their own.
+  RestoreRenamed,
 }
 
 impl Refusal {
@@ -68,6 +72,10 @@ impl Refusal {
       Self::NoChangedLines => Some("no changed lines selected"),
       Self::Staged => Some("Staged: unstage with f before restoring"),
       Self::NothingToRestore => Some("Nothing to restore"),
+      Self::RestoreConflicted => Some("Cannot restore hunks of a conflicted file, use rf instead"),
+      Self::RestoreRenamed => {
+        Some("Cannot restore hunks of a renamed or copied file, use rf instead")
+      }
     }
   }
 }
@@ -134,6 +142,32 @@ pub fn toggle_all(files: &[FileDiff], selected: usize) -> Result<IndexRequest, R
   })
 }
 
+/// Where the selection goes after hunk `hunk` of the selected entry, which is
+/// in `section`, was staged, unstaged or restored. `leaves` says whether the
+/// whole hunk left the entry. If it did, the next hunk takes its index, and
+/// after the last hunk the selection moves to the next file in the section,
+/// or to the previous hunk when there is none. If part of the hunk is left,
+/// the cursor stays on it.
+pub fn follow_after(
+  files: &[FileDiff],
+  selected: usize,
+  section: Section,
+  hunk: usize,
+  leaves: bool,
+) -> Option<Follow> {
+  let file = files.get(selected)?;
+  let in_entry = |hunk| Follow {
+    path: file.path().to_path_buf(),
+    section,
+    hunk: Some(hunk),
+  };
+  if !leaves || hunk.saturating_add(1) < file.hunks.len() {
+    Some(in_entry(hunk))
+  } else {
+    neighbour(files, selected).or_else(|| hunk.checked_sub(1).map(in_entry))
+  }
+}
+
 /// Stages hunk `hunk` of the selected entry, or unstages it when the entry is
 /// in the staged section. With `lines`, only those lines of the hunk go.
 ///
@@ -167,16 +201,7 @@ pub fn toggle_hunk(
   let leaves = lines
     .as_ref()
     .is_none_or(|lines| changed.clone().all(|i| lines.contains(&i)));
-  let in_entry = |hunk| Follow {
-    path: file.path().to_path_buf(),
-    section,
-    hunk: Some(hunk),
-  };
-  let follow = if !leaves || hunk.saturating_add(1) < file.hunks.len() {
-    Some(in_entry(hunk))
-  } else {
-    neighbour(files, selected).or_else(|| hunk.checked_sub(1).map(in_entry))
-  };
+  let follow = follow_after(files, selected, section, hunk, leaves);
   Ok(IndexRequest {
     file: file.clone(),
     target: lines.map_or(Target::Hunk(hunk), |lines| Target::Lines(hunk, lines)),

@@ -34,6 +34,13 @@ What the keys currently do. In normal mode keys move around and act on a file or
 **Selection**:
 The run of lines a visual-mode action applies to.
 
+**Chord**:
+A prefix key followed by one more key, such as `r` then `h`. Pressing the prefix starts the chord and the next key finishes it. `Esc` or any key that is not a follow-up cancels it and does nothing else. A chord has no timeout. Only normal mode has chords. Visual mode acts on its selection with the prefix key alone.
+_Avoid_: sequence, pending key, leader
+
+**Chord popup**:
+The box in the bottom-right corner of the diff pane that lists the follow-up keys of a pending chord. It appears only after a short delay, so a fast typist never sees it, and it closes when the chord ends.
+
 **Section**:
 One of the two groups in the file list: unstaged and staged. A file with both kinds of change appears in both. The diff shown for an entry covers only its own section.
 
@@ -69,7 +76,7 @@ _Avoid_: selected row (selection and section already use "select")
 The one-cell bar beside the hunk under the cursor. It is white for an unstaged hunk and blue for a staged one. A hunk in a revision's diff is already committed, so its bar is blue.
 
 **Restore**:
-Throwing away the working-tree changes of one unstaged entry so the file matches the index again. An untracked file has no index version, so restoring it deletes the file. A conflicted file gets its conflict markers back and stays conflicted. It never changes the index and cannot be undone. A staged entry is never restored, and a revision's changeset, being read-only, cannot be either.
+Throwing away working-tree changes of an unstaged entry so they match the index again. It has three sizes: the whole file, one hunk, or a selection of lines. A hunk or line restore removes the chosen added lines and brings back the chosen removed lines, and leaves the rest of the file alone. An untracked file has no index version, so restoring it whole deletes the file, while restoring a hunk or lines of it removes only those lines and keeps the file, even if it ends up empty. A conflicted file restored whole gets its conflict markers back and stays conflicted, and a hunk or line restore on it is refused. It never changes the index and cannot be undone. A staged entry is never restored, and a revision's changeset, being read-only, cannot be either. A selection with no added or removed line is refused.
 _Avoid_: discard, revert, reset, checkout
 
 **Nuke**:

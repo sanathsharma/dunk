@@ -528,6 +528,37 @@ impl Vcs for Git {
     }
   }
 
+  fn restore_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: Option<&BTreeSet<usize>>,
+  ) -> Result<(), Error> {
+    let patch = lines.map_or_else(
+      || file.reverse_hunk_patch(hunk),
+      |lines| file.reverse_line_patch(hunk, lines),
+    );
+    let root = self.root()?;
+    let on_disk = root.join(file.path());
+    // An added file may not be tracked, and a patch that removes every line
+    // of it deletes it. The file stays, empty, as it was.
+    let permissions = (file.status == FileStatus::Added)
+      .then(|| std::fs::metadata(&on_disk).ok().map(|m| m.permissions()))
+      .flatten();
+    let args = ["apply", "--recount", "--unidiff-zero", "-"];
+    let out = Self::command_with_input(&root, args, &patch)?;
+    if !out.status.success() {
+      return Err(git_error(&out));
+    }
+    if let Some(permissions) = permissions
+      && !on_disk.exists()
+    {
+      std::fs::write(&on_disk, b"")?;
+      std::fs::set_permissions(&on_disk, permissions)?;
+    }
+    Ok(())
+  }
+
   fn sides(&self, req: &DiffRequest, file: &FileDiff) -> Sides {
     let (Ok(root), Ok(head)) = (self.root(), self.head()) else {
       return Sides::default();
@@ -1720,6 +1751,158 @@ mod tests {
     assert_eq!(
       result.unwrap_err().to_string(),
       "Restored 1 of 2 files, 1 failed: ro/x.txt (permission denied)"
+    );
+  }
+  /// `f.txt` with 20 lines and changes at lines 2 and 19, so two hunks.
+  fn write_two_hunks(d: &Path) {
+    let text = |a: &str, b: &str| {
+      (1..=20)
+        .map(|n| match n {
+          2 => format!("{a}\n"),
+          19 => format!("{b}\n"),
+          _ => format!("{n}\n"),
+        })
+        .collect::<String>()
+    };
+    write(d, "f.txt", &text("2", "19"));
+    commit_all(d, "init");
+    write(d, "f.txt", &text("TWO", "NINETEEN"));
+  }
+
+  fn unstaged_entry(vcs: &Git, name: &str) -> FileDiff {
+    everything(vcs)
+      .into_iter()
+      .find(|f| f.section == Some(Section::Unstaged) && f.path() == Path::new(name))
+      .unwrap()
+  }
+
+  #[test]
+  fn restoring_a_hunk_puts_back_only_that_hunk_and_leaves_the_index_alone() {
+    let tmp = repo();
+    let d = tmp.path();
+    write_two_hunks(d);
+    let vcs = Git::new(d);
+    vcs
+      .restore_lines(&unstaged_entry(&vcs, "f.txt"), 1, None)
+      .unwrap();
+    let text = fs::read_to_string(d.join("f.txt")).unwrap();
+    assert!(text.contains("\nTWO\n"), "{text}");
+    assert!(text.contains("\n19\n"), "{text}");
+    assert!(!text.contains("NINETEEN"), "{text}");
+    let staged = vcs
+      .diff(&DiffRequest {
+        scope: Scope::Staged,
+        ..DiffRequest::default()
+      })
+      .unwrap();
+    assert!(staged.is_empty());
+  }
+
+  #[test]
+  fn restoring_some_lines_of_a_replacement_keeps_the_rest() {
+    let tmp = repo();
+    let d = tmp.path();
+    write_two_hunks(d);
+    let vcs = Git::new(d);
+    let file = unstaged_entry(&vcs, "f.txt");
+    let added = file.hunks[0]
+      .lines
+      .iter()
+      .position(|l| l.kind == LineKind::Added)
+      .unwrap();
+    vcs
+      .restore_lines(&file, 0, Some(&BTreeSet::from([added])))
+      .unwrap();
+    let text = fs::read_to_string(d.join("f.txt")).unwrap();
+    // The added line went, the removed line stays removed.
+    assert!(!text.contains("TWO"), "{text}");
+    assert!(!text.lines().any(|l| l == "2"), "{text}");
+    assert!(text.contains("NINETEEN"), "{text}");
+  }
+
+  #[test]
+  fn restoring_the_removed_line_of_a_replacement_brings_it_back() {
+    let tmp = repo();
+    let d = tmp.path();
+    write_two_hunks(d);
+    let vcs = Git::new(d);
+    let file = unstaged_entry(&vcs, "f.txt");
+    let removed = file.hunks[0]
+      .lines
+      .iter()
+      .position(|l| l.kind == LineKind::Removed)
+      .unwrap();
+    vcs
+      .restore_lines(&file, 0, Some(&BTreeSet::from([removed])))
+      .unwrap();
+    let text = fs::read_to_string(d.join("f.txt")).unwrap();
+    assert!(text.lines().any(|l| l == "2"), "{text}");
+    assert!(text.contains("TWO"), "{text}");
+  }
+
+  #[test]
+  fn restoring_lines_of_an_untracked_file_keeps_the_file_even_when_empty() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "n.txt", "x\ny\n");
+    let vcs = Git::new(d);
+    let file = unstaged_entry(&vcs, "n.txt");
+    let first = file.hunks[0].changed().next().unwrap();
+    vcs
+      .restore_lines(&file, 0, Some(&BTreeSet::from([first])))
+      .unwrap();
+    assert_eq!(fs::read_to_string(d.join("n.txt")).unwrap(), "y\n");
+    let file = unstaged_entry(&vcs, "n.txt");
+    vcs.restore_lines(&file, 0, None).unwrap();
+    assert_eq!(fs::read_to_string(d.join("n.txt")).unwrap(), "");
+  }
+
+  #[test]
+  fn an_emptied_untracked_file_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n");
+    commit_all(d, "init");
+    write(d, "run.sh", "x\n");
+    fs::set_permissions(d.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let vcs = Git::new(d);
+    vcs
+      .restore_lines(&unstaged_entry(&vcs, "run.sh"), 0, None)
+      .unwrap();
+    let mode = fs::metadata(d.join("run.sh")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+  }
+
+  #[test]
+  fn restoring_a_hunk_of_a_deleted_file_brings_the_file_back() {
+    let tmp = repo();
+    let d = tmp.path();
+    write(d, "a.txt", "1\n2\n");
+    commit_all(d, "init");
+    fs::remove_file(d.join("a.txt")).unwrap();
+    let vcs = Git::new(d);
+    vcs
+      .restore_lines(&unstaged_entry(&vcs, "a.txt"), 0, None)
+      .unwrap();
+    assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "1\n2\n");
+  }
+
+  #[test]
+  fn a_restore_that_git_cannot_apply_is_an_error() {
+    let tmp = repo();
+    let d = tmp.path();
+    write_two_hunks(d);
+    let vcs = Git::new(d);
+    let file = unstaged_entry(&vcs, "f.txt");
+    // The file changed after the diff was read.
+    write(d, "f.txt", "something else\n");
+    assert!(vcs.restore_lines(&file, 0, None).is_err());
+    assert_eq!(
+      fs::read_to_string(d.join("f.txt")).unwrap(),
+      "something else\n"
     );
   }
 }

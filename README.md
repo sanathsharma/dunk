@@ -78,7 +78,9 @@ Press `?` in dunk for the same list.
 | `a` | Stage or unstage the hunk under the cursor, or the selection in visual mode |
 | `f` | Stage or unstage the whole file |
 | `A` | Stage every unstaged file, or unstage every staged file when none is left to stage |
-| `r` | Restore the file under the cursor: discard its unstaged changes. Asks you to type `restore` first. |
+| `r` then `f` | Restore the file under the cursor: discard its unstaged changes. Asks you to type `restore` first. |
+| `r` then `h` | Restore the hunk under the cursor. Asks you to type `restore` first. |
+| `r` (visual mode) | Restore the selected lines. Asks you to type `restore` first. |
 | `x` | Nuke: return every file to `HEAD`, staged and unstaged. Asks you to type `nuke` first. |
 | `e` | Open the cursor's line in `$VISUAL` or `$EDITOR` |
 | `?` | Open the help menu |
@@ -88,11 +90,16 @@ The footer shows the current mode: normal, visual, or restore while a confirmati
 
 ### Restore and nuke
 
-Both keys list the files they will touch and what each one loses, then wait for you to type a word. `Enter` confirms only when the word matches exactly, and `Esc` cancels. Neither can be undone.
+Restore and nuke list what they will touch and what each part loses, then wait for you to type a word. `Enter` confirms only when the word matches exactly, and `Esc` cancels. Neither can be undone.
 
-`r` works on the unstaged part of one file and leaves the index alone. An untracked file is deleted. A conflicted file gets its conflict markers back and stays conflicted. A staged entry is refused, so unstage it with `f` first.
+Restore works on the unstaged part of a file and leaves the index alone. It comes in three sizes. `r` then `f` restores the file, `r` then `h` restores the hunk under the cursor, and `r` in visual mode restores the selected lines. A hunk or line restore removes the chosen added lines and puts back the chosen removed lines. A staged entry is refused, so unstage it with `f` first.
 
-`x` returns every file in the changeset to `HEAD`: staged changes, unstaged changes and untracked files, which are deleted. A conflicted file is resolved to its `HEAD` version. Ignored files stay. It covers the whole working tree even under `--staged` or `--unstaged`, and the prompt says so, but it stays inside the paths you passed. Neither key works in visual mode or on a revision.
+- An untracked file is deleted by `rf`. `rh` and visual `r` remove only the chosen lines and keep the file, even when it ends up empty.
+- A conflicted file gets its conflict markers back from `rf` and stays conflicted. `rh` and visual `r` refuse it.
+
+`r` starts a chord. If you press the second key quickly nothing else shows. After 300 ms a small box in the corner of the diff lists the follow-up keys. `Esc` or any other key cancels the chord.
+
+`x` returns every file in the changeset to `HEAD`: staged changes, unstaged changes and untracked files, which are deleted. A conflicted file is resolved to its `HEAD` version. Ignored files stay. It covers the whole working tree even under `--staged` or `--unstaged`, and the prompt says so, but it stays inside the paths you passed. `x` does not work in visual mode, and neither restore nor nuke works on a revision.
 
 ### Editor
 
@@ -140,6 +147,8 @@ The `[highlights]` table restyles parts of the screen. Group names are CamelCase
 | `DiffHunkBarStaged` | The bar beside a staged hunk or a hunk in a revision, blue by default |
 | `DiffHunkSeparator` | The rule between two hunks, dark gray by default |
 | `Visual` | Selected lines in visual mode |
+| `ChordPopup` | Added to `Border` and `Normal` on the box that lists a chord's follow-up keys |
+| `ChordKey` | The key letters in that box, bold by default |
 
 Each group takes `fg`, `bg`, `bold`, `italic`, `underline` and `reverse`. A color is an ANSI name such as `"bright-red"`, a palette index such as `42`, or `"#rrggbb"`.
 

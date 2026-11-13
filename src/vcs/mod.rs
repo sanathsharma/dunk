@@ -171,6 +171,17 @@ pub trait Vcs {
   /// past a file that fails and reports the failures together.
   fn restore(&self, files: &[FileDiff], kind: Kind) -> Result<(), Error>;
 
+  /// Puts hunk `hunk` of the unstaged entry `file` back to what the index
+  /// holds, or only the lines `lines` of it, which are indexes into the hunk's
+  /// lines. The index does not change. An untracked file keeps what is left,
+  /// even if that is nothing.
+  fn restore_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: Option<&BTreeSet<usize>>,
+  ) -> Result<(), Error>;
+
   /// Reads both versions of `file` as `request` compared them.
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides;
 }

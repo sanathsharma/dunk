@@ -125,6 +125,12 @@ impl Memory {
     self.lock().get(Path::new(path))?.index.clone()
   }
 
+  /// What the working tree holds for `path`, or `None` when it holds no such
+  /// file.
+  pub fn work_text(&self, path: &str) -> Option<String> {
+    self.lock().get(Path::new(path))?.work.clone()
+  }
+
   fn missing(path: &Path) -> Error {
     Error::Git(format!("no such file: {}", path.display()))
   }
@@ -307,6 +313,30 @@ impl Vcs for Memory {
         v.work.clone_from(&v.head);
       }),
     }
+  }
+
+  fn restore_lines(
+    &self,
+    file: &FileDiff,
+    hunk: usize,
+    lines: Option<&BTreeSet<usize>>,
+  ) -> Result<(), Error> {
+    let hunk = file
+      .hunks
+      .get(hunk)
+      .ok_or_else(|| Error::Git(format!("no hunk {hunk} in {}", file.path().display())))?;
+    // The working tree is the new side of an unstaged diff: the picked added
+    // lines go and the picked removed ones come back.
+    let with = rewritten(hunk, false, |i| lines.is_none_or(|l| l.contains(&i)));
+    self.update([file], |v| {
+      let text = splice(
+        v.work.as_deref().unwrap_or(""),
+        hunk.new_start,
+        hunk.new_len,
+        &with,
+      );
+      v.work = Some(text);
+    })
   }
 
   fn sides(&self, request: &DiffRequest, file: &FileDiff) -> Sides {

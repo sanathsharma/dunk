@@ -1,5 +1,6 @@
 mod app;
 mod args;
+mod chord;
 mod config;
 mod diff;
 mod editor;

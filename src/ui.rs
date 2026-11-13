@@ -1,9 +1,10 @@
 use crate::app::{App, ListRow, Load, Mode};
 use crate::args::{Border, Layout as DiffLayout};
+use crate::chord;
 use crate::diff::{FileDiff, FileStatus, Hunk, Line as DiffLine, LineKind, Section};
 use crate::highlight::{FileHighlight, Styled};
 use crate::palette::Palette;
-use crate::restore::Prompt;
+use crate::restore::{Loss, Prompt};
 use crate::split::pairs;
 use crate::vcs::Kind;
 use crate::words::changed_words;
@@ -14,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, Paragraph};
 use std::borrow::Cow;
 use std::ops::{Range, RangeInclusive};
+use std::time::Instant;
 
 const HELP: &str = " j/k move · n/p file · [/] hunk · a stage · ? help · q quit";
 
@@ -38,8 +40,16 @@ const HELP_MENU: &[(&str, &str)] = &[
     "stage all files, or unstage all when none is left to stage",
   ),
   (
-    "r",
+    "rf",
     "restore the file: discard its unstaged changes, after typing restore",
+  ),
+  (
+    "rh",
+    "restore the hunk: discard its unstaged changes, after typing restore",
+  ),
+  (
+    "r (visual)",
+    "restore the selected lines, after typing restore",
   ),
   ("x", "nuke: every file back to HEAD, after typing nuke"),
   (",/.", "first, last file"),
@@ -119,6 +129,13 @@ fn render_main(frame: &mut Frame, main: Rect, app: &mut App) {
     Layout::horizontal([Constraint::Length(list_width), Constraint::Min(1)]).areas(main);
   render_files(frame, list, app);
   render_diff(frame, diff, app);
+  let styles = chord::Styles {
+    border: app.palette.border.patch(app.palette.chord_popup),
+    key: app.palette.chord_key,
+    text: app.palette.normal.patch(app.palette.chord_popup),
+    border_type: border_type(app.border),
+  };
+  app.chords.render(frame, diff, &styles, Instant::now());
   if app.help {
     render_help(frame, main, app);
   }
@@ -210,6 +227,14 @@ const fn prompt_fixed_rows(narrowed: bool) -> usize {
   if narrowed { 6 } else { 4 }
 }
 
+/// What a restore of part of a file takes, for the confirmation's title.
+fn part_noun(prompt: &Prompt) -> &'static str {
+  match prompt.request().entries.first().map(|e| e.loss) {
+    Some(Loss::Lines(_)) => "selected lines",
+    _ => "hunk",
+  }
+}
+
 fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
   let Some(prompt) = &app.prompt else {
     return;
@@ -220,7 +245,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     Kind::Nuke => "Nuke",
   };
   let noun = if count == 1 { "file" } else { "files" };
-  let title = format!(" {verb} {count} {noun} ");
+  let title = match prompt.request().part {
+    Some(_) => format!(" {verb} {} ", part_noun(prompt)),
+    None => format!(" {verb} {count} {noun} "),
+  };
   // Two rows go to the borders.
   let room = usize::from(area.height)
     .saturating_sub(2)
@@ -915,6 +943,7 @@ mod tests {
   use ratatui::Terminal;
   use ratatui::backend::TestBackend;
   use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+  use std::time::Duration;
 
   const DIFF: &str = "\
 diff --git a/src/a.rs b/src/a.rs
@@ -987,7 +1016,7 @@ new file mode 100644
     app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
     let (_, rows) = draw(&mut app, 110, 30);
     let (_, restore) = row_with(&rows, "discard its unstaged changes");
-    assert!(restore.contains(" r "), "{restore}");
+    assert!(restore.contains(" rf "), "{restore}");
     let (_, nuke) = row_with(&rows, "back to HEAD");
     assert!(nuke.contains(" x "), "{nuke}");
   }
@@ -1150,7 +1179,7 @@ new file mode 100644
   #[test]
   fn the_restore_prompt_names_the_file_what_it_loses_and_the_word_to_type() {
     let mut app = named_app(&[("src/lib.rs", Section::Unstaged)]);
-    press(&mut app, "r");
+    press(&mut app, "rf");
     let (_, rows) = draw(&mut app, 100, 24);
     row_with(&rows, "Restore 1 file");
     assert!(
@@ -1182,7 +1211,7 @@ new file mode 100644
 
   #[test]
   fn only_the_word_to_type_is_bold() {
-    for (keys, word) in [("r", "restore"), ("x", "nuke")] {
+    for (keys, word) in [("rf", "restore"), ("x", "nuke")] {
       let mut app = named_app(&[("a.rs", Section::Unstaged)]);
       press(&mut app, keys);
       let (terminal, rows) = draw(&mut app, 100, 24);
@@ -1204,8 +1233,8 @@ new file mode 100644
   #[test]
   fn typed_input_shows_after_the_prompt_arrow() {
     let mut app = named_app(&[("a.rs", Section::Unstaged)]);
-    // The first `r` opens the prompt, the rest is typed into it.
-    press(&mut app, "rrest");
+    // `rf` opens the prompt, the rest is typed into it.
+    press(&mut app, "rfrest");
     let (_, rows) = draw(&mut app, 100, 24);
     assert!(rows.iter().any(|r| r.contains("> rest")), "{rows:#?}");
   }
@@ -1256,7 +1285,7 @@ new file mode 100644
   #[test]
   fn the_prompt_is_drawn_even_when_the_changeset_became_empty() {
     let mut app = named_app(&[("a.rs", Section::Unstaged)]);
-    press(&mut app, "r");
+    press(&mut app, "rf");
     app.on_loaded(Ok(Vec::new()));
     assert!(app.files.is_empty());
     let (_, rows) = draw(&mut app, 100, 24);
@@ -1486,7 +1515,7 @@ new file mode 100644
     app.palette.mode_restore = Style::new().fg(Color::Rgb(9, 9, 9));
     let (terminal, _) = draw(&mut app, 100, 14);
     assert_eq!(terminal.backend().buffer()[(1, 13)].fg, Color::Rgb(7, 7, 7));
-    press(&mut app, "r");
+    press(&mut app, "rf");
     let (terminal, rows) = draw(&mut app, 100, 14);
     assert!(rows[13].starts_with("\" RESTORE "), "{}", rows[13]);
     assert_eq!(terminal.backend().buffer()[(1, 13)].fg, Color::Rgb(9, 9, 9));
@@ -1778,5 +1807,66 @@ diff --git a/a.rs b/a.rs
     assert_eq!(sanitize(b"a\tb\r"), "a    b");
     assert_eq!(sanitize(b"x\x1b[31m"), "x\u{FFFD}[31m");
     assert_eq!(sanitize(b"\xff"), "\u{FFFD}");
+  }
+  fn press_r_at(app: &mut App, ago: Duration) {
+    let at = Instant::now().checked_sub(ago).unwrap();
+    let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+    app.chords.feed(key, at);
+  }
+
+  #[test]
+  fn the_chord_popup_lists_the_follow_ups_in_the_corner_after_the_delay() {
+    let mut app = app_with(DIFF);
+    press_r_at(&mut app, Duration::from_millis(400));
+    let (_, rows) = draw(&mut app, 100, 24);
+    let (top, title) = row_with(&rows, " restore ");
+    row_with(&rows, "f  file");
+    row_with(&rows, "h  hunk");
+    // The popup is in the right half of the diff pane, above the footer.
+    assert!(col_of(title, " restore ") > 60, "{title}");
+    assert!(top > 15, "{rows:#?}");
+    assert!(top < 23, "{rows:#?}");
+  }
+
+  #[test]
+  fn the_chord_popup_does_not_flash_before_the_delay() {
+    let mut app = app_with(DIFF);
+    press_r_at(&mut app, Duration::ZERO);
+    let (_, rows) = draw(&mut app, 100, 24);
+    assert!(rows.iter().all(|r| !r.contains("f  file")), "{rows:#?}");
+  }
+
+  #[test]
+  fn the_chord_popup_takes_the_chord_key_group_for_the_letters() {
+    let mut app = app_with(DIFF);
+    app.palette.chord_key = Style::new().fg(Color::Rgb(5, 6, 7));
+    press_r_at(&mut app, Duration::from_millis(400));
+    let (terminal, rows) = draw(&mut app, 100, 24);
+    let (y, row) = row_with(&rows, "f  file");
+    let x = col_of(row, "f  file") - 1;
+    assert_eq!(
+      terminal.backend().buffer()[(x, col(y))].fg,
+      Color::Rgb(5, 6, 7)
+    );
+  }
+
+  #[test]
+  fn the_help_menu_lists_hunk_and_line_restore() {
+    let mut app = app_with(DIFF);
+    app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    let (_, rows) = draw(&mut app, 110, 30);
+    let (_, hunk) = row_with(&rows, "restore the hunk");
+    assert!(hunk.contains(" rh "), "{hunk}");
+    row_with(&rows, "restore the selected lines");
+  }
+
+  #[test]
+  fn the_prompt_of_a_part_restore_names_the_hunk_or_the_lines() {
+    let mut app = named_app(&[("a.rs", Section::Unstaged)]);
+    press(&mut app, "rh");
+    let (_, rows) = draw(&mut app, 100, 24);
+    row_with(&rows, "Restore hunk");
+    row_with(&rows, "(hunk, 2 lines)");
+    row_with(&rows, "Type restore to confirm");
   }
 }

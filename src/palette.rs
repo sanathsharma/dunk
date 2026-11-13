@@ -23,6 +23,8 @@ pub struct Palette {
   pub diff_hunk_bar_staged: Style,
   pub diff_hunk_separator: Style,
   pub visual: Style,
+  pub chord_popup: Style,
+  pub chord_key: Style,
 }
 
 impl Default for Palette {
@@ -52,6 +54,8 @@ impl Default for Palette {
       diff_hunk_bar_staged: Style::new().fg(Color::Blue),
       diff_hunk_separator: Style::new().fg(Color::DarkGray),
       visual: Style::new().bg(Color::Blue),
+      chord_popup: Style::new(),
+      chord_key: Style::new().add_modifier(Modifier::BOLD),
     }
   }
 }
@@ -97,6 +101,10 @@ pub struct Highlights {
   diff_hunk_separator: Option<Spec>,
   #[serde(rename = "Visual")]
   visual: Option<Spec>,
+  #[serde(rename = "ChordPopup")]
+  chord_popup: Option<Spec>,
+  #[serde(rename = "ChordKey")]
+  chord_key: Option<Spec>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -259,6 +267,8 @@ impl Highlights {
         &mut palette.diff_hunk_separator,
       ),
       ("Visual", &self.visual, &mut palette.visual),
+      ("ChordPopup", &self.chord_popup, &mut palette.chord_popup),
+      ("ChordKey", &self.chord_key, &mut palette.chord_key),
     ];
     for (name, spec, slot) in groups {
       if let Some(spec) = spec {
@@ -353,6 +363,8 @@ mod tests {
       "DiffHunkBarStaged",
       "DiffHunkSeparator",
       "Visual",
+      "ChordPopup",
+      "ChordKey",
     ] {
       assert!(err.contains(group), "{group} missing from {err}");
     }
