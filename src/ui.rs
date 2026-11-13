@@ -217,7 +217,7 @@ fn prompt_lines(prompt: &Prompt, room: usize) -> Vec<Line<'static>> {
     Span::styled(prompt.word(), Style::new().add_modifier(Modifier::BOLD)),
     Span::raw(" to confirm, esc to cancel."),
   ]));
-  lines.push(Line::from(format!(" > {}", prompt.input())));
+  lines.push(Line::from(format!(" ❯ {}", prompt.input())));
   lines
 }
 
@@ -1236,7 +1236,7 @@ new file mode 100644
     // `rf` opens the prompt, the rest is typed into it.
     press(&mut app, "rfrest");
     let (_, rows) = draw(&mut app, 100, 24);
-    assert!(rows.iter().any(|r| r.contains("> rest")), "{rows:#?}");
+    assert!(rows.iter().any(|r| r.contains("❯ rest")), "{rows:#?}");
   }
 
   #[test]
@@ -1255,7 +1255,7 @@ new file mode 100644
     row_with(&rows, "… and 3 more");
     let listed = rows.iter().filter(|r| r.contains("(unstaged)")).count();
     assert_eq!(listed, 7, "{rows:#?}");
-    row_with(&rows, "> ");
+    row_with(&rows, "❯ ");
   }
 
   #[test]
@@ -1279,7 +1279,7 @@ new file mode 100644
     app.prompt = Some(Prompt::new(request).narrowed_view());
     let (_, rows) = draw(&mut app, 100, 12);
     row_with(&rows, "The view is narrowed");
-    row_with(&rows, "> ");
+    row_with(&rows, "❯ ");
   }
 
   #[test]
